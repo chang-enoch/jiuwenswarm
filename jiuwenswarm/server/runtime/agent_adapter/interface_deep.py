@@ -7118,7 +7118,7 @@ class JiuWenSwarmDeepAdapter:
         """
         if not get_skill_evolution_enabled(config):
             return None
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -7163,7 +7163,7 @@ class JiuWenSwarmDeepAdapter:
             if self._skill_manager is not None
             else []
         )
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -7378,7 +7378,7 @@ class JiuWenSwarmDeepAdapter:
                 logger.debug("[JiuWenSwarmDeepAdapter] SkillCreateRail disabled by config")
                 return None
 
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 
@@ -8133,9 +8133,7 @@ class JiuWenSwarmDeepAdapter:
         # enable/disable of agent_observability without rebuilding the agent.
         try:
             from openjiuwen.agent_teams.observability.rail import ObservabilityRail
-            from jiuwenswarm.agents.harness.agent_observability import (
-                AgentTraceBindingRail,
-            )
+            from openjiuwen.harness.observability import AgentTraceBindingRail
 
             rails_list.append(AgentTraceBindingRail())
             rails_list.append(ObservabilityRail())
@@ -9270,7 +9268,7 @@ class JiuWenSwarmDeepAdapter:
                 should_enable_general_agent = should_add_general_agent and (
                     sub_mode == "plan" or (isinstance(mode, str) and mode.startswith("agent"))
                 )
-                from jiuwenswarm.agents.harness.observability_runtime import (
+                from openjiuwen.extensions.observability.demand import (
                     get_trajectory_span_processor,
                 )
 
@@ -16838,9 +16836,11 @@ class JiuWenSwarmDeepAdapter:
             # Sync single-agent / coding-agent observability with current
             # config before running, and open a root span so OtelCallbackHandler
             # has a parent for LLM/tool spans (see streaming path for details).
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability()
@@ -17921,9 +17921,11 @@ class JiuWenSwarmDeepAdapter:
             )
             # Sync single-agent / coding-agent observability with current config
             # before running.
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability(force=_dbg_settings.otel_enabled)

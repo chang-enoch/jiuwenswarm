@@ -20,6 +20,7 @@ from openjiuwen.agent_teams.paths import team_home
 from openjiuwen.agent_teams.runtime.pool import RuntimeState
 from openjiuwen.agent_teams.schema.blueprint import TeamAgentSpec
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+from openjiuwen.agent_teams import observability as team_observability
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.common.logging import server_logger
 from openjiuwen.harness import DeepAgent
@@ -63,11 +64,7 @@ from jiuwenswarm.common.config import (
     get_skill_create_enabled,
     get_skill_evolution_enabled,
 )
-from jiuwenswarm.agents.harness.observability_runtime import (
-    acquire_observability_demand,
-    build_observability_config,
-    release_observability_demand,
-)
+from jiuwenswarm.agents.harness.observability_runtime import build_observability_config
 from jiuwenswarm.common.reasoning_injector import build_reasoning_model_request_kwargs
 from jiuwenswarm.agents.harness.team.team_runtime_inheritance import (
     MemberInfo,
@@ -151,7 +148,7 @@ def sync_team_observability() -> None:
         # Same gap as single-agent: unified runtime must still host the
         # shared TrajectorySpanProcessor for skill / team evolution rails.
         try:
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 ensure_trajectory_span_processor_attached,
             )
 
@@ -184,10 +181,7 @@ def sync_team_observability() -> None:
             service_name="jiuwenswarm",
             traces_dir=traces_dir,
         )
-        provider_existed = acquire_observability_demand(
-            "team",
-            observability_config=obs_cfg,
-        )
+        provider_existed = team_observability.acquire_observability(obs_cfg)
         was_active = _observability_active
         _observability_active = True
         if not was_active and not provider_existed:
@@ -222,7 +216,7 @@ def shutdown_team_observability() -> None:
         _runtime_managed_observability = False
         return
     try:
-        release_observability_demand("team")
+        team_observability.release_observability()
         _observability_active = False
         logger.info("[TeamObservability] disabled")
     except Exception as exc:
