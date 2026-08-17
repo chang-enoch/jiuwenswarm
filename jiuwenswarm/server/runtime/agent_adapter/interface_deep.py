@@ -8128,17 +8128,17 @@ class JiuWenSwarmDeepAdapter:
         # for task-loop runs, or agent.<name>.invoke for single-round) under the root
         # run span per iteration/round. It is the only thing that creates the
         # task_iteration / invoke spans that llm.call + tool.* nest under. It
-        # self-disables (before_* returns early when get_team_span() is None), so
+        # self-disables (before_* returns early when there is no run root span), so
         # attaching it unconditionally is safe and also adapts to runtime
         # enable/disable of agent_observability without rebuilding the agent.
+        # The harness rail owns the complete single-agent tier; team identity is
+        # supplied separately by the team blueprint.
         try:
-            from openjiuwen.agent_teams.observability.rail import ObservabilityRail
-            from openjiuwen.harness.observability import AgentTraceBindingRail
+            from openjiuwen.harness.observability import AgentObservabilityRail
 
-            rails_list.append(AgentTraceBindingRail())
-            rails_list.append(ObservabilityRail())
+            rails_list.append(AgentObservabilityRail())
         except Exception as exc:
-            logger.warning("%s Failed to attach ObservabilityRail: %s", log_prefix, exc)
+            logger.warning("%s Failed to attach AgentObservabilityRail: %s", log_prefix, exc)
         stage_timer.mark("observability_rail")
 
         # Bind tenant checkpointer after rails exist (set_checkpoint runs earlier).
