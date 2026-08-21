@@ -12,6 +12,7 @@ Public API is unchanged (``WebChannel`` / ``WebChannelConfig``). Internally:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Callable
 
 from jiuwenswarm.common.schema.message import Message, Mode, ReqMethod
@@ -59,6 +60,9 @@ class WebChannel(BaseChannel):
         self.ws = WebWsTransport(config, router, self)
         self.http = WebHttpTransport(self)
         self.git_watcher_registry: Any = None
+        self._trajectory_event_loop: asyncio.AbstractEventLoop | None = None
+        self._trajectory_listener_registered = False
+        self._trajectory_update_listener = self._on_trajectory_updates
 
     # ── Compatibility shims (invoke / handlers access private attrs) ──
 
@@ -249,6 +253,12 @@ class WebChannel(BaseChannel):
         if self._running:
             return
         self._running = True
+        self._trajectory_event_loop = asyncio.get_running_loop()
+        if not self._trajectory_listener_registered:
+            from jiuwenswarm.observability.updates import trajectory_update_broker
+
+            trajectory_update_broker.register(self._trajectory_update_listener)
+            self._trajectory_listener_registered = True
         self.rpc.maybe_start_history_capture()
         await self.ws.start_ws_server()
         await self.http.start()
@@ -259,13 +269,50 @@ class WebChannel(BaseChannel):
             logger_info += f" http://{self.config.host}:{self.http.port}"
         import logging
         logging.getLogger(__name__).info(logger_info)
-        await self.ws.wait_closed()
+        try:
+            await self.ws.wait_closed()
+        finally:
+            self._unregister_trajectory_listener()
 
     async def stop(self) -> None:
         self._running = False
+        self._unregister_trajectory_listener()
         await self.http.stop()
         self.rpc.shutdown()
         await self.ws.stop_ws_server()
+
+    def _unregister_trajectory_listener(self) -> None:
+        if self._trajectory_listener_registered:
+            from jiuwenswarm.observability.updates import trajectory_update_broker
+
+            trajectory_update_broker.unregister(self._trajectory_update_listener)
+            self._trajectory_listener_registered = False
+        self._trajectory_event_loop = None
+
+    def _on_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
+        loop = self._trajectory_event_loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._schedule_trajectory_updates, updates)
+
+    def _schedule_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
+        asyncio.create_task(self._send_trajectory_updates(updates))
+
+    async def _send_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
+        for update in updates:
+            session_id = str(getattr(update, "session_id", "") or "").strip()
+            if not session_id:
+                continue
+            payload = {
+                "session_id": session_id,
+                "trace_id": str(getattr(update, "trace_id", "") or ""),
+                "revision": int(getattr(update, "revision", 0)),
+                "store_epoch": getattr(update, "store_epoch", None),
+                "lifecycle": str(getattr(update, "lifecycle", "final") or "final"),
+            }
+            for peer in self.peers_for_session(session_id):
+                if peer in self.clients and not getattr(peer, "closed", False):
+                    await self.send_event(peer, "trace.updated", payload)
 
     async def connect(self) -> None:
         await self.start()
