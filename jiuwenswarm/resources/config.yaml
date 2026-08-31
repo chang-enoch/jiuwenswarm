@@ -490,13 +490,14 @@ agent_observability:
 # ============================================================
 # 单 Agent 轨迹观测 Web 数据面
 # ============================================================
-# enabled=true 会作为单 Agent OTel provider 的额外 demand，但仍完整复用
-# agent_observability 的 exporter、采样、脱敏、字段长度与 Langfuse 配置。
-# Processor 后的数据由 AgentServer 有界队列写入 SQLite；Gateway 只读查询。
-# Team / auto harness 本期不会向 Web 暴露轨迹。
+# enabled=true 会作为 Agent / Team OTel provider 的额外 demand，但仍完整复用
+# agent_observability / team_observability 的 exporter、采样、脱敏、字段长度
+# 与 Langfuse 配置。Processor 后的数据由 AgentServer 有界队列写入 SQLite；
+# Gateway 只读查询。Agent 与 Team 会话均向 Web 暴露轨迹。
+# auto_harness 不向 Web 暴露轨迹。
 # ============================================================
 trajectory_ui:
-  enabled: true                     # 启用“对话 / 轨迹”数据链路
+  enabled: false                     # 启用“对话 / 轨迹”数据链路
   db_path: ""                       # Session database root; defaults to ~/.jiuwenswarm/.trace/sessions
   retention_days: 7                 # SQLite 轨迹保留天数
   queue_size: 4096                  # Agent 主线程非阻塞写入队列上限
