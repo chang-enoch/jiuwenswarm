@@ -581,7 +581,9 @@ def _is_restorable_history_record(record: Any) -> bool:
 
     if role == "user":
         mode = record.get("mode", "")
-        if mode in ("team", "team.plan", "code.team"):
+        from jiuwenswarm.common.mode_matrix import is_team_mode
+
+        if is_team_mode(mode):
             channel_id = record.get("channel_id", "")
             # desktop 渠道的用户消息是真实用户输入，必须与 web/tui 同规放行——
             # 否则桌面团队会话重启后用户问题气泡丢失
@@ -820,6 +822,14 @@ def resolve_agent_request_mode(
         canonical_mode = f"team.{sub_mode}" if sub_mode else "team"
         if sub_mode == "plan":
             return "code", "team", canonical_mode
+        if not sub_mode and normalized_work_mode in {"code", "design"}:
+            # Web 桌面团队请求 = mode=team + work_mode：按 WorkModeProfile 注册表
+            # 组合出团队 canonical（code→code.team / design→design.team）。
+            # 无 work_mode 或 work 的历史/默认路径原样返回（"team", None, "team"）。
+            from jiuwenswarm.common.mode_profiles import WORK_MODE_PROFILES
+
+            profile = WORK_MODE_PROFILES[normalized_work_mode]
+            return profile.manager_mode, "team", profile.team_canonical
         return "team", sub_mode, canonical_mode
 
     default_sub_modes = {
@@ -1903,7 +1913,9 @@ class AgentWebSocketServer:
                 await self._handle_chat_capacity(ws, request, send_lock)
                 return
 
-            await self._trigger_before_chat_request_hook(request)
+            defer_admission_preparation = self._should_defer_admission_preparation(request)
+            if not defer_admission_preparation:
+                await self._trigger_before_chat_request_hook(request)
 
             if request.req_method == ReqMethod.SESSION_LIST:
                 await self._handle_session_list(ws, request, send_lock)
@@ -2209,10 +2221,17 @@ class AgentWebSocketServer:
                             async with send_lock:
                                 await send_wire_payload(ws, wire)
                 return
-            await self._ensure_auto_team_binding_for_chat(request)
             if request.is_stream:
-                await self._handle_stream(ws, request, send_lock)
+                if not defer_admission_preparation:
+                    await self._ensure_auto_team_binding_for_chat(request)
+                await self._handle_stream(
+                    ws,
+                    request,
+                    send_lock,
+                    defer_admission_preparation=defer_admission_preparation,
+                )
             else:
+                await self._ensure_auto_team_binding_for_chat(request)
                 await self._handle_unary(ws, request, send_lock)
         except asyncio.CancelledError:
             # 流式任务被 interrupt 取消，正常退出无需报错
@@ -2276,6 +2295,16 @@ class AgentWebSocketServer:
             ReqMethod.CHAT_SEND,
             ReqMethod.CHAT_RESUME,
             ReqMethod.CHAT_ANSWER,
+        )
+
+    @staticmethod
+    def _should_defer_admission_preparation(request: AgentRequest) -> bool:
+        """准入 ACK 请求先确认，再执行可能耗时的聊天前置处理。"""
+        return (
+            request.is_stream
+            and request.req_method == ReqMethod.CHAT_SEND
+            and str(request.channel_id or "").strip().lower() == "desktop"
+            and (request.metadata or {}).get("require_admission_ack") is True
         )
 
     @staticmethod
@@ -2682,6 +2711,7 @@ class AgentWebSocketServer:
                 params[_SESSION_PREVIOUS_MODE_KEY] = stored_session_mode.strip()
             if isinstance(stored_work_mode, str) and stored_work_mode.strip().lower() in {
                 "code",
+                "design",
                 "work",
             }:
                 runtime_work_mode = stored_work_mode.strip().lower()
@@ -2689,6 +2719,7 @@ class AgentWebSocketServer:
             request_work_mode = params.get("work_mode")
             if isinstance(request_work_mode, str) and request_work_mode.strip().lower() in {
                 "code",
+                "design",
                 "work",
             }:
                 runtime_work_mode = request_work_mode.strip().lower()
@@ -3056,7 +3087,12 @@ class AgentWebSocketServer:
 
 
     async def _handle_stream(
-        self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
+        self,
+        ws: Any,
+        request: AgentRequest,
+        send_lock: asyncio.Lock,
+        *,
+        defer_admission_preparation: bool = False,
     ) -> None:
         desktop_stream_admitted = self._begin_desktop_chat_stream(request)
         if desktop_stream_admitted is False:
@@ -3082,6 +3118,9 @@ class AgentWebSocketServer:
                 wire = encode_agent_chunk_for_wire(accepted, response_id=request.request_id, sequence=0)
                 async with send_lock:
                     await send_wire_payload(ws, wire)
+            if defer_admission_preparation:
+                await self._trigger_before_chat_request_hook(request)
+                await self._ensure_auto_team_binding_for_chat(request)
             if foreground:
                 await manager.begin_foreground_chat()
             try:
@@ -3930,8 +3969,10 @@ class AgentWebSocketServer:
 
     @staticmethod
     def _is_team_metadata_mode(metadata: dict[str, Any]) -> bool:
+        from jiuwenswarm.common.mode_matrix import is_team_mode
+
         mode = str(metadata.get("mode") or "").strip().lower()
-        return mode in {"team", "team.plan", "code.team"}
+        return is_team_mode(mode)
 
     @staticmethod
     def _active_team_session_map() -> dict[str, str]:
@@ -8585,17 +8626,29 @@ class AgentWebSocketServer:
                 and request.req_method == ReqMethod.SESSION_CREATE
                 and channel_id.strip().lower() == "tui"
             )
+            # xiaoyi external：沿用上层 conversationId 作 session_id（裸值）。
+            # 目录已存在则复用，不再自造 xiaoyi_*。
+            external_xiaoyi_session = bool(
+                requested_session_id
+                and request.req_method == ReqMethod.SESSION_CREATE
+                and channel_id.strip().lower() == "xiaoyi"
+            )
+            external_session = external_tui_session or external_xiaoyi_session
+            # 仅 TUI external 绑定真实代码项目；xiaoyi external 保持 default/work，
+            # 不改 work_mode 语义（D2=A）。
+            bind_project = external_tui_session
             existing_metadata: dict[str, Any] | None = None
-            if requested_session_id and not external_tui_session:
+            if requested_session_id and not external_session:
                 raise ValueError(
                     "session.create no longer accepts session_id; use session.switch to restore"
                 )
             external_id_lock: asyncio.Lock | None = None
             external_id_lock_acquired = False
-            if external_tui_session:
+            if external_session:
                 logger.warning(
-                    "[AgentServer] TUI supplied session_id via session.create; "
+                    "[AgentServer] %s supplied session_id via session.create; "
                     "bypassing prewarm compatibility path: session_id=%s",
+                    "TUI" if external_tui_session else "xiaoyi external",
                     requested_session_id,
                 )
                 if not is_valid_session_id(requested_session_id):
@@ -8609,9 +8662,9 @@ class AgentWebSocketServer:
                 await external_id_lock.acquire()
                 external_id_lock_acquired = True
 
-                # Existing TUI metadata is authoritative. The frontend injects its
-                # current cwd into every RPC, which must not rebind a restored session
-                # when `--session` is launched from another directory.
+                # Existing external metadata is authoritative. TUI 前端每条 RPC 注入
+                # 当前 cwd，恢复时不得因从其它目录启动而重绑；xiaoyi external 同样
+                # 以既有 metadata 为准，避免重启后改 project/work_mode 语义。
                 from jiuwenswarm.server.runtime.session.session_metadata import (
                     get_session_metadata,
                 )
@@ -8620,16 +8673,43 @@ class AgentWebSocketServer:
                     existing_channel = str(
                         existing_metadata.get("channel_id") or ""
                     ).strip().lower()
-                    if existing_channel not in {"", "tui"}:
-                        raise ValueError("session_id is already owned by another channel")
-                    for field in ("project_id", "project_dir", "work_mode", "mode"):
+                    if external_tui_session:
+                        if existing_channel not in {"", "tui"}:
+                            raise ValueError(
+                                "session_id is already owned by another channel"
+                            )
+                    else:
+                        # xiaoyi：目录名即 requested_session_id，同一会话复用。
+                        # mobileMirror 可能把 channel_id 写成 desktop，不视为易主。
+                        # 仅拒绝明显属于其它产品命名空间的 id / 渠道。
+                        sid = str(requested_session_id or "").strip()
+                        foreign_id = sid.startswith("desktop_") or sid.startswith("tui")
+                        foreign_channel = existing_channel not in {
+                            "",
+                            "xiaoyi",
+                            "desktop",
+                        }
+                        if foreign_id or foreign_channel:
+                            raise ValueError(
+                                "session_id is already owned by another channel"
+                            )
+                    # xiaoyi：工作空间不绑在 session.create 上（与 gateway 一致，
+                    # 每轮 chat.send 的 project_dir/cwd 生效）。拷盘上
+                    # default+project_dir 会撞规则3 BAD_REQUEST，重启续聊全灭。
+                    # TUI 仍拷 project_dir，它绑的是真实代码项目。
+                    copy_fields = (
+                        ("project_id", "project_dir", "work_mode", "mode")
+                        if external_tui_session
+                        else ("project_id", "work_mode", "mode")
+                    )
+                    for field in copy_fields:
                         value = existing_metadata.get(field)
                         if isinstance(value, str) and value.strip():
                             params[field] = value.strip()
                     mode, _, canonical_mode = resolve_agent_request_mode(
                         params.get("mode", "agent")
                     )
-                else:
+                elif bind_project:
                     # Resolve a new external TUI id while holding the per-id lock.
                     # This keeps concurrent windows from rebinding the same id to
                     # different projects before metadata becomes visible.
@@ -8642,6 +8722,11 @@ class AgentWebSocketServer:
                         params["project_id"] = project.project_id
                         params["project_dir"] = project.project_dir
                         params["work_mode"] = project.work_mode
+                else:
+                    # xiaoyi external 新会话：不绑定真实代码项目，
+                    # project_id/work_mode 交由后续 resolve_session_work_mode_params
+                    # 按 channel_id="xiaoyi" 推断为 default/work（D2=A）。
+                    pass
             # Step 1: 归一化 work_mode / project_id / project_dir 三元组
             # (与 web _session_create 共用同一 helper，保持主路径/fallback 一致)
             from jiuwenswarm.server.runtime.session.work_mode import resolve_session_work_mode_params
@@ -8778,14 +8863,20 @@ class AgentWebSocketServer:
                         "expert_type": "team",
                         "team_template_id": _expert_svc.resolve_expert_group_template_id(),
                     }
-                    canonical_mode = "team"
-                    params["mode"] = "team"
+                    # 团判型按 final_work_mode 查 WorkModeProfile 注册表
+                    # 收敛 canonical（work→team / code→code.team / design→design.team）
+                    from jiuwenswarm.common.mode_profiles import (
+                        team_canonical_for_work_mode,
+                    )
 
-            is_swarm = bool(params.get("is_swarm")) or canonical_mode in {
-                "team",
-                "team.plan",
-                "code.team",
-            }
+                    canonical_mode = team_canonical_for_work_mode(final_work_mode)
+                    params["mode"] = canonical_mode
+
+            from jiuwenswarm.common.mode_matrix import TEAM_CANONICAL_MODES
+
+            is_swarm = (
+                bool(params.get("is_swarm")) or canonical_mode in TEAM_CANONICAL_MODES
+            )
             if not is_swarm:
                 mode, _, canonical_mode = resolve_agent_request_mode(
                     canonical_mode,
@@ -8797,7 +8888,7 @@ class AgentWebSocketServer:
                 and canonical_mode in {"agent", "code", "code.normal"}
             )
             create_token = str(params.get("create_token") or "").strip()
-            if external_tui_session:
+            if external_session:
                 claim = WarmClaim(
                     session_id=requested_session_id,
                     prewarm_hit=False,
@@ -8820,7 +8911,7 @@ class AgentWebSocketServer:
             # 会话目录已存在则拒绝,避免覆盖既有会话元数据(与 web 本地 handler 一致)
             session_dir = get_agent_sessions_dir() / session_id
             if (session_dir / "metadata.json").is_file():
-                if not external_tui_session:
+                if not external_session:
                     self._agent_manager.activate_session_prewarm(session_id)
                     resp = AgentResponse(
                         request_id=request.request_id,
@@ -8877,7 +8968,7 @@ class AgentWebSocketServer:
                     team_template_id=expert_binding.get("team_template_id", ""),
                     channel_metadata=channel_metadata,
                 )
-                if not external_tui_session:
+                if not external_session:
                     self._agent_manager.activate_session_prewarm(session_id)
 
             # team prepare 必须在 ack 前完成，避免首条 chat.send 与分布式切换竞态；
@@ -8913,7 +9004,7 @@ class AgentWebSocketServer:
                     "prewarm_status": claim.prewarm_status,
                     **(
                         {"created": session_created, "mode": canonical_mode}
-                        if external_tui_session
+                        if external_session
                         else {}
                     ),
                 },
@@ -8943,7 +9034,7 @@ class AgentWebSocketServer:
 
         except Exception as e:
             logger.exception("[AgentServer] %s failed: %s", operation, e)
-            if not locals().get("external_tui_session", False):
+            if not locals().get("external_session", False):
                 await self._agent_manager.release_session_prewarm_claim(
                     locals().get("session_id")
                 )

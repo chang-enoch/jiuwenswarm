@@ -166,6 +166,10 @@ from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.agents.harness.common.rails.cspl import CsplConfig, CsplSentinelRail
 from jiuwenswarm.common.hooks_config import load_hooks_config
 from jiuwenswarm.common.log_preview import preview_text
+from jiuwenswarm.server.runtime.agent_adapter.assembly_hooks import (
+    AssemblyPoint,
+    run_assembly_hooks,
+)
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
 from jiuwenswarm.server.hooks.user_hook_rail import UserHookRail
@@ -254,6 +258,7 @@ from jiuwenswarm.agents.harness.common.tools.image_tools import generate_image
 from jiuwenswarm.agents.harness.common.tools import (
     SendFileToolkit,
     SendHtmlCardToolkit,
+    XiaoyiAppendReferenceToolkit,
     SkillRetrievalToolkit,
     SkillToolkit,
     is_skill_retrieval_enabled,
@@ -1295,6 +1300,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._runtime_state_write_task: asyncio.Task[None] | None = None
         self._housekeeping_tasks: set[asyncio.Task[None]] = set()
         self._send_html_card_toolkit: SendHtmlCardToolkit | None = None
+        self._append_reference_toolkit: XiaoyiAppendReferenceToolkit | None = None
 
     def _schedule_runtime_state_write(
         self,
@@ -5841,10 +5847,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             completion_timeout=config.get("completion_timeout", 3600.0),
         )
 
-        # 实例重建：旧 LoadRecord 在新实例的 _load_records 账本里是未知 id
-        # （卸载会静默 no-op），必须丢弃；专家由入口 create_instance() 按 metadata 重放
-        self._expert_load_record = None
-        self._current_expert_id = None
+        # 装配生命周期点位：实例重建前的扩展状态重置
+        # （专家旧 LoadRecord 在新实例账本里是未知 id，由 expert 扩展丢弃）
+        await run_assembly_hooks(AssemblyPoint.BEFORE_INSTANCE_READY, self)
 
         await asyncio.sleep(0)
         await self._instance.ensure_initialized()
@@ -5871,17 +5876,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             "[JiuWenSwarmDeepAdapter] 初始化完成: agent_name=%s, mode=%s, sub_mode=%s", self._agent_name, mode, sub_mode
         )
 
-        # 加载已激活的 packages（skills, rails, tools）
-        await self._load_active_packages()
+        # 装配生命周期点位：create 尾部扩展——packages 恢复 → 专家按
+        # metadata 重放（仅 session 级子适配器，root 不装专家）→ user rails。
+        # 扩展实现与执行序见 assembly_hooks.register_builtin_assembly_extensions。
         await asyncio.sleep(0)
-
-        # 专家（仅 session 级子适配器）：按 session metadata 重放，
-        # 保证驱逐重建/首次装配后人设不丢（root 不装专家）
-        if self._is_session_scoped_adapter and self._parent_session_id:
-            await self._replay_expert_from_metadata()
-
-        # 动态加载用户自定义的 Rail 扩展
-        await self.load_user_rails()
+        await run_assembly_hooks(AssemblyPoint.AFTER_INSTANCE_READY, self)
 
     def _schedule_project_gitignore_agent_history(self, project_dir: str | None) -> None:
         """后台执行 .gitignore housekeeping，绝不阻塞实例创建.
@@ -6196,8 +6195,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         finally:
             self._restore_omitted_reload_fields(deep_cfg, omitted_fields)
         if "system_prompt" not in omitted_fields:
+            # 装配生命周期点位：prompt 重建后扩展重挂（专家按当前绑定重挂）
             self._install_structured_static_prompt_sections()
-            await self._reapply_expert_after_prompt_rebuild()
+            await run_assembly_hooks(AssemblyPoint.AFTER_PROMPT_REBUILD, self)
         self._commit_reload_fingerprints(reload_fingerprints)
         self._sync_active_evolution_review_agent_after_reload()
 
@@ -6501,7 +6501,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             session_id: Session the current turn belongs to. Heartbeat and cron
                 sessions drive the scheduler themselves and get no cron tools.
         """
-        if session_id is not None and session_id.startswith(("heartbeat", "cron")):
+        if session_id is not None and session_id.startswith(("heartbeat", "cron", "__cron__")):
+            # 单 agent 模式的 cron 执行会话 id 形如 "__cron___{ts}_{hex}"（warm pool
+            # 以 channel_id="__cron__" 作前缀生成，见 agent_warm_pool._new_session_id），
+            # 此前只判 "cron" 前缀会漏掉它。且 agent 实例跨会话共享：普通会话注册过的
+            # cron 工具须在此主动摘除，否则执行中的模型仍能调 cron_create_job，
+            # 把任务描述里"每天/每周…"等字样再建一遍定时任务。
+            self._remove_registered_cron_tools()
             return
         language = self._resolve_runtime_language()
         registered_names = {
@@ -6533,13 +6539,38 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         except Exception as exc:
             logger.error("[JiuWenSwarmDeepAdapter] 定时工具注册失败: %s", exc)
 
+    def _remove_registered_cron_tools(self) -> None:
+        """摘除共享 agent 实例上已注册的 cron 工具。
+
+        调度器自驱会话（heartbeat / "cron_" / "__cron__" 前缀）不携带 cron 工具；
+        agent 实例跨会话复用，普通会话注册的工具会残留到 cron 执行现场，必须
+        主动移除。注册指纹同步复位，让后续普通会话走常规路径重新注册。
+        """
+        try:
+            registered = [
+                existing
+                for existing in (self._instance.ability_manager.list() or [])
+                if getattr(existing, "name", "") in _CRON_TOOL_NAMES
+            ]
+            if not registered:
+                return
+            for existing in registered:
+                self._instance.ability_manager.remove(existing.name)
+            self._cron_tools_registered_language = None
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] %d cron tools removed for scheduler-owned session",
+                len(registered),
+            )
+        except Exception as exc:
+            logger.error("[JiuWenSwarmDeepAdapter] 定时工具移除失败: %s", exc)
+
     async def _update_session_tools(
         self,
         session_id: str | None,
         request_id: str | None,
         channel_id: str | None = None,
     ) -> None:
-        """刷新每请求相关的 cron / send_file / send_html_card 工具运行时状态。
+        """刷新每请求相关的 cron / send_file / send_html_card / append_reference 工具运行时状态。
 
         两者的工具实例都只建一次：cron 见 ``_ensure_cron_tools_registered``，
         send_file 首次注册后改走 ``update_runtime_context``。这里每次请求只做
@@ -6619,6 +6650,37 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     self._instance.ability_manager.add(html_tool.card)
             elif self._send_html_card_toolkit is not None:
                 self._send_html_card_toolkit.update_runtime_context(
+                    request_id=request_id,
+                    session_id=session_id,
+                    channel_id=channel_for_tool,
+                    metadata=metadata_for_tool,
+                )
+
+        # xiaoyi_append_reference：未配置时仅 xiaoyi 默认开启（手机参考来源卡片）
+        append_reference_enabled = (
+            config_base.get("channels", {}).get(channel, {}).get("append_reference_allowed")
+        )
+        if append_reference_enabled is None:
+            append_reference_enabled = (channel == "xiaoyi")
+        if append_reference_enabled and request_id and session_id:
+            channel_for_tool = _CRON_TOOL_CHANNEL_ID.get()
+            metadata_for_tool = _CRON_TOOL_METADATA.get()
+            already_registered_ref = any(
+                getattr(existing, "name", "").startswith("xiaoyi_append_reference")
+                for existing in (self._instance.ability_manager.list() or [])
+            )
+            if not already_registered_ref:
+                self._append_reference_toolkit = XiaoyiAppendReferenceToolkit(
+                    request_id=request_id,
+                    session_id=session_id,
+                    channel_id=channel_for_tool,
+                    metadata=metadata_for_tool,
+                )
+                for ref_tool in self._append_reference_toolkit.get_tools():
+                    Runner.resource_mgr.add_tool(ref_tool)
+                    self._instance.ability_manager.add(ref_tool.card)
+            elif self._append_reference_toolkit is not None:
+                self._append_reference_toolkit.update_runtime_context(
                     request_id=request_id,
                     session_id=session_id,
                     channel_id=channel_for_tool,
@@ -9611,7 +9673,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
         # 专家团 mode 防御：已绑定专家团的会话只接受 team 系 mode，
         # 显式报错、不静默改道（避免干扰 code.*/plan 组合语义）。
-        if mode not in ("team", "team.plan", "code.team"):
+        from jiuwenswarm.common.mode_matrix import is_team_mode as _is_team_canonical
+
+        if not _is_team_canonical(mode):
             from jiuwenswarm.server.runtime.session.session_metadata import (
                 get_session_metadata,
             )
@@ -9633,7 +9697,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 return
 
         # Team 模式处理
-        if mode in ("team", "team.plan", "code.team"):
+        if _is_team_canonical(mode):
             from jiuwenswarm.server.runtime.agent_adapter.team_helpers import process_team_message_stream
             resolved_model = self._resolve_model_for_request(request)
             self._apply_model_to_react_agent(
