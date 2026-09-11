@@ -27,11 +27,6 @@ from jiuwenswarm.common.connectors import connector_excluded_commands
 from jiuwenswarm.common.utils import (
     get_config_dir,
     get_config_file,
-    get_user_overlay_file,
-)
-from jiuwenswarm.common.config_split import (
-    overlay_sibling_of,
-    resolve_user_config_io_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,96 +246,13 @@ def _read_with_retry(filepath: Path, max_attempts: int = 3) -> dict[str, Any]:
     return {}
 
 
-_SYSTEM_LIST_KEYS = frozenset(
-    {
-        "progressive_tool_always_visible_tools",
-        "progressive_tool_default_visible_tools",
-    }
-)
-
-
-def _is_system_list_path(path: tuple[str, ...]) -> bool:
-    if not path:
-        return False
-    if path[-1] in _SYSTEM_LIST_KEYS:
-        return True
-    # modes.<name>.tools 以及更深一层（如 modes.team.<team>.tools）跟版本
-    return path[0] == "modes" and path[-1] == "tools"
-
-
-def _merge_indexed_dict_lists(
-    base_list: list[Any],
-    overlay_list: list[Any],
-    *,
-    path: tuple[str, ...],
-) -> list[Any]:
-    result = deepcopy(base_list)
-    for index, item in enumerate(overlay_list):
-        if index >= len(result):
-            result.append(deepcopy(item))
-        elif isinstance(result[index], dict) and isinstance(item, dict):
-            result[index] = merge_config_layers(
-                result[index], item, sparse=True, path=path
-            )
-        elif item not in ({}, None):
-            result[index] = deepcopy(item)
-    return result
-
-
-def merge_config_layers(
-    base: dict[str, Any],
-    overlay: dict[str, Any],
-    *,
-    sparse: bool = False,
-    path: tuple[str, ...] = (),
-) -> dict[str, Any]:
-    """内存合并：用户系统 yaml + 用户 overlay。用户叶覆盖；overlay 独有路径保留。
-
-    ``sparse=True``（``config.user.yaml``）：系统 list 整段用基底；
-    ``models.defaults`` 按下标深合并（只叠 temperature 等用户叶）；
-    用户 list（``mcp.servers`` / ``hooks``）overlay 有则整段采用。
-    不修改入参。
-    """
-    if not isinstance(base, dict):
-        return deepcopy(overlay) if isinstance(overlay, dict) else {}
-    if not isinstance(overlay, dict):
-        return deepcopy(base)
-    result = deepcopy(base)
-    for key, value in overlay.items():
-        child = path + (key,)
-        current = result.get(key)
-        if isinstance(current, dict) and isinstance(value, dict):
-            result[key] = merge_config_layers(
-                current, value, sparse=sparse, path=child
-            )
-        elif sparse and isinstance(current, list) and isinstance(value, list):
-            if _is_system_list_path(child):
-                continue
-            if child == ("models", "defaults"):
-                result[key] = _merge_indexed_dict_lists(current, value, path=child)
-            else:
-                result[key] = deepcopy(value)
-        else:
-            result[key] = deepcopy(value)
-    return result
-
-
 def get_config():
-    """读取并解析配置：用户 ``config.yaml``；若有 ``config.user.yaml`` 再稀疏叠上。"""
+    """读取并解析用户 ``config.yaml``（不再叠 overlay）。
+
+    升级判定与白名单写回见 ``config_split`` / ``docs/zh/配置分层与升级.md``。
+    """
     user_file = get_config_file()
-    overlay = get_user_overlay_file()
     config_base = _read_with_retry(user_file)
-    if overlay.is_file():
-        try:
-            same = overlay.resolve() == user_file.resolve()
-        except OSError:
-            same = False
-        if not same:
-            config_base = merge_config_layers(
-                config_base,
-                _read_with_retry(overlay),
-                sparse=True,
-            )
     # resolve_env_vars 和 _normalize_config 只操作内存数据，在锁外执行以缩短锁持有时间
     config_base = resolve_env_vars(config_base)
     _normalize_config(config_base)
@@ -385,49 +297,9 @@ def is_file_operation_history_enabled(config: dict[str, Any] | None) -> bool:
 
 
 def get_config_raw():
-    """未解析环境变量的配置视图。
-
-    读 ``CONFIG_YAML_PATH``（用户系统 yaml）；有 sibling ``config.user.yaml`` 则稀疏叠上。
-    禁止把合并结果 dump 回系统文件。
-    """
+    """未解析环境变量的配置视图。只读 ``CONFIG_YAML_PATH``。"""
     user_file = Path(CONFIG_YAML_PATH)
-    config_base = _read_with_retry(user_file) if user_file.is_file() else {}
-    overlay = overlay_sibling_of(user_file)
-    if overlay.is_file():
-        try:
-            same = overlay.resolve() == user_file.resolve()
-        except OSError:
-            same = False
-        if not same:
-            return merge_config_layers(
-                config_base, _read_with_retry(overlay), sparse=True
-            )
-    return config_base
-
-
-def get_user_config() -> dict[str, Any]:
-    """只读用户 overlay（不存在则为空 dict）。"""
-    overlay = get_user_overlay_file()
-    if not overlay.is_file():
-        return {}
-    data = load_yaml_round_trip(overlay)
-    return data if isinstance(data, dict) else {}
-
-
-def patch_user_config(mutator) -> dict[str, Any]:
-    """读-改-写 ``config.user.yaml``。``mutator`` 就地改或返回新 dict。"""
-    overlay = get_user_overlay_file()
-    overlay.parent.mkdir(parents=True, exist_ok=True)
-    data = load_yaml_round_trip(overlay) if overlay.is_file() else {}
-    if not isinstance(data, dict):
-        data = {}
-    new_data = mutator(data)
-    if new_data is None:
-        new_data = data
-    if not isinstance(new_data, dict):
-        raise TypeError("patch_user_config mutator must return a dict")
-    dump_yaml_round_trip(overlay, new_data)
-    return new_data
+    return _read_with_retry(user_file) if user_file.is_file() else {}
 
 
 def get_default_model_provider(config: dict[str, Any] | None) -> str:
@@ -441,7 +313,7 @@ def validate_persisted_kv_cache_affinity() -> tuple[bool, list[str]]:
 
 
 def set_config(config):
-    path = resolve_user_config_io_path(CONFIG_YAML_PATH, CONFIG_YAML_PATH)
+    path = Path(CONFIG_YAML_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
@@ -612,15 +484,9 @@ def set_auto_memory_enabled(enabled: bool) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
-def load_yaml_round_trip(config_path: Path, *, follow_overlay: bool = True):
-    """ruamel 加载 config，保留注释与格式。
-
-    对用户 ``config.yaml`` 路径：默认已有 overlay 则读 overlay；文件缺失返回 ``{}``。
-    ``follow_overlay=False`` 读系统 yaml 本身（permissions 等暂不进 overlay 的段）。
-    """
+def load_yaml_round_trip(config_path: Path):
+    """ruamel 加载 config，保留注释与格式。文件缺失返回 ``{}``。"""
     config_path = Path(config_path)
-    if follow_overlay:
-        config_path = resolve_user_config_io_path(config_path, CONFIG_YAML_PATH)
     if not config_path.is_file():
         return {}
     rt = YAML()
@@ -629,17 +495,9 @@ def load_yaml_round_trip(config_path: Path, *, follow_overlay: bool = True):
         return rt.load(f)
 
 
-def dump_yaml_round_trip(
-    config_path: Path, data: Any, *, follow_overlay: bool = True
-) -> None:
-    """ruamel 写回 config，保留注释与格式（原子写入：临时文件 + os.replace）。
-
-    对用户 ``config.yaml`` 路径：默认已有 overlay 或新装无旧文件时只写 overlay。
-    ``follow_overlay=False`` 写系统 yaml 本身。
-    """
+def dump_yaml_round_trip(config_path: Path, data: Any) -> None:
+    """ruamel 写回 config，保留注释与格式（原子写入：临时文件 + os.replace）。"""
     config_path = Path(config_path)
-    if follow_overlay:
-        config_path = resolve_user_config_io_path(config_path, CONFIG_YAML_PATH)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     rt = YAML()
     rt.preserve_quotes = True
@@ -697,7 +555,7 @@ def update_config(mutator, *, lock_timeout: float = 10.0) -> Any:
     否则同进程二次获取锁将死锁。如需在写盘后读取展示数据，请在 update_config
     返回后另起一次独立调用（此时锁已释放，安全）。
     """
-    write_path = resolve_user_config_io_path(CONFIG_YAML_PATH, CONFIG_YAML_PATH)
+    write_path = Path(CONFIG_YAML_PATH)
     with _CONFIG_WRITE_LOCK:
         with portalocker.Lock(
             str(_config_lock_path(write_path)),
@@ -710,28 +568,6 @@ def update_config(mutator, *, lock_timeout: float = 10.0) -> Any:
             if new_data is None:
                 return data
             dump_yaml_round_trip(CONFIG_YAML_PATH, new_data)
-            return new_data
-
-
-def update_system_config(mutator, *, lock_timeout: float = 10.0) -> Any:
-    """跨进程互斥读写用户系统 ``config.yaml``，不重定向到 overlay。
-
-    permissions 暂不进 overlay，档位 / persist_allow_rule 走这条。
-    锁语义与 ``update_config`` 相同且共用 ``_CONFIG_WRITE_LOCK``（不可重入）。
-    """
-    write_path = Path(CONFIG_YAML_PATH)
-    with _CONFIG_WRITE_LOCK:
-        with portalocker.Lock(
-            str(_config_lock_path(write_path)),
-            timeout=lock_timeout,
-        ):
-            data = load_yaml_round_trip(write_path, follow_overlay=False)
-            if data is None:
-                data = {}
-            new_data = mutator(data)
-            if new_data is None:
-                return data
-            dump_yaml_round_trip(write_path, new_data, follow_overlay=False)
             return new_data
 
 
@@ -1034,7 +870,7 @@ def update_skill_retrieval_in_config(updates: dict[str, Any]) -> None:
 
 
 def update_permissions_enabled_in_config(value: bool) -> None:
-    """更新 permissions.enabled（工具安全护栏开关）并写回系统 yaml。"""
+    """更新 permissions.enabled（工具安全护栏开关）并写回。"""
 
     def mutator(data: dict[str, Any]) -> dict[str, Any]:
         if "permissions" not in data or not isinstance(data.get("permissions"), dict):
@@ -1042,7 +878,7 @@ def update_permissions_enabled_in_config(value: bool) -> None:
         data["permissions"]["enabled"] = value
         return data
 
-    update_system_config(mutator)
+    update_config(mutator)
 
 
 def update_permission_profile_in_config(profile: str) -> bool:
@@ -1094,7 +930,7 @@ def update_permission_profile_in_config(profile: str) -> bool:
         _set(defaults, "write", patch["file_guard_rw"])
         return data
 
-    update_system_config(mutator)
+    update_config(mutator)
     return changed
 
 
@@ -1321,10 +1157,32 @@ def get_permissions_approval_overrides() -> dict[str, Any]:
     return {"approval_overrides": [x for x in raw if isinstance(x, dict)]}
 
 
+def _permissions_map(data: dict[str, Any]) -> dict[str, Any]:
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        perms = {}
+        data["permissions"] = perms
+    return perms
+
+
+def _dict_id(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("id") or "").strip()
+
+
+def _list_without_id(items: Any, item_id: str) -> list[Any]:
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if _dict_id(x) != item_id]
+
+
 def create_permissions_rule_in_config(rule: dict[str, Any]) -> dict[str, Any]:
-    """追加一条 ``permissions.rules`` 项，返回落盘后的规则（含 ``id``）。"""
+    """追加一条 ``permissions.rules`` 到系统 yaml，返回落盘后的规则（含 ``id``）。"""
     if not isinstance(rule, dict):
         raise ValueError("rule must be an object")
+    if str(rule.get("layer") or "").strip().lower() == "builtin":
+        raise ValueError("cannot persist builtin rules")
     rid = str(rule.get("id") or "").strip() or f"ui_rule_{uuid.uuid4().hex[:12]}"
     stored: dict[str, Any] = {"id": rid}
     for key in _RULE_MUTABLE_KEYS:
@@ -1340,43 +1198,45 @@ def create_permissions_rule_in_config(rule: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("pattern must be non-empty")
     _normalize_rule_severity_action(stored)
 
-    data = load_yaml_round_trip(CONFIG_YAML_PATH)
-    if "permissions" not in data:
-        data["permissions"] = {}
-    rules = data["permissions"].get("rules")
-    if not isinstance(rules, list):
-        rules = []
-    if any(isinstance(r, dict) and str(r.get("id") or "").strip() == rid for r in rules):
+    existing = get_permissions_rules().get("rules") or []
+    if any(_dict_id(r) == rid for r in existing):
         raise ValueError(f"rule id already exists: {rid}")
-    rules.append(stored)
-    data["permissions"]["rules"] = rules
-    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        perms = _permissions_map(data)
+        rules = perms.get("rules")
+        if not isinstance(rules, list):
+            rules = []
+        if any(_dict_id(r) == rid for r in rules):
+            raise ValueError(f"rule id already exists: {rid}")
+        rules.append(stored)
+        perms["rules"] = rules
+        return data
+
+    update_config(mutator)
     return stored
 
 
 def update_permissions_rule_in_config(rule_id: str, patch: dict[str, Any]) -> dict[str, Any]:
-    """按 ``id`` 合并更新一条 rule。"""
+    """按 ``id`` 合并更新一条用户 rule，写入系统 yaml。"""
     rid = str(rule_id or "").strip()
     if not rid:
         raise ValueError("id is required")
     if not isinstance(patch, dict):
         raise ValueError("patch must be an object")
 
-    data = load_yaml_round_trip(CONFIG_YAML_PATH)
-    if "permissions" not in data:
-        data["permissions"] = {}
-    rules = data["permissions"].get("rules")
-    if not isinstance(rules, list):
-        rules = []
-    idx: int | None = None
-    for i, r in enumerate(rules):
-        if isinstance(r, dict) and str(r.get("id") or "").strip() == rid:
-            idx = i
+    merged_rules = get_permissions_rules().get("rules") or []
+    current: dict[str, Any] | None = None
+    for r in merged_rules:
+        if _dict_id(r) == rid:
+            current = dict(r)
             break
-    if idx is None:
+    if current is None:
         raise ValueError(f"rule not found: {rid}")
+    if str(current.get("layer") or "").strip().lower() == "builtin":
+        raise ValueError("cannot persist builtin rules")
 
-    merged: dict[str, Any] = dict(rules[idx])
+    merged: dict[str, Any] = dict(current)
     for k, v in patch.items():
         if k == "id":
             continue
@@ -1387,6 +1247,7 @@ def update_permissions_rule_in_config(rule_id: str, patch: dict[str, Any]) -> di
         else:
             merged[k] = v
     merged["id"] = rid
+    merged.pop("layer", None)
     if "tools" in merged:
         merged["tools"] = _normalize_rule_tools(merged["tools"])
     if "pattern" in merged:
@@ -1396,48 +1257,71 @@ def update_permissions_rule_in_config(rule_id: str, patch: dict[str, Any]) -> di
     if not merged.get("pattern"):
         raise ValueError("pattern must be non-empty")
     _normalize_rule_severity_action(merged)
-    rules[idx] = merged
-    data["permissions"]["rules"] = rules
-    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        perms = _permissions_map(data)
+        rules = perms.get("rules")
+        if not isinstance(rules, list):
+            rules = []
+        replaced = False
+        for i, r in enumerate(rules):
+            if _dict_id(r) == rid:
+                rules[i] = merged
+                replaced = True
+                break
+        if not replaced:
+            rules.append(merged)
+        perms["rules"] = rules
+        return data
+
+    update_config(mutator)
     return merged
 
 
 def delete_permissions_rule_in_config(rule_id: str) -> bool:
-    """删除 ``permissions.rules`` 中指定 ``id``；若未找到返回 False。"""
+    """删除系统 yaml 中指定 ``id`` 的用户 rule。"""
     rid = str(rule_id or "").strip()
     if not rid:
         raise ValueError("id is required")
-    data = load_yaml_round_trip(CONFIG_YAML_PATH)
-    if "permissions" not in data:
-        return False
-    rules = data["permissions"].get("rules")
-    if not isinstance(rules, list):
-        return False
-    new_rules = [r for r in rules if not (isinstance(r, dict) and str(r.get("id") or "").strip() == rid)]
-    if len(new_rules) == len(rules):
-        return False
-    data["permissions"]["rules"] = new_rules
-    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
-    return True
+    found = False
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal found
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            return data
+        rules = perms.get("rules")
+        new_rules = _list_without_id(rules, rid)
+        if isinstance(rules, list) and len(new_rules) != len(rules):
+            found = True
+            perms["rules"] = new_rules
+        return data
+
+    update_config(mutator)
+    return found
 
 
 def delete_permissions_approval_override_in_config(override_id: str) -> bool:
-    """按 ``id`` 删除 ``approval_overrides`` 中一项；若未找到返回 False。"""
+    """按 ``id`` 删除系统 yaml 中的 ``approval_overrides``。"""
     oid = str(override_id or "").strip()
     if not oid:
         raise ValueError("id is required")
-    data = load_yaml_round_trip(CONFIG_YAML_PATH)
-    if "permissions" not in data:
-        return False
-    ov = data["permissions"].get("approval_overrides")
-    if not isinstance(ov, list):
-        return False
-    new_ov = [x for x in ov if not (isinstance(x, dict) and str(x.get("id") or "").strip() == oid)]
-    if len(new_ov) == len(ov):
-        return False
-    data["permissions"]["approval_overrides"] = new_ov
-    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
-    return True
+    found = False
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal found
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            return data
+        ov = perms.get("approval_overrides")
+        new_ov = _list_without_id(ov, oid)
+        if isinstance(ov, list) and len(new_ov) != len(ov):
+            found = True
+            perms["approval_overrides"] = new_ov
+        return data
+
+    update_config(mutator)
+    return found
 
 
 def _normalize_rule_tools(raw: Any) -> list[str]:

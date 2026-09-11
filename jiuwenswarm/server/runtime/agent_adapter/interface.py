@@ -52,6 +52,7 @@ from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse, AgentRe
 from jiuwenswarm.common.chat_final import ensure_final_mode_inplace
 from jiuwenswarm.extensions.hook_event import AgentServerHookEvents
 from jiuwenswarm.extensions.hooks_context import MemoryHookContext
+from jiuwenswarm.server.xiaoyi_invocation import request_billing_trace_id
 from jiuwenswarm.common.schema.message import EventType, ReqMethod
 from jiuwenswarm.server.utils.stream_utils import is_retry_notice_payload
 from jiuwenswarm.common.utils import (
@@ -110,6 +111,10 @@ def _extract_error_code_message(exc: BaseException) -> tuple[str | None, str | N
 
 class _TeamPlanApprovalPayloadError(ValueError):
     """Raised when a structured team.plan approval payload is malformed."""
+
+
+class _InvalidAnswersTypeError(ValueError):
+    """Raised when HITL continuation answers is not a list."""
 
 
 def _schedule_symphony_session_feedback(session_id: str, request_id: str) -> None:
@@ -1213,7 +1218,11 @@ class JiuWenSwarm:
         if isinstance(query, InteractiveInput):
             final_query = query
         else:
-            answers = params.get("answers", [])
+            answers = params.get("answers")
+            if answers is not None and not isinstance(answers, list):
+                raise _InvalidAnswersTypeError(
+                    f"answers must be a list, got {type(answers).__name__}"
+                )
             if answers:
                 request_id = params.get("request_id", "")
                 source = params.get("source", "")
@@ -2175,6 +2184,14 @@ class JiuWenSwarm:
                 payload={"error": str(exc)},
                 metadata=request.metadata,
             )
+        except _InvalidAnswersTypeError as exc:
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"status": "failed", "code": "INVALID_ARGUMENT", "error": str(exc)},
+                metadata=request.metadata,
+            )
 
         # cloud memory: before chat hook
         if memory_mode == "cloud":
@@ -2184,6 +2201,7 @@ class JiuWenSwarm:
                 channel_id=request.channel_id,
                 agent_name="main_agent",
                 workspace_dir=str(get_agent_home_dir()),
+                trace_id=request_billing_trace_id(request),
                 extra=_memory_hook_extra(request),
             )
             await ExtensionRegistry.get_instance().trigger(AgentServerHookEvents.MEMORY_BEFORE_CHAT, mem_ctx)
@@ -2238,6 +2256,7 @@ class JiuWenSwarm:
                     channel_id=request.channel_id,
                     agent_name="main_agent",
                     workspace_dir=str(get_agent_home_dir()),
+                    trace_id=request_billing_trace_id(request),
                     assistant_message=content_str,
                     extra=_memory_hook_extra(request),
                 )
@@ -2432,6 +2451,14 @@ class JiuWenSwarm:
                 is_complete=True,
             )
             return
+        except _InvalidAnswersTypeError as exc:
+            yield AgentResponseChunk(
+                request_id=rid,
+                channel_id=cid,
+                payload={"event_type": "chat.error", "code": "INVALID_ARGUMENT", "error": str(exc)},
+                is_complete=True,
+            )
+            return
 
         # Team 模式：使用原始 query，而不是 build_user_prompt 包装后的内容
         team_query_is_interactive_input = False
@@ -2454,6 +2481,7 @@ class JiuWenSwarm:
                 channel_id=request.channel_id,
                 agent_name="main_agent",
                 workspace_dir=str(get_agent_home_dir()),
+                trace_id=request_billing_trace_id(request),
                 extra=_memory_hook_extra(request),
             )
             await ExtensionRegistry.get_instance().trigger(AgentServerHookEvents.MEMORY_BEFORE_CHAT, mem_ctx)
@@ -3132,6 +3160,7 @@ class JiuWenSwarm:
                 channel_id=request.channel_id,
                 agent_name="main_agent",
                 workspace_dir=str(get_agent_home_dir()),
+                trace_id=request_billing_trace_id(request),
                 assistant_message=assistant_message,
                 extra=_memory_hook_extra(request),
             )
