@@ -167,11 +167,11 @@ def _memory_hook_extra(request: AgentRequest) -> dict[str, Any]:
 
     常规续聊只携带 ``session_id``，不会重复传 ``project_id``。项目归属已经在
     AgentServer 收包时写入 session metadata；Memory Hook 若只透传
-    ``request.params``，GaussPD 的 MemoryAdd 会退化到默认隔离桶。MCP Rail 已按
+    ``request.params``，Celia 的 MemoryAdd 会退化到默认隔离桶。MCP Rail 已按
     session metadata 取值，此处使用同一真源，保持两条记忆链路一致。
 
     ``project_id`` 与 ``project_dir`` 都优先采用本轮请求值。后者是桌面工作区
-    的稳定隔离候选值：旧桌面会话仍可能只有 ``project_id=default``，GaussPD
+    的稳定隔离候选值：旧桌面会话仍可能只有 ``project_id=default``，Celia
     胶水会在这种情况下以该目录作为动态 ``project_id``。
     """
     extra = dict(request.params) if isinstance(request.params, dict) else {}
@@ -956,6 +956,21 @@ class JiuWenSwarm:
         self._session_manager = SessionManager()
         # SkillDev 模式：懒初始化，首次 skilldev.* 请求时构造
         self._skilldev_service = None
+
+    def owns_session(self, session_id: str | None) -> bool:
+        """该 agent 实例是否持有 *session_id* 的会话运行时（session-scoped 子 adapter）。
+
+        interrupt/cancel 按 session 精确路由用：chat.send 的 agent 按
+        (channel, mode, project_dir) 缓存，而 cancel 请求通常不带这些路由键，
+        只有 session_id——按缓存键找会命中同 channel 的其它 agent，interrupt
+        落到无关实例上空转（被停的 DeepAgent round 收不到 abort）。这里暴露
+        root adapter 内现成的 session 归属表，供 AgentManager 反查。
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return False
+        owns = getattr(adapter, "has_session_runtime", None)
+        return callable(owns) and bool(owns(session_id))
 
     def _get_skilldev_service(self):
         """懒初始化并返回 SkillDevService 实例.
@@ -2697,6 +2712,32 @@ class JiuWenSwarm:
                                 should_record = True
                             if et == "chat.error":
                                 await _prepare_rewind_for_error()
+                            # DeepAgent round 级异常（round_execution_error，如模型调用失败）：
+                            # agent-core 只以 execution.error 下发，客户端没有对应分支时会在
+                            # 流尾判成「已完成」（长任务中途失败 → 假完成，只剩琥珀「本轮曾
+                            # 发生异常」）。此处补发一条 chat.error，复用既有「轮内错误 →
+                            # 流尾失败收口」链路；原 execution.error 仍照常下发（web 的 goal
+                            # 语义依赖它）。带 goal 的属于 goal 尝试失败、后续可能继续，不补，
+                            # 避免打断续跑。
+                            if et == "execution.error" and not data.payload.get("goal"):
+                                await _prepare_rewind_for_error()
+                                _round_err_text = str(
+                                    data.payload.get("message")
+                                    or data.payload.get("error")
+                                    or "本轮执行失败"
+                                )
+                                _round_err_payload: dict[str, Any] = {
+                                    "event_type": "chat.error",
+                                    "error": _round_err_text,
+                                }
+                                if data.payload.get("code"):
+                                    _round_err_payload["code"] = data.payload.get("code")
+                                yield AgentResponseChunk(
+                                    request_id=rid,
+                                    channel_id=cid,
+                                    payload=_round_err_payload,
+                                    is_complete=False,
+                                )
                             if et == "context.compression_state":
                                 _append_compact_history_from_payload(
                                     payload=data.payload,
