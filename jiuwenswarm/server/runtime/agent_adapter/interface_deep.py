@@ -490,7 +490,7 @@ from jiuwenswarm.common.mcp_config import (
     unregister_live_office_claw_tool_instance,
     validate_office_claw_mcp_config,
 )
-from jiuwenswarm.common.deepagent_task_plan_binding_patch import (
+from jiuwenswarm.server.runtime.agent_adapter.deepagent_task_plan_binding_patch import (
     apply_deepagent_task_plan_binding_patch,
 )
 from jiuwenswarm.common.mcp_call_timeout_patch import apply_mcp_call_timeout_patch
