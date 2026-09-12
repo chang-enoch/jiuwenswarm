@@ -147,6 +147,7 @@ from jiuwenswarm.agents.harness.common.prompt.prompt_builder import (
 )
 from jiuwenswarm.agents.harness.common.rails import (
     BrowserTaskPromptRail,
+    IdentityRail,
     JiuSwarmStreamEventRail,
     InvocationContextRail,
     MultimodalImageRail,
@@ -1203,6 +1204,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._context_assemble_mode: str | None = None
         self._context_processor_rail: ContextProcessorRail | None = None
         self._runtime_prompt_rail: RuntimePromptRail | None = None
+        self._identity_rail: IdentityRail | None = None
         self._response_prompt_rail: ResponsePromptRail | None = None
         self._invocation_context_rail: InvocationContextRail | None = None
         self._security_rail: SecurityRail | None = None
@@ -4909,6 +4911,16 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             rail = None
         return rail
 
+    def _build_identity_rail(self) -> IdentityRail | None:
+        """Build IdentityRail to load IDENTITY.md into the identity section."""
+        try:
+            rail = IdentityRail(language=self._resolve_runtime_language())
+            logger.info("[JiuWenSwarmDeepAdapter] IdentityRail create success")
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] IdentityRail create failed: %s", exc)
+            rail = None
+        return rail
+
     def _build_skill_retrieval_prompt_rail(self) -> SkillRetrievalPromptRail | None:
         """Build lightweight agentic skill retrieval prompt guidance."""
         if not is_skill_retrieval_enabled():
@@ -5117,6 +5129,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 self._build_invocation_context_rail,
             ),
             _RailBuildInfo("_runtime_prompt_rail", self._build_runtime_prompt_rail),
+            _RailBuildInfo("_identity_rail", self._build_identity_rail),
             _RailBuildInfo("_response_prompt_rail", self._build_response_prompt_rail),
             _RailBuildInfo(
                 "_multimodal_image_rail",
@@ -6962,6 +6975,20 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             self._runtime_prompt_rail.set_model_name(self._resolve_model_name())
             self._runtime_prompt_rail.set_mode(runtime_config.mode)
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
+        if self._identity_rail:
+            self._identity_rail.set_language(resolved_language)
+            # 显式指定 IDENTITY.md 读取路径为全局 agent workspace（跨会话稳定），
+            # 防止默认路径解析逻辑受 workspace 切换影响。
+            try:
+                from jiuwenswarm.common.utils import get_deepagent_identity_md_path
+                self._identity_rail.set_identity_md_path(
+                    str(get_deepagent_identity_md_path())
+                )
+            except Exception:
+                logger.debug(
+                    "[JiuWenSwarmDeepAdapter] set_identity_md_path failed",
+                    exc_info=True,
+                )
         if self._response_prompt_rail:
             self._response_prompt_rail.set_channel(resolved_channel)
         if isinstance(self._subagent_rail, BrowserTaskPromptRail):
