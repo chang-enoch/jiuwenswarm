@@ -42,16 +42,21 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 import logging
-from logging.handlers import BaseRotatingHandler
 from ruamel.yaml import YAML
 
-_LOG_FILE_MAX_BYTES = 20 * 1024 * 1024
-_LOG_FILE_BACKUP_COUNT = 20
+# 按天切分：日内超限轮转出 <stem>.old.log（仅保最近一份），保留 90 天。
+# 布局与桌面端 <dataRoot>/logs/YYYY-MM-DD/ 一致，便于反馈打包按天过滤。
+# 注意：agent-core 侧有同名同语义实现
+# （openjiuwen/core/common/logging/dated_file_handler.py），两份需同步维护。
+_LOG_DATED_MAX_BYTES = 2 * 1024 * 1024
+_LOG_RETENTION_DAYS = 90
+_DATED_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass
 class CopyDiffResult:
     """Result of copy operation with diff tracking."""
+
     added_dirs: list[str]
     added_files: list[str]
     overwritten_files: list[str]
@@ -166,6 +171,7 @@ class TrackCopyDiff:
 @dataclass
 class LoggingLevels:
     """Container for logging level configuration."""
+
     logger: int
     console: int
     gateway: int
@@ -174,91 +180,100 @@ class LoggingLevels:
     full: int
 
 
-class SafeRotatingFileHandler(BaseRotatingHandler):
-    """Safe rotating file handler"""
+class DatedDailyFileHandler(logging.FileHandler):
+    """按天切分的日志文件 handler。
 
-    def __init__(self, filename, maxBytes=0, backupCount=0, encoding=None,
-                 delay=False, errors=None):
+    活动文件为 ``<base_dir>/<YYYY-MM-DD>/<filename>``，日期取本地时钟，
+    每次 emit 时解析——长驻进程跨天自动切文件。日内超过 ``max_bytes``
+    轮转出 ``<stem>.old.log``（仅保最近一份，对齐桌面端）。
+
+    ``filename`` 可含子目录。``base_dir`` 属性暴露给调用方做幂等判断。
+
+    注意：与 agent-core 的
+    ``openjiuwen/core/common/logging/dated_file_handler.py`` 同名同语义，
+    两份需同步维护（utils 不在模块级依赖 openjiuwen）。
+
+    Args:
+        base_dir: 日期目录的父目录（统一日志根）。
+        filename: 日期目录内的日志文件相对路径。
+        max_bytes: 日内大小上限；``0`` 表示不轮转。
+        encoding: 文件编码。
+    """
+
+    def __init__(
+        self, base_dir, filename, max_bytes=_LOG_DATED_MAX_BYTES, encoding="utf-8"
+    ):
         """Initialize the handler."""
-        super().__init__(filename, 'a', encoding, errors)
-        self.max_bytes = maxBytes
-        self.backup_count = backupCount
-        self._current_filename = filename
+        self.base_dir = str(base_dir)
+        self._relative_filename = filename
+        self.max_bytes = max_bytes
+        self._current_date = None
+        super().__init__(self._current_path(), mode="a", encoding=encoding, delay=True)
+        self._current_date = self._today()
 
-        if delay:
-            self.stream = None
+    @staticmethod
+    def _today():
+        """返回本地日期 ``YYYY-MM-DD`` 字符串。"""
+        return datetime.datetime.now().strftime("%Y-%m-%d")
 
-    def shouldRollover(self, record):
-        """
-        Determine if rollover should occur.
+    def _current_path(self):
+        """返回当前日期下的日志文件路径。"""
+        return str(Path(self.base_dir) / self._today() / self._relative_filename)
 
-        Returns True if the log file size exceeds maxBytes.
-        """
-        if self.stream is None:
-            return False
-        if self.max_bytes > 0:
-            msg = "%s\n" % self.format(record)
-            self.stream.seek(0, 2)  # Seek to end of file
-            if self.stream.tell() + len(msg) >= self.max_bytes:
-                return True
-        return False
-
-    def doRollover(self):
-        """
-        Perform log rotation to keep app.log as the active log file.
-        """
-        base_path = Path(self.baseFilename)
-
-        timestamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_filename = base_path.parent / f"{base_path.stem}_{timestamp}{base_path.suffix}"
-
+    def _open(self):
+        """打开文件前确保日期目录链存在（filename 可含子目录）。"""
         try:
-            if base_path.exists():
-                shutil.copy2(base_path, backup_filename)
-        except OSError as e:
-            print(f"WARNING: Could not copy log file to backup: {e}", file=sys.stderr)
+            Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return super()._open()
 
-        # Clean up old backup files
-        self._cleanup_old_backups()
+    def emit(self, record):
+        """跨天切换文件后写入；失败不抛（日志不阻塞业务）。"""
+        today = self._today()
+        if today != self._current_date:
+            self._switch_day(today)
+        self._rotate_if_needed(record)
+        super().emit(record)
 
+    def _switch_day(self, today):
+        """关闭旧流并切到新日期目录（失败则继续写旧文件，不丢日志）。"""
         try:
             if self.stream:
-                self.stream.seek(0)  # Seek to beginning
-                self.stream.truncate(0)  # Truncate to 0 bytes
-        except OSError as e:
-            print(f"WARNING: Could not truncate log file: {e}", file=sys.stderr)
+                self.stream.close()
+                self.stream = None
+            self._current_date = today
+            self.baseFilename = self._current_path()
+            if not self.delay:
+                self.stream = self._open()
+        except OSError:
+            self._current_date = today
+            if self.stream is None and not self.delay:
+                try:
+                    self.stream = self._open()
+                except OSError:
+                    pass
 
-    def _cleanup_old_backups(self):
-        """
-        Remove old backup files if they exceed backupCount.
-
-        Backup files are sorted by modification time (oldest first).
-        """
-        if self.backup_count <= 0:
+    def _rotate_if_needed(self, record):
+        """日内超限时 copy+truncate 轮转到 ``<stem>.old.log``。"""
+        if not self.stream or self.max_bytes <= 0:
             return
-
         try:
-            base_path = Path(self.baseFilename)
-            log_dir = base_path.parent
-
-            backup_files = []
-            for f in log_dir.glob(f"{base_path.stem}_*{base_path.suffix}"):
-                if f.is_file() and f != base_path:
-                    backup_files.append(f)
-
-            # Sort by modification time (oldest first)
-            backup_files.sort(key=lambda x: x.stat().st_mtime)
-
-            # Remove excess files
-            files_to_delete = len(backup_files) - self.backup_count
-            if files_to_delete > 0:
-                for f in backup_files[:files_to_delete]:
-                    try:
-                        f.unlink()
-                    except OSError as e:
-                        print(f"WARNING: Could not delete old log file {f}: {e}", file=sys.stderr)
-        except Exception as e:
-            print(f"WARNING: Error during backup cleanup: {e}", file=sys.stderr)
+            msg = "%s\n" % self.format(record)
+            self.stream.seek(0, os.SEEK_END)
+            if (
+                self.stream.tell() + len(msg.encode(self.encoding or "utf-8"))
+                < self.max_bytes
+            ):
+                return
+            backup = Path(self.baseFilename).with_suffix(".old.log")
+            if backup.exists():
+                backup.unlink()
+            shutil.copy2(self.baseFilename, backup)
+            self.stream.seek(0)
+            self.stream.truncate(0)
+        except OSError:
+            pass
 
 
 def _parse_log_level(name: str, default: int = logging.INFO) -> int:
@@ -274,7 +289,9 @@ def _log_component_from_logger_name(name: str) -> str:
         return "channel"
     if name.startswith("jiuwenswarm.agents.harness.common.rails.permissions"):
         return "permissions"
-    if name.startswith("openjiuwen.harness.security") or name.startswith("openjiuwen.harness.rails.security"):
+    if name.startswith("openjiuwen.harness.security") or name.startswith(
+        "openjiuwen.harness.rails.security"
+    ):
         return "permissions"
     if name.startswith("jiuwenswarm.agents") or name.startswith("jiuwenswarm.server"):
         return "agent_server"
@@ -419,8 +436,6 @@ def get_user_workspace_dir() -> Path:
     return _workspace_base_dir
 
 
-
-
 # Cache for resolved paths
 _config_dir: Path | None = None
 _workspace_dir: Path | None = None
@@ -446,7 +461,10 @@ def _detect_installation_mode() -> bool:
     # Check if module file is in any site-packages directory
     for path in sys.path:
         site_packages = Path(path)
-        if "site-packages" in str(site_packages) and site_packages in module_file.parents:
+        if (
+            "site-packages" in str(site_packages)
+            and site_packages in module_file.parents
+        ):
             _is_package = True
             return True
 
@@ -544,16 +562,20 @@ def prompt_preferred_language() -> Optional[Literal["zh", "en"]]:
     print("[jiuwenswarm-init]  须明确选择：1 / 2 / zh / en（无默认语言）")
     print("[jiuwenswarm-init]  取消：no / n / q / cancel / 取消")
     print("[jiuwenswarm-init] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    raw = input(
-        "[jiuwenswarm-init] 请输入选项 (1, 2, zh, en) 或 no 取消: "
-    ).strip().lower()
+    raw = (
+        input("[jiuwenswarm-init] 请输入选项 (1, 2, zh, en) 或 no 取消: ")
+        .strip()
+        .lower()
+    )
     if raw in ("no", "n", "q", "quit", "cancel", "取消"):
         return None
     if raw in ("1", "zh", "中文", "chinese"):
         return "zh"
     if raw in ("2", "en", "english", "e", "英文"):
         return "en"
-    print("[jiuwenswarm-init] 无效选项；未选择有效语言，初始化已取消（与拒绝 yes/no 相同）。")
+    print(
+        "[jiuwenswarm-init] 无效选项；未选择有效语言，初始化已取消（与拒绝 yes/no 相同）。"
+    )
     return None
 
 
@@ -595,7 +617,8 @@ def _update_skills_state_for_builtin(
 
     # 获取已记录的技能名称
     existing_names = {
-        item.get("name") for item in state["installed_plugins"]
+        item.get("name")
+        for item in state["installed_plugins"]
         if isinstance(item, dict) and item.get("name")
     }
 
@@ -603,14 +626,16 @@ def _update_skills_state_for_builtin(
     installed_at = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
     for skill_name in skill_names:
         if skill_name not in existing_names:
-            state["installed_plugins"].append({
-                "name": skill_name,
-                "marketplace": "builtin",
-                "version": "",
-                "commit": "",
-                "source": "builtin",
-                "installed_at": installed_at,
-            })
+            state["installed_plugins"].append(
+                {
+                    "name": skill_name,
+                    "marketplace": "builtin",
+                    "version": "",
+                    "commit": "",
+                    "source": "builtin",
+                    "installed_at": installed_at,
+                }
+            )
             logger.info(f"已将默认技能记录到状态文件: {skill_name}")
 
     # 保存状态文件
@@ -688,6 +713,7 @@ def _install_default_builtin_skills(
     if installed_skills:
         _update_skills_state_for_builtin(user_skills_dir, installed_skills)
 
+
 def ensure_builtin_skills_installed() -> None:
     """每次启动时检查并补装缺失的内置技能（幂等）。
 
@@ -708,7 +734,8 @@ def ensure_builtin_skills_installed() -> None:
 
     # 只扫描 default_skills 中指定的内置技能
     builtin_skills = [
-        item for item in builtin_dir.iterdir()
+        item
+        for item in builtin_dir.iterdir()
         if item.is_dir()
         and (item / "SKILL.md").exists()
         and item.name in default_skills
@@ -733,6 +760,7 @@ def ensure_builtin_skills_installed() -> None:
     if installed_skills:
         _update_skills_state_for_builtin(user_skills_dir, installed_skills)
 
+
 def _migrate_from_jiuwenclaw_root() -> bool:
     """Migrate from legacy ~/.jiuwenclaw/ to ~/.jiuwenswarm/.
 
@@ -751,7 +779,9 @@ def _migrate_from_jiuwenclaw_root() -> bool:
         return False
     if new_root.exists():
         # New workspace exists, don't migrate
-        print(f"[migration] Both .jiuwenclaw and .jiuwenswarm exist, skipping migration")
+        print(
+            f"[migration] Both .jiuwenclaw and .jiuwenswarm exist, skipping migration"
+        )
         return False
 
     print(f"[migration] Migrating from {old_root} to {new_root}")
@@ -761,7 +791,9 @@ def _migrate_from_jiuwenclaw_root() -> bool:
         print(f"[migration] Migration completed: {old_root} -> {new_root}")
         return True
     except OSError as e:
-        print(f"[migration] ERROR: Failed to migrate from .jiuwenclaw to .jiuwenswarm: {e}")
+        print(
+            f"[migration] ERROR: Failed to migrate from .jiuwenclaw to .jiuwenswarm: {e}"
+        )
         return False
 
 
@@ -879,8 +911,10 @@ def _migrate_legacy_workspace(
 
         builtin_skill_names = _get_builtin_skill_names()
         for skill_dir in new_skills.iterdir():
-            if skill_dir.is_dir() and (skill_dir.name in builtin_skill_names \
-                 or skill_dir.name in ["daily-report", "skill-creation"]):
+            if skill_dir.is_dir() and (
+                skill_dir.name in builtin_skill_names
+                or skill_dir.name in ["daily-report", "skill-creation"]
+            ):
                 shutil.rmtree(skill_dir)
 
     # 4. Migrate memory
@@ -915,7 +949,11 @@ def _migrate_legacy_workspace(
             elif item.is_file():
                 # Date-based memory files (YYYY-MM-DD.md) -> daily_memory/
                 # Other files -> new_memory/ root
-                dest = daily_memory / item.name if date_pattern.match(item.name) else new_memory / item.name
+                dest = (
+                    daily_memory / item.name
+                    if date_pattern.match(item.name)
+                    else new_memory / item.name
+                )
                 if not dest.exists():
                     shutil.copy2(item, dest)
                     logger.info(f"Migrated memory file: {item.name}")
@@ -982,6 +1020,7 @@ def _clean_home_keep_cron(home_dir: Path, *, context: str) -> None:
         f"({context}): {home_dir}"
     )
 
+
 def _recover_gateway_cron_jobs(workspace_dir: Path) -> None:
     """Recover cron_jobs.json mistakenly migrated to gateway/ (dead path).
 
@@ -1042,6 +1081,7 @@ def _recover_gateway_cron_jobs(workspace_dir: Path) -> None:
     except (json.JSONDecodeError, OSError) as exc:
         logger.error(f"Failed to recover cron_jobs.json from gateway/: {exc}")
 
+
 def cleanup_team_files(workspace_dir: Path) -> None:
     """清理 Team 旧版本遗留的文件和目录.
 
@@ -1065,18 +1105,26 @@ def cleanup_team_files(workspace_dir: Path) -> None:
     if legacy_workspace.exists():
         try:
             shutil.rmtree(legacy_workspace)
-            logger.info(f"[Cleanup] Removed legacy workspace directory: {legacy_workspace}")
+            logger.info(
+                f"[Cleanup] Removed legacy workspace directory: {legacy_workspace}"
+            )
         except OSError as e:
-            logger.warning(f"[Cleanup] Failed to remove legacy workspace directory: {e}")
+            logger.warning(
+                f"[Cleanup] Failed to remove legacy workspace directory: {e}"
+            )
 
     # 清理 {workspace_dir}/agent/team_data/ (旧版本 team 数据库目录)
     legacy_team_data = agent_dir / "team_data"
     if legacy_team_data.exists():
         try:
             shutil.rmtree(legacy_team_data)
-            logger.info(f"[Cleanup] Removed legacy team_data directory: {legacy_team_data}")
+            logger.info(
+                f"[Cleanup] Removed legacy team_data directory: {legacy_team_data}"
+            )
         except OSError as e:
-            logger.warning(f"[Cleanup] Failed to remove legacy team_data directory: {e}")
+            logger.warning(
+                f"[Cleanup] Failed to remove legacy team_data directory: {e}"
+            )
 
     # 清理 {workspace_dir}/team.db* (旧版本 team 数据库文件)
     legacy_team_db_root = workspace_dir / "team.db"
@@ -1087,7 +1135,9 @@ def cleanup_team_files(workspace_dir: Path) -> None:
                 db_file.unlink()
                 logger.info(f"[Cleanup] Removed legacy team database file: {db_file}")
             except OSError as e:
-                logger.warning(f"[Cleanup] Failed to remove legacy team database file: {e}")
+                logger.warning(
+                    f"[Cleanup] Failed to remove legacy team database file: {e}"
+                )
 
     # 清理 {workspace_dir}/agent/team.db* (旧版本 team 数据库文件)
     legacy_team_db_agent = agent_dir / "team.db"
@@ -1098,7 +1148,9 @@ def cleanup_team_files(workspace_dir: Path) -> None:
                 db_file.unlink()
                 logger.info(f"[Cleanup] Removed legacy team database file: {db_file}")
             except OSError as e:
-                logger.warning(f"[Cleanup] Failed to remove legacy team database file: {e}")
+                logger.warning(
+                    f"[Cleanup] Failed to remove legacy team database file: {e}"
+                )
 
 
 def prepare_workspace(
@@ -1165,9 +1217,7 @@ def prepare_workspace(
     old_home_is_legacy = old_home.exists() and any(
         (old_home / m).exists() for m in _legacy_home_markers
     )
-    legacy_dirs_exist = (
-        old_home_is_legacy or old_skills.exists() or old_memory.exists()
-    )
+    legacy_dirs_exist = old_home_is_legacy or old_skills.exists() or old_memory.exists()
 
     # Recover cron jobs mistakenly left in gateway/ (dead path) by an older
     # buggy migration — merge them back into agent/home/cron_jobs.json.
@@ -1191,13 +1241,18 @@ def prepare_workspace(
     config_dest_dir = workspace_dir / "config"
     config_dest_dir.mkdir(parents=True, exist_ok=True)
     config_yaml_dest = config_dest_dir / "config.yaml"
-    overlay_yaml_dest = config_dest_dir / "config.user.yaml"  # 遗留 overlay；启动折进 yaml 后删除
+    overlay_yaml_dest = (
+        config_dest_dir / "config.user.yaml"
+    )  # 遗留 overlay；启动折进 yaml 后删除
 
     from jiuwenswarm.common.config_split import sync_system_files_from_package
     from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
-        is_legacy_workspace_memory_enabled, is_old_celia_enabled,
+        is_legacy_workspace_memory_enabled,
+        is_old_celia_enabled,
     )
-    from jiuwenswarm.agents.harness.common.memory.workspace import load_workspace_memory_config
+    from jiuwenswarm.agents.harness.common.memory.workspace import (
+        load_workspace_memory_config,
+    )
 
     builtin_rules_src = resources_dir / "builtin_rules.yaml"
     builtin_rules_dest = config_dest_dir / "builtin_rules.yaml"
@@ -1236,7 +1291,9 @@ def prepare_workspace(
     legacy_memory_enabled = is_legacy_workspace_memory_enabled(memory_config)
 
     if legacy_dirs_exist and not overwrite:
-        _migrate_legacy_workspace(workspace_dir, preferred_language, memory_enabled=legacy_memory_enabled)
+        _migrate_legacy_workspace(
+            workspace_dir, preferred_language, memory_enabled=legacy_memory_enabled
+        )
     elif overwrite:
         try:
             if old_home.exists():
@@ -1258,14 +1315,18 @@ def prepare_workspace(
     template_root = resources_dir
     template_agent_dir = template_root / "agent"
     if not template_agent_dir.is_dir():
-        raise RuntimeError(f"resources template missing agent dir: {template_agent_dir}")
+        raise RuntimeError(
+            f"resources template missing agent dir: {template_agent_dir}"
+        )
 
     # ----- .env: copy from template to config/.env -----
     env_template_src_candidates = [
         resources_dir / ".env.template",
         package_root / ".env.template",
     ]
-    env_template_src = next((p for p in env_template_src_candidates if p.exists()), None)
+    env_template_src = next(
+        (p for p in env_template_src_candidates if p.exists()), None
+    )
     if not env_template_src:
         raise RuntimeError(
             "env template source not found; tried: "
@@ -1285,7 +1346,10 @@ def prepare_workspace(
     agent_root = workspace_dir / "agent"
     agent_sessions = agent_root / "sessions"
     (agent_root / ".checkpoint").mkdir(parents=True, exist_ok=True)
-    (agent_root / ".logs").mkdir(parents=True, exist_ok=True)
+    # 桌面端注入统一日志目录（JIUWENSWARM_LOG_DIR）时，日志不落
+    # agent/.logs，工作区不再预建该目录（避免遗留空文件夹）。
+    if not os.getenv("JIUWENSWARM_LOG_DIR", "").strip():
+        (agent_root / ".logs").mkdir(parents=True, exist_ok=True)
 
     # ----- DeepAgent workspace (standard DeepAgents schema) -----
     deepagent_workspace = agent_root / "workspace"
@@ -1330,7 +1394,10 @@ def prepare_workspace(
             shutil.copytree(src_dir, dst_dir, ignore=ignore)
         else:
             shutil.copytree(
-                src_dir, dst_dir, dirs_exist_ok=True, ignore=ignore,
+                src_dir,
+                dst_dir,
+                dirs_exist_ok=True,
+                ignore=ignore,
                 copy_function=copy_if_missing,
             )
 
@@ -1345,9 +1412,8 @@ def prepare_workspace(
             _copy_dir(
                 template_agent_workspace,
                 deepagent_workspace,
-                ignore_patterns=("*_ZH.md", "*_EN.md", "skills") + (
-                    () if legacy_memory_enabled else ("USER.md", "MEMORY.md", "memory")
-                ),
+                ignore_patterns=("*_ZH.md", "*_EN.md", "skills")
+                + (() if legacy_memory_enabled else ("USER.md", "MEMORY.md", "memory")),
             )
     else:
         deepagent_workspace.mkdir(parents=True, exist_ok=True)
@@ -1357,7 +1423,11 @@ def prepare_workspace(
             cumulative=cumulative_diff,
             overwrite=overwrite,
         ):
-            _copy_dir(template_agent_memory, agent_memory, ignore_patterns=("*_ZH.md", "*_EN.md"))
+            _copy_dir(
+                template_agent_memory,
+                agent_memory,
+                ignore_patterns=("*_ZH.md", "*_EN.md"),
+            )
 
     # Copy multi-language files based on resolved language
     # Files with _ZH/_EN suffix are copied to the workspace without suffix
@@ -1462,7 +1532,9 @@ def _print_diff_summary(diff_result: CopyDiffResult, overwrite: bool) -> None:
 
     total_files = len(diff_result.added_files) + len(diff_result.overwritten_files)
     if total_files == 0:
-        print("[jiuwenswarm-init] 初始化完成：工作区已就绪，无新文件需创建 / Init complete: workspace ready, no new files needed")
+        print(
+            "[jiuwenswarm-init] 初始化完成：工作区已就绪，无新文件需创建 / Init complete: workspace ready, no new files needed"
+        )
         return
 
     print("[jiuwenswarm-init] 初始化完成，文件变更如下：/ Init complete, file changes:")
@@ -1471,15 +1543,18 @@ def _print_diff_summary(diff_result: CopyDiffResult, overwrite: bool) -> None:
         for f in diff_result.added_files[:10]:
             print(f"    + {f}")
         if len(diff_result.added_files) > 10:
-            print(f"    ...等 {len(diff_result.added_files) - 10} 个 / ...and {len(diff_result.added_files) - 10} more")
+            print(
+                f"    ...等 {len(diff_result.added_files) - 10} 个 / ...and {len(diff_result.added_files) - 10} more"
+            )
     if diff_result.overwritten_files:
-        print(f"  更新文件 / Updated files: "
-              f"{len(diff_result.overwritten_files)}")
+        print(f"  更新文件 / Updated files: {len(diff_result.overwritten_files)}")
         for f in diff_result.overwritten_files[:10]:
             print(f"    ~ {f}")
         if len(diff_result.overwritten_files) > 10:
-            print(f"    ...等 {len(diff_result.overwritten_files) - 10} 个 / "
-              f"...and {len(diff_result.overwritten_files) - 10} more")
+            print(
+                f"    ...等 {len(diff_result.overwritten_files) - 10} 个 / "
+                f"...and {len(diff_result.overwritten_files) - 10} more"
+            )
 
 
 def init_user_workspace(
@@ -1519,18 +1594,26 @@ def init_user_workspace(
                 f"[jiuwenswarm-init] With -f/--force flag, "
                 f"entire {workspace_dir} will be deleted for clean initialization."
             )
-            print("[jiuwenswarm-init] WARNING: This will delete all historical configuration and memory information.")
+            print(
+                "[jiuwenswarm-init] WARNING: This will delete all historical configuration and memory information."
+            )
             print("[jiuwenswarm-init] This action cannot be undone.")
             if _is_interactive():
-                confirmation = input(
-                    "[jiuwenswarm-init] Do you want to confirm reinitialization? (yes/no): "
-                ).strip().lower()
+                confirmation = (
+                    input(
+                        "[jiuwenswarm-init] Do you want to confirm reinitialization? (yes/no): "
+                    )
+                    .strip()
+                    .lower()
+                )
 
                 if confirmation not in ("yes", "y"):
                     print("[jiuwenswarm-init] Initialization cancelled. Exiting.")
                     return "cancelled"
             else:
-                print("[jiuwenswarm-init] Non-interactive mode: proceeding with reinitialization.")
+                print(
+                    "[jiuwenswarm-init] Non-interactive mode: proceeding with reinitialization."
+                )
 
             # Close all log handlers to release file locks before deleting
             _close_log_handlers()
@@ -1538,31 +1621,42 @@ def init_user_workspace(
             # Delete entire workspace directory for clean initialization
             try:
                 shutil.rmtree(workspace_dir)
-                print(f"[jiuwenswarm-init] Removed workspace directory: {workspace_dir}")
+                print(
+                    f"[jiuwenswarm-init] Removed workspace directory: {workspace_dir}"
+                )
             except OSError as e:
-                print(f"[jiuwenswarm-init] ERROR: Failed to remove "
-                  f"workspace: {e}")
+                print(f"[jiuwenswarm-init] ERROR: Failed to remove workspace: {e}")
                 return "cancelled"
         else:
             # Merge mode: inform about preservation
-            print("[jiuwenswarm-init] 增量初始化：只添加缺失文件，不覆盖已有文件 / "
-              "Incremental init: only adds missing files, preserves existing")
+            print(
+                "[jiuwenswarm-init] 增量初始化：只添加缺失文件，不覆盖已有文件 / "
+                "Incremental init: only adds missing files, preserves existing"
+            )
             print("[jiuwenswarm-init] 此操作不可撤销 / This action cannot be undone.")
             if _is_interactive():
-                confirmation = input("[jiuwenswarm-init] Do you want to continue? (yes/no): ").strip().lower()
+                confirmation = (
+                    input("[jiuwenswarm-init] Do you want to continue? (yes/no): ")
+                    .strip()
+                    .lower()
+                )
 
                 if confirmation not in ("yes", "y"):
                     print("[jiuwenswarm-init] Initialization cancelled. Exiting.")
                     return "cancelled"
             else:
-                print("[jiuwenswarm-init] Non-interactive mode: proceeding with merge initialization.")
+                print(
+                    "[jiuwenswarm-init] Non-interactive mode: proceeding with merge initialization."
+                )
 
     lang = prompt_preferred_language()
     if lang is None:
         print("[jiuwenswarm-init] Initialization cancelled. Exiting.")
         return "cancelled"
     print(f"[jiuwenswarm-init] 将使用语言 / Language: {lang}")
-    diff_result = prepare_workspace(overwrite, preferred_language=lang, workspace_dir=workspace_dir)
+    diff_result = prepare_workspace(
+        overwrite, preferred_language=lang, workspace_dir=workspace_dir
+    )
     _print_diff_summary(diff_result, overwrite)
 
     return workspace_dir
@@ -1602,7 +1696,9 @@ def _resolve_paths() -> None:
             pkg = source_root / "jiuwenswarm"
             res = pkg / "resources"
             _root_dir = source_root
-            _config_dir = res if (res / "config.yaml").exists() else source_root / "config"
+            _config_dir = (
+                res if (res / "config.yaml").exists() else source_root / "config"
+            )
             _workspace_dir = res / "agent" / "workspace"
             _workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1909,11 +2005,24 @@ def _migrate_legacy_checkpoint_and_logs() -> None:
     workspace = get_user_workspace_dir()
     agent_root = workspace / "agent"
 
+    env_log_dir = os.getenv("JIUWENSWARM_LOG_DIR", "").strip()
     for name in (".checkpoint", ".logs"):
         legacy = workspace / name
-        new_path = agent_root / name
+        # 统一日志目录注入时，legacy .logs 仅在统一目录尚不存在时整体
+        # 改名迁入（move rename 语义，文件直接落统一目录根）；统一目录
+        # 已存在（桌面端 spawn 前预建）则跳过，不在 agent/ 下新建 .logs。
+        # 外层日期布局激活（注入 JIUWENSWARM_LOG_DATE_ROOT）时落当日
+        # 日期目录（整体改名为 <DATE_ROOT>/<今日>/<…>；其内的平铺文件由
+        # _migrate_flat_logs_to_dated_dirs 后续按 mtime 归位）。checkpoint
+        # 迁移行为不受影响。
+        if name == ".logs" and env_log_dir:
+            new_path = (
+                get_dated_logs_dir() if _dated_layout() is not None else Path(env_log_dir).expanduser()
+            )
+        else:
+            new_path = agent_root / name
         if legacy.exists() and not new_path.exists():
-            agent_root.mkdir(parents=True, exist_ok=True)
+            new_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(legacy), str(new_path))
 
 
@@ -1923,8 +2032,391 @@ def get_checkpoint_dir() -> Path:
 
 
 def get_logs_dir() -> Path:
+    """jiuwenswarm 自身日志目录。
+
+    优先读环境变量 ``JIUWENSWARM_LOG_DIR``（桌面端注入，统一落
+    ``<dataRoot>/logs/jiuwenswarm``）；未设置时保持 ``<root>/agent/.logs``。
+    """
     _migrate_legacy_checkpoint_and_logs()
+    env_log_dir = os.getenv("JIUWENSWARM_LOG_DIR", "").strip()
+    if env_log_dir:
+        return Path(env_log_dir).expanduser()
     return get_agent_root_dir() / ".logs"
+
+
+def _dated_layout() -> Optional[tuple[Path, str]]:
+    """外层日期布局解析（桌面端注入形态）。
+
+    注入 ``JIUWENSWARM_LOG_DATE_ROOT``（桌面端为 ``<dataDir>/logs``）且
+    统一日志根（``get_logs_dir()``）位于其下时，日期目录建在根上，日期
+    目录内再拼日志根相对根的路径：
+
+        <DATE_ROOT>/<YYYY-MM-DD>/jiuwenswarm/<uidKey>/…
+
+    与桌面端自身 ``<dataRoot>/logs/YYYY-MM-DD/`` 布局同层对齐（反馈打包
+    按天过滤天然覆盖）。未注入或不在其下时返回 None（维持日期在用户根
+    内层的旧布局）。
+
+    Returns:
+        ``(日期根, 日志根相对日期根的子路径)``；未激活时为 None。
+    """
+    env_date_root = os.getenv("JIUWENSWARM_LOG_DATE_ROOT", "").strip()
+    if not env_date_root:
+        return None
+    logs_dir = get_logs_dir()
+    date_root = Path(env_date_root).expanduser()
+    try:
+        rel = logs_dir.relative_to(date_root)
+    except ValueError:
+        return None
+    rel_str = rel.as_posix().strip("/")
+    if not rel_str:
+        return None
+    return date_root, rel_str
+
+
+def should_precreate_logs_root() -> bool:
+    """锚点日志根是否需要调用方预建。
+
+    外层日期布局未激活（独立运行/旧桌面注入）时锚点根
+    （``get_logs_dir()``）即实际写入根（日期目录在其内），维持预建；
+    激活时日志全部落 ``<DATE_ROOT>/<日期>/…``（handler 自建目录），
+    锚点根不会被写入——预建只会遗留空目录，跳过。
+    """
+    return _dated_layout() is None
+
+
+def get_dated_logs_dir(now: Optional[datetime.datetime] = None) -> Path:
+    """当日日志目录：``<logs_root>/<YYYY-MM-DD>/``。
+
+    与桌面端 ``<dataRoot>/logs/YYYY-MM-DD/`` 布局一致。日期取本地时钟
+    （与日志行 asctime 同源）。长驻调用方应钉住首写日期（跨天不拆，
+    对齐桌面会话日志先例），跨天新起时重新取值。
+
+    外层日期布局激活（桌面端注入 ``JIUWENSWARM_LOG_DATE_ROOT``）时返回
+    ``<DATE_ROOT>/<YYYY-MM-DD>/<jiuwenswarm>/<uidKey>/``。
+
+    Args:
+        now: 参考时间；缺省为当前本地时间。
+
+    Returns:
+        当日日志目录路径（不负责创建）。
+    """
+    ref = now or datetime.datetime.now()
+    layout = _dated_layout()
+    if layout is not None:
+        date_root, rel = layout
+        return date_root / ref.strftime("%Y-%m-%d") / rel
+    return get_logs_dir() / ref.strftime("%Y-%m-%d")
+
+
+def cleanup_expired_dated_log_dirs(
+    base_dir: Path,
+    retention_days: int = _LOG_RETENTION_DAYS,
+    now: Optional[datetime.datetime] = None,
+) -> int:
+    """清理 ``base_dir`` 下超过保留窗口的日期目录。
+
+    只处理 ``YYYY-MM-DD`` 命名的目录，其余条目绝不动；删除失败跳过
+    不抛（日志清理不影响业务）。与 agent-core 同名函数语义一致，
+    两处需同步维护。
+
+    Args:
+        base_dir: 日期目录的父目录。
+        retention_days: 保留天数；``0`` 表示仅保留今天。
+        now: 参考时间；缺省为当前本地时间。
+
+    Returns:
+        实际删除的日期目录数。
+    """
+    try:
+        entries = list(base_dir.iterdir())
+    except OSError:
+        return 0
+
+    today = (now or datetime.datetime.now()).date()
+    cutoff = today - datetime.timedelta(days=retention_days)
+    removed = 0
+    for entry in entries:
+        if not _DATED_DIR_RE.match(entry.name):
+            continue
+        try:
+            day = datetime.date.fromisoformat(entry.name)
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        try:
+            if not entry.is_dir():
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def get_bootstrap_log_dir() -> Path:
+    """启动期诊断日志目录（exe error / win setup 等）。
+
+    与 ``scripts/jiuwenswarm_exe_entry.py`` 的 fallback 规则保持一致：
+    优先 ``JIUWENSWARM_LOG_DIR``（桌面端统一注入），否则
+    ``<JIUWENSWARM_DATA_DIR>/logs``。外层日期布局激活（注入
+    ``JIUWENSWARM_LOG_DATE_ROOT``）时追加当日日期目录。exe_entry 在包
+    import 之前运行，无法复用本函数，两处规则需同步维护。
+    """
+    env_log_dir = os.getenv("JIUWENSWARM_LOG_DIR", "").strip()
+    if env_log_dir:
+        base = Path(env_log_dir).expanduser()
+    else:
+        base = (
+            Path(
+                os.environ.get("JIUWENSWARM_DATA_DIR", Path.home() / ".jiuwenswarm")
+            )
+            / "logs"
+        )
+    layout = _dated_layout()
+    if layout is not None:
+        date_root, rel = layout
+        return date_root / datetime.datetime.now().strftime("%Y-%m-%d") / rel
+    return base
+
+
+def _migrate_legacy_agent_core_logs(today_core_dir: Path) -> None:
+    """回收 agent-core 历史错误落点到当日 core 目录。
+
+    三类历史落点：
+
+    1. ``<workspace>/logs/logs`` 双层目录——早期版本未钉绝对路径时，
+       default 后端相对 ``./logs/`` 以 CWD（桌面 spawn 的 ``<workspace>``，
+       即 ``<dataRoot>/users/<uid>/jiuwenswarm``）落盘（run/jiuwen.log、
+       runner.log、interface/…、performance/… 等）。
+    2. ``<uidKey>/core/<YYYY-MM-DD>/…``——旧按天布局（日期在 core 里面），
+       先翻转成 ``<uidKey>/<YYYY-MM-DD>/core/…``（core 在日期里面）。
+    3. 上述 2 产出的 ``<uidKey>/<YYYY-MM-DD>/…`` 旧内层日期布局——外层
+       日期布局激活时由 ``_migrate_legacy_user_dated_dirs`` 再翻到
+       ``<DATE_ROOT>/<YYYY-MM-DD>/<jiuwenswarm>/<uidKey>/…``。
+
+    目标已存在跳过；全部尽力而为，失败留原地（无害，90 天保留窗口
+    自然淘汰）。
+
+    Args:
+        today_core_dir: 今日 core 目录（当前布局下 ``<uidKey>/<今日>/core``
+            或外层布局 ``<DATE_ROOT>/<今日>/<…>/<uidKey>/core``，历史文件的
+            合并目标）。
+    """
+    _merge_tree_into(workspace_legacy_dir(), today_core_dir)
+    # 外层日期布局时 user_root 为注入的统一目录（旧 core/ 与内层日期目录
+    # 都在它下面）；旧布局下 core 目录父级即用户根。
+    _relocate_core_dated_dirs(
+        today_core_dir,
+        get_logs_dir() if _dated_layout() is not None else today_core_dir.parent.parent,
+    )
+
+
+def workspace_legacy_dir() -> Path:
+    """早期 CWD 相对落盘的双层日志目录路径。"""
+    return get_user_workspace_dir() / "logs" / "logs"
+
+
+def _merge_tree_into(src: Path, dest_root: Path) -> None:
+    """把 src 目录树按文件搬进 dest_root；目标已存在跳过，失败留原地。"""
+    if not src.is_dir():
+        return
+
+    def _merge(src_dir: Path, dest_dir: Path) -> None:
+        for item in list(src_dir.iterdir()):
+            target = dest_dir / item.name
+            try:
+                if item.is_dir():
+                    _merge(item, target)
+                elif item.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        shutil.move(str(item), str(target))
+            except OSError:
+                continue
+
+    try:
+        _merge(src, dest_root)
+        # 仅剩空目录树时移除；仍有残留（移动失败/目标已存在）则保留。
+        for path in sorted(
+            src.rglob("*"), key=lambda p: len(p.parts), reverse=True
+        ):
+            try:
+                if path.is_dir():
+                    path.rmdir()
+            except OSError:
+                continue
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def _relocate_core_dated_dirs(today_core_dir: Path, user_root: Path) -> None:
+    """旧布局 ``<uidKey>/core/<date>/`` 翻转为 ``<uidKey>/<date>/core/``。
+
+    Args:
+        today_core_dir: 今日 core 目录（合并目标）。
+        user_root: 用户层统一日志根（``logs/jiuwenswarm/<uidKey>``）。
+    """
+    today_core_dir.parent.mkdir(parents=True, exist_ok=True)
+    old_core = user_root / "core"
+    if not old_core.is_dir() or old_core == today_core_dir:
+        return
+
+    try:
+        for day_dir in list(old_core.iterdir()):
+            if not _DATED_DIR_RE.match(day_dir.name) or not day_dir.is_dir():
+                continue
+            _merge_tree_into(day_dir, user_root / day_dir.name / "core")
+    except OSError:
+        pass
+
+
+def configure_agent_core_log_dir() -> bool:
+    """把 agent-core（openjiuwen）日志统一到独立 core 子目录（按天）。
+
+    优先 ``JIUWENSWARM_CORE_LOG_DIR``（桌面端注入
+    ``logs/jiuwenswarm/<uidKey>/core``，与 jiuwenswarm 本体日志分离），
+    未设置时回退 ``JIUWENSWARM_LOG_DIR``（兼容旧注入布局）。此处将
+    agent-core 的 default 日志后端 ``log_path`` 钉死为该目录的**绝对
+    路径**（相对路径会随 CWD 漂移并出现 ``logs/logs`` 双层目录），并
+    开启 ``log_date_dirs`` 按天切分。日期目录落点：外层日期布局激活
+    （注入 ``JIUWENSWARM_LOG_DATE_ROOT``）时在 ``<dataRoot>/logs`` 下
+    （与桌面端自身日志同层）——``<日期>/jiuwenswarm/<uidKey>/core/…``；
+    否则在用户层（core 的父目录）与本体日志同层并排——
+    ``<uidKey>/<YYYY-MM-DD>/core/…``。``log_date_base`` 把日期根告知
+    agent-core。仅当当前后端为 ``default`` 时覆盖，保留其余字段
+    （level/backup_count 等）。成功返回 True；未注入、后端非 default
+    或配置失败返回 False（调用方维持原有行为）。
+    """
+    env_core_log_dir = os.getenv("JIUWENSWARM_CORE_LOG_DIR", "").strip()
+    env_log_dir = os.getenv("JIUWENSWARM_LOG_DIR", "").strip()
+    env_log_dir = env_core_log_dir or env_log_dir
+    if not env_log_dir:
+        return False
+    try:
+        from openjiuwen.core.common.logging.log_config import (
+            configure_log_config,
+            get_log_config_snapshot,
+        )
+
+        snapshot = get_log_config_snapshot()
+        backend = str(snapshot.get("backend", "default")).strip().lower()
+        if backend != "default":
+            return False
+        log_dir = Path(env_log_dir).expanduser()
+        # 日期根：外层日期布局激活（桌面端注入 JIUWENSWARM_LOG_DATE_ROOT）
+        # 时为注入根（<dataRoot>/logs），日期目录与桌面端自身日志同层；
+        # 否则 core 注入形态取父目录（用户层，日期目录与本体日志并排）；
+        # 旧 JIUWENSWARM_LOG_DIR 形态（用户根本身）日期根即注入目录。
+        layout = _dated_layout()
+        if layout is not None:
+            date_base = layout[0]
+        elif env_core_log_dir and log_dir.name == "core":
+            date_base = log_dir.parent
+        else:
+            date_base = log_dir
+        # 幂等：已钉到同一目录时直接返回。入口模块在 import 早期与日志块后
+        # 各调用一次，二次 configure 会 reset LogManager 重建全部 logger，
+        # 使业务模块已持有的实例脱离管理（重复 handler/丢运行时级别）。
+        _current = str(snapshot.get("log_path", "") or "").strip()
+        if _current and os.path.normcase(os.path.abspath(_current)) == os.path.normcase(
+            str(log_dir)
+        ):
+            return True
+        # 外层日期布局激活时该锚点目录（log_path 值）不会被写入：实际落
+        # date_base/<日期>/…，由 openjiuwen DatedDailyFileHandler 自建；不
+        # 预建以免遗留空目录。非日期布局（独立运行/旧桌面注入）log_path
+        # 即实际写入根，维持预建。
+        if layout is None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        # 回收历史错误落点：早期版本（或旧 openjiuwen 依赖）CWD 相对路径
+        # 落下的 <workspace>/logs/logs 双层目录，按文件迁入当日 core 目录
+        # （外层布局下 <DATE_ROOT>/<今日>/<jiuwenswarm>/<uidKey>/core）。
+        if layout is not None:
+            _migrate_legacy_agent_core_logs(
+                date_base
+                / datetime.datetime.now().strftime("%Y-%m-%d")
+                / layout[1]
+                / "core"
+            )
+        else:
+            _migrate_legacy_agent_core_logs(
+                date_base
+                / datetime.datetime.now().strftime("%Y-%m-%d")
+                / log_dir.name
+            )
+        # 旧内层日期布局（含上面 relocate 翻出的 <日期>/core/）翻到外层
+        # 日期布局（仅激活时动作；本体日志侧 setup_logger 亦独立兜底一次）。
+        _migrate_legacy_user_dated_dirs(get_logs_dir())
+        # 日期根过期清理（按天切分配套；本体日志侧 setup_logger 已对同一
+        # 日期根做过清理，这里对 agent-core 布局独立兜底一次）。
+        try:
+            from openjiuwen.core.common.logging.dated_file_handler import (
+                cleanup_expired_dated_log_dirs as _cleanup_core,
+            )
+
+            _cleanup_core(date_base)
+        except Exception:  # noqa: BLE001 - 清理失败不影响日志配置
+            pass
+        # configure_log_config 会 reset LogManager：先记录已注册 logger 的
+        # 运行时级别（如 gateway 对 openjiuwen 内部日志的 CRITICAL 压制），
+        # 覆盖 log_path 后按需重建并恢复，避免日志量行为变化。
+        prev_levels = _collect_agent_core_logger_levels()
+        snapshot["log_path"] = str(log_dir)
+        snapshot["log_date_dirs"] = True
+        snapshot["log_date_base"] = str(date_base)
+        try:
+            configure_log_config(snapshot)
+        except Exception:  # noqa: BLE001 - 旧 openjiuwen 不识别新配置键
+            # 依赖分支（gitcode br_0.1.16.post2.hotfix）未含按天切分支持时，
+            # 校验会把整个 snapshot 拒掉——日志会落回 CWD 相对路径（logs/logs
+            # 双层目录）。回退仅钉 log_path：日志仍进 core 目录，按大小切分。
+            snapshot.pop("log_date_dirs", None)
+            snapshot.pop("log_date_base", None)
+            configure_log_config(snapshot)
+        _restore_agent_core_logger_levels(prev_levels)
+        return True
+    except Exception:  # noqa: BLE001 - 配置失败时保持默认日志行为
+        return False
+
+
+def _collect_agent_core_logger_levels() -> dict:
+    """收集 agent-core 已注册 logger 的有效级别（重建后恢复用）。"""
+    levels: dict = {}
+    try:
+        from openjiuwen.core.common.logging.manager import LogManager
+
+        # 直接读注册表，勿用 get_all_loggers()：后者会触发 initialize()
+        # 按当前（可能仍是旧相对 log_path）配置强制创建基础 logger，
+        # 在 CWD 留下 logs/ 空目录。
+        for name, lg in dict(getattr(LogManager, "_loggers", None) or {}).items():
+            inner = getattr(lg, "logger", None)
+            inner = inner() if callable(inner) else inner
+            if inner is not None and hasattr(inner, "getEffectiveLevel"):
+                levels[name] = inner.getEffectiveLevel()
+    except Exception:
+        pass
+    return levels
+
+
+def _restore_agent_core_logger_levels(levels: dict) -> None:
+    """reset 后按需重建 logger 并恢复先前级别（幂等，失败静默）。"""
+    if not levels:
+        return
+    try:
+        from openjiuwen.core.common.logging.manager import LogManager
+
+        for name, level in levels.items():
+            try:
+                LogManager.get_logger(name).set_level(level)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def get_xy_tmp_dir() -> Path:
@@ -2001,9 +2493,7 @@ def is_package_installation() -> bool:
 
 # 统一敏感信息掩码值。
 _SENSITIVE_MASK = "******"
-_DATA_IMAGE_PATTERN = re.compile(
-    r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+"
-)
+_DATA_IMAGE_PATTERN = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
 # 匹配常见敏感字段键值对（不要求值必须带引号），用于覆盖:
 # - token=abc
 # - api_key: sk-xxx
@@ -2054,7 +2544,9 @@ _SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
 # PII / 非凭证类 pattern：掩码但不附指纹（关联意义不大，且避免引入额外可逆性顾虑）。
 _SENSITIVE_PII_PATTERNS: tuple[re.Pattern[str], ...] = tuple(_SENSITIVE_PATTERNS[-3:])
 # 凭证类 prefix pattern：掩码并附指纹（同 key 指纹一致可关联、不可逆）。
-_SENSITIVE_CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(_SENSITIVE_PATTERNS[:4])
+_SENSITIVE_CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    _SENSITIVE_PATTERNS[:4]
+)
 
 
 def _fingerprint(value: str) -> str:
@@ -2071,7 +2563,9 @@ def _fingerprint(value: str) -> str:
 # 已脱敏产物形态：纯 ****** 或 ******(fp:xxxxxxxx)。
 # 用于在二次脱敏时识别"已是脱敏值"，跳过重算指纹，避免产生"指纹的指纹"
 # 导致跨日志关联失效（如 stream_logger._mask_secrets 先脱敏，_write_raw 再脱敏）。
-_ALREADY_MASKED_PATTERN = re.compile(rf"^{re.escape(_SENSITIVE_MASK)}(\(fp:[0-9a-f]{{8}}\))?$")
+_ALREADY_MASKED_PATTERN = re.compile(
+    rf"^{re.escape(_SENSITIVE_MASK)}(\(fp:[0-9a-f]{{8}}\))?$"
+)
 
 
 def _is_already_masked(value: Any) -> bool:
@@ -2113,7 +2607,8 @@ def _sanitize_log_text(text: str) -> str:
     )
     # _NAMED_SENSITIVE_KV_PATTERN: 组1=键+分隔符, 组2=起始引号, 组3=值, 组4=结束引号。
     masked = _NAMED_SENSITIVE_KV_PATTERN.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(3))}{m.group(4)}", masked
+        lambda m: f"{m.group(1)}{m.group(2)}{_masked_with_fp(m.group(3))}{m.group(4)}",
+        masked,
     )
     # _BEARER_SENSITIVE_PATTERN: 组1=Bearer 前缀, 组2=令牌值。
     masked = _BEARER_SENSITIVE_PATTERN.sub(
@@ -2254,6 +2749,183 @@ def install_source_record_masking() -> None:
     _source_record_masking_installed = True
 
 
+# 平铺布局时代的日志文件名（含桌面注入统一目录后、按天切分前的布局）。
+_FLAT_LOG_BASENAMES = frozenset(
+    {
+        "gateway.log",
+        "channel.log",
+        "agent_server.log",
+        "full.log",
+        "permissions.log",
+        "desktop.log",
+        "update_helper.log",
+        "ws-dev.log",
+        "browser_runtime_stdout.log",
+        "browser_runtime_stderr.log",
+    }
+)
+# 旧按大小轮转的备份命名：<stem>_<YYYYMMDD>_<HHMMSS>.log。
+_FLAT_BACKUP_RE = re.compile(r"^(?P<stem>.+)_(?P<day>\d{8})_\d{6}\.log$")
+
+
+def _dated_dir_for_flat_file(path: Path) -> Optional[Path]:
+    """推断平铺日志文件应迁入的日期目录（相对日期根的子路径）。
+
+    优先解析备份文件名里的 ``_YYYYMMDD_`` 时间戳；否则用 mtime。
+    无法取得有效日期（如 mtime 早于 2000-01-01）返回 None。
+
+    Args:
+        path: 平铺日志文件路径。
+
+    Returns:
+        日期目录相对子路径（``<YYYY-MM-DD>``）；无法判定时为 None。
+    """
+    backup_match = _FLAT_BACKUP_RE.match(path.name)
+    if backup_match and (backup_match.group("stem") + ".log") in _FLAT_LOG_BASENAMES:
+        raw_day = backup_match.group("day")
+        day = f"{raw_day[:4]}-{raw_day[4:6]}-{raw_day[6:8]}"
+        return Path(day)
+    try:
+        mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return None
+    if mtime.date() < datetime.date(2000, 1, 1):
+        return None
+    return Path(mtime.strftime("%Y-%m-%d"))
+
+
+def _dated_cleanup_root(logs_root: Path) -> Path:
+    """过期日期目录清理的基准目录（日期目录的直接父目录）。
+
+    外层日期布局激活时清理作用于 ``DATE_ROOT``（连同桌面端自身日期
+    目录一并按 90 天统一清理）；否则为用户根（旧布局）。
+
+    Args:
+        logs_root: 统一日志根目录。
+
+    Returns:
+        日期目录的父目录。
+    """
+    layout = _dated_layout()
+    if layout is not None:
+        return layout[0]
+    return logs_root
+
+
+def _dated_target_dir(day: str, logs_root: Path) -> Path:
+    """某日期在本布局下的目标目录。
+
+    Args:
+        day: ``YYYY-MM-DD`` 日期串。
+        logs_root: 统一日志根目录（旧布局迁移的源/目标基）。
+
+    Returns:
+        外层布局激活时 ``<DATE_ROOT>/<day>/<jiuwenswarm>/<uidKey>``，
+        否则 ``<logs_root>/<day>``。
+    """
+    layout = _dated_layout()
+    if layout is not None:
+        date_root, rel = layout
+        return date_root / day / rel
+    return logs_root / day
+
+
+def _migrate_flat_logs_to_dated_dirs(logs_root: Path) -> None:
+    """把平铺布局时代的日志迁入按天日期目录。
+
+    覆盖两类产物：本体日志原文件（gateway.log 等）与旧按大小轮转的
+    备份（``gateway_20260901_120000.log``，按文件名时间戳定日期）。
+    单文件独立 try/except：目标已存在跳过，失败留原地（无害，等 90
+    天保留窗口自然淘汰）。仅处理 ``logs_root`` 第一层的已知文件名，
+    绝不动日期目录与其他子目录（core/ 等）。
+
+    Args:
+        logs_root: 统一日志根目录。
+    """
+    try:
+        entries = list(logs_root.iterdir())
+    except OSError:
+        return
+
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            if entry.name not in _FLAT_LOG_BASENAMES:
+                backup_match = _FLAT_BACKUP_RE.match(entry.name)
+                if (
+                    not backup_match
+                    or (backup_match.group("stem") + ".log") not in _FLAT_LOG_BASENAMES
+                ):
+                    continue
+            target_dir = _dated_dir_for_flat_file(entry)
+            if target_dir is None:
+                continue
+            target_dir = _dated_target_dir(target_dir.as_posix(), logs_root)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / entry.name
+            if target.exists():
+                continue
+            shutil.move(str(entry), str(target))
+        except OSError:
+            continue
+
+
+def _migrate_legacy_user_dated_dirs(logs_root: Path) -> None:
+    """旧内层日期布局迁入外层日期布局（仅外层布局激活时动作）。
+
+    旧布局 ``<uidKey>/<YYYY-MM-DD>/…``（日期在用户根内层，含
+    ``_relocate_core_dated_dirs`` 先行翻出的 ``<日期>/core/``）翻转为
+    ``<DATE_ROOT>/<YYYY-MM-DD>/<jiuwenswarm>/<uidKey>/…``。按文件搬移、
+    目标已存在跳过、失败留原地（与既有迁移同风格，90 天保留窗口自然
+    淘汰残留）。
+
+    Args:
+        logs_root: 统一日志根目录（迁移源）。
+    """
+    layout = _dated_layout()
+    if layout is None:
+        return
+    try:
+        entries = list(logs_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir() or not _DATED_DIR_RE.match(entry.name):
+                continue
+            _merge_tree_into(entry, _dated_target_dir(entry.name, logs_root))
+        except OSError:
+            continue
+
+
+def make_dated_file_handler(filename: str, **kwargs: Any) -> DatedDailyFileHandler:
+    """按当前布局构造按天切分 handler 的统一入口。
+
+    旧布局（含非桌面独立运行）：``<logs_root>/<日期>/<filename>``；
+    外层日期布局激活（桌面端注入 ``JIUWENSWARM_LOG_DATE_ROOT``）：
+    ``<DATE_ROOT>/<日期>/jiuwenswarm/<uidKey>/<filename>``——日期目录与
+    桌面端自身日志同层。各落点（setup_logger / desktop / web / permissions）
+    统一经此构造，避免四处重复分支。
+
+    Args:
+        filename: 日期目录内的日志文件相对路径。
+        **kwargs: 透传 ``DatedDailyFileHandler``（如 ``max_bytes``）。
+
+    Returns:
+        已配置 base_dir / filename 的 handler（级别与格式由调用方补齐）。
+    """
+    layout = _dated_layout()
+    if layout is not None:
+        date_root, rel = layout
+        kwargs.setdefault("base_dir", date_root)
+        kwargs.setdefault("filename", f"{rel}/{filename}")
+    else:
+        kwargs.setdefault("base_dir", get_logs_dir())
+        kwargs.setdefault("filename", filename)
+    return DatedDailyFileHandler(**kwargs)
+
+
 def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     """配置 ``jiuwenswarm`` 根日志：控制台 + 分组件文件 + 汇总 full.log。
 
@@ -2262,13 +2934,31 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     - ``jiuwenswarm.agents.*`` 或 ``jiuwenswarm.server.*`` → agent_server.log
     - 其余 ``jiuwenswarm.*``（含 ``jiuwenswarm.app``、gateway、evolution、utils 等）→ gateway.log
 
-    所有分类日志同时写入 ``full.log``。输出目录：``~/.jiuwenswarm/agent/.logs/``。
+    所有分类日志同时写入 ``full.log``。输出按天切分：
+    ``<logs_root>/<YYYY-MM-DD>/gateway.log`` 等（对齐桌面端
+    ``<dataRoot>/logs/YYYY-MM-DD/`` 布局；日内超 2MB 轮转出 ``.old.log``，
+    保留 90 天）。``<logs_root>`` 为 ``~/.jiuwenswarm/agent/.logs/``
+    （注入 ``JIUWENSWARM_LOG_DIR`` 时为该目录，桌面端为
+    ``<dataRoot>/logs/jiuwenswarm``）。外层日期布局激活（桌面端注入
+    ``JIUWENSWARM_LOG_DATE_ROOT``）时为
+    ``<dataRoot>/logs/<YYYY-MM-DD>/jiuwenswarm/…``（日期与桌面端自身日志
+    同层）。
 
     级别由 ``config.yaml`` 的 ``logging`` 段控制；环境变量 ``LOG_LEVEL`` 仅覆盖**控制台**级别
     （``log_level`` 参数为 ``None`` 时）。若传入 ``log_level``（如单测），则控制台与各文件级别均为该值。
     """
     logs_root = get_logs_dir()
-    logs_root.mkdir(parents=True, exist_ok=True)
+    # 外层日期布局激活时各分类日志经 make_dated_file_handler 落
+    # <DATE_ROOT>/<日期>/…（handler 自建目录），锚点根不会被写入，不预
+    # 建以免遗留空目录；旧布局（未注入 DATE_ROOT）logs_root 即写入根
+    # （日期目录在其内），维持预建。
+    if _dated_layout() is None:
+        logs_root.mkdir(parents=True, exist_ok=True)
+
+    # 启动期一次性收尾：平铺旧布局迁入日期目录 + 清理过期日期目录。
+    _migrate_flat_logs_to_dated_dirs(logs_root)
+    _migrate_legacy_user_dated_dirs(logs_root)
+    cleanup_expired_dated_log_dirs(_dated_cleanup_root(logs_root))
 
     levels = _resolve_logging_levels(log_level)
 
@@ -2280,21 +2970,20 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
         root.removeHandler(handler)
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     privacy_filter = SensitiveDataFilter()
 
-    def _add_rotating(
+    def _add_dated(
         filename: str,
         level: int,
         name_filter: Optional[_ComponentNameFilter] = None,
         custom_formatter: Optional[logging.Formatter] = None,
     ) -> None:
-        h = SafeRotatingFileHandler(
-            filename=logs_root / filename,
-            maxBytes=_LOG_FILE_MAX_BYTES,
-            backupCount=_LOG_FILE_BACKUP_COUNT,
+        h = make_dated_file_handler(
+            filename,
+            max_bytes=_LOG_DATED_MAX_BYTES,
             encoding="utf-8",
         )
         h.setLevel(level)
@@ -2304,13 +2993,23 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
             h.addFilter(name_filter)
         root.addHandler(h)
 
-    _add_rotating("gateway.log", levels.gateway, _ComponentNameFilter("gateway"))
-    _add_rotating("channel.log", levels.channel, _ComponentNameFilter("channel"))
-    _add_rotating("agent_server.log", levels.agent_server,
-        _CompositeFilter([_ComponentNameFilter("agent_server"), _ComponentNameFilter("permissions")]))
-    _add_rotating("full.log", levels.full, None)
+    _add_dated("gateway.log", levels.gateway, _ComponentNameFilter("gateway"))
+    _add_dated("channel.log", levels.channel, _ComponentNameFilter("channel"))
+    _add_dated(
+        "agent_server.log",
+        levels.agent_server,
+        _CompositeFilter(
+            [_ComponentNameFilter("agent_server"), _ComponentNameFilter("permissions")]
+        ),
+    )
+    _add_dated("full.log", levels.full, None)
     json_formatter = JsonOnlyFormatter()
-    _add_rotating("permissions.log", levels.agent_server, _ComponentNameFilter("permissions"), json_formatter)
+    _add_dated(
+        "permissions.log",
+        levels.agent_server,
+        _ComponentNameFilter("permissions"),
+        json_formatter,
+    )
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(levels.console)

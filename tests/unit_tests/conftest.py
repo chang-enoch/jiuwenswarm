@@ -21,10 +21,23 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 import jiuwenswarm.common.utils as _utils
 
 _REAL_GET_CONFIG_FILE = _utils.get_config_file
 _REAL_GET_AGENT_WORKSPACE_DIR = _utils.get_agent_workspace_dir
+
+
+@pytest.fixture(autouse=True)
+def _clean_outer_date_layout_env(monkeypatch):
+    """隔离外层日期布局环境变量，避免宿主环境影响布局相关用例。
+
+    桌面开发机上 JIUWENSWARM_LOG_DATE_ROOT 可能随 shell 环境存在；单测
+    除非显式 setenv，一律按未注入（旧布局）运行。
+    """
+    monkeypatch.delenv("JIUWENSWARM_LOG_DATE_ROOT", raising=False)
+    yield
 
 # Must match the stubs used in test_external_memory_{builder,config}.py
 _STUB_CONFIG = Path("/tmp/test_config.yaml")

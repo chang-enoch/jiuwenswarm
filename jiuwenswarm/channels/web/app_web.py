@@ -27,19 +27,60 @@ from urllib.parse import quote, unquote, urlparse
 
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
 from jiuwenswarm.dotenv_early import parse_dotenv_early
+
 parse_dotenv_early("jiuwenswarm-web")
 
 # --- Now safe to import jiuwenswarm modules ---
-from jiuwenswarm.agents.harness.common.tools.ssl_config import get_insecure_ssl_context, get_ssl_verify
+from jiuwenswarm.agents.harness.common.tools.ssl_config import (
+    get_insecure_ssl_context,
+    get_ssl_verify,
+)
 from jiuwenswarm.agents.harness.team.bootstrap import configure_agent_teams_home
 from jiuwenswarm.common.debug_dump import install_async_dump_handler
-from jiuwenswarm.common.ws_diagnostics import describe_ws_exception, format_ws_diagnostics
-from jiuwenswarm.common.utils import get_agent_root_dir, get_logs_dir, \
-    get_agent_sessions_dir, get_root_dir, get_user_workspace_dir, is_package_installation, \
-    wait_for_tcp_port, SensitiveDataFilter
-from jiuwenswarm.server.runtime.session.session_history import history_exists, load_history_records
+from jiuwenswarm.common.ws_diagnostics import (
+    describe_ws_exception,
+    format_ws_diagnostics,
+)
+from jiuwenswarm.common.utils import (
+    get_agent_root_dir,
+    get_logs_dir,
+    get_agent_sessions_dir,
+    get_root_dir,
+    get_user_workspace_dir,
+    is_package_installation,
+    make_dated_file_handler,
+    should_precreate_logs_root,
+    wait_for_tcp_port,
+    SensitiveDataFilter,
+)
+from jiuwenswarm.server.runtime.session.session_history import (
+    history_exists,
+    load_history_records,
+)
 
 configure_agent_teams_home()
+
+
+def _dated_user_log_roots(logs_root: Path) -> list[Path]:
+    """外层日期布局下本用户的各日期日志目录（旧布局返回空）。
+
+    ``<DATE_ROOT>/<YYYY-MM-DD>/<jiuwenswarm>/<uidKey>/``——仅供日志文件
+    服务守卫放行本用户子树；失败静默返回空（守卫回落单根检查）。
+    """
+    try:
+        from jiuwenswarm.common.utils import _dated_layout
+
+        layout = _dated_layout()
+        if layout is None:
+            return []
+        date_root, rel = layout
+        return [
+            date_root / entry.name / rel
+            for entry in date_root.iterdir()
+            if entry.is_dir() and len(entry.name) == 10 and entry.name[4:6].isdigit()
+        ]
+    except Exception:  # noqa: BLE001 - 守卫辅助失败回落旧检查
+        return []
 
 
 def _get_agent_teams_root() -> Path:
@@ -103,14 +144,20 @@ def _generate_agent_data(project_root: Path) -> None:
         if not entry.is_file() or entry.name.startswith("."):
             continue
         # Skip files in hidden directories (e.g., .agent_history)
-        if any(part.startswith(".") for part in entry.relative_to(workspace_root).parts):
+        if any(
+            part.startswith(".") for part in entry.relative_to(workspace_root).parts
+        ):
             continue
         relative_folder_path = entry.parent.relative_to(agent_root).as_posix()
-        folder_key = root_folder_key if relative_folder_path == "." else relative_folder_path
+        folder_key = (
+            root_folder_key if relative_folder_path == "." else relative_folder_path
+        )
 
         display_name = _normalize_lang_suffix(entry.name)
         display_path = (
-            f"agent/{relative_folder_path}/{display_name}".replace("/.", "/").replace("//", "/")
+            f"agent/{relative_folder_path}/{display_name}".replace("/.", "/").replace(
+                "//", "/"
+            )
             if relative_folder_path != "."
             else f"agent/{display_name}"
         )
@@ -253,19 +300,19 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 if payload_len == 126:
                     if len(self._buffer) < idx + 2:
                         break
-                    payload_len = int.from_bytes(self._buffer[idx:idx + 2], "big")
+                    payload_len = int.from_bytes(self._buffer[idx : idx + 2], "big")
                     idx += 2
                 elif payload_len == 127:
                     if len(self._buffer) < idx + 8:
                         break
-                    payload_len = int.from_bytes(self._buffer[idx:idx + 8], "big")
+                    payload_len = int.from_bytes(self._buffer[idx : idx + 8], "big")
                     idx += 8
 
                 mask_key = b""
                 if masked:
                     if len(self._buffer) < idx + 4:
                         break
-                    mask_key = bytes(self._buffer[idx:idx + 4])
+                    mask_key = bytes(self._buffer[idx : idx + 4])
                     idx += 4
 
                 frame_end = idx + payload_len
@@ -276,10 +323,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 del self._buffer[:frame_end]
 
                 if masked:
-                    payload = bytes(
-                        b ^ mask_key[i % 4]
-                        for i, b in enumerate(payload)
-                    )
+                    payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
                 if rsv:
                     continue
@@ -299,7 +343,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     self._fragmented_text.extend(payload)
                     if fin:
                         messages.append(
-                            bytes(self._fragmented_text).decode("utf-8", errors="replace")
+                            bytes(self._fragmented_text).decode(
+                                "utf-8", errors="replace"
+                            )
                         )
                         self._fragmented_text.clear()
                         self._awaiting_continuation = False
@@ -319,7 +365,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     def _truncate_for_ws_log(cls, text: str) -> str:
         if len(text) <= cls._WS_LOG_MAX_CHARS:
             return text
-        return f"{text[:cls._WS_LOG_MAX_CHARS]}...<truncated:{len(text) - cls._WS_LOG_MAX_CHARS}>"
+        return f"{text[: cls._WS_LOG_MAX_CHARS]}...<truncated:{len(text) - cls._WS_LOG_MAX_CHARS}>"
 
     @classmethod
     def _format_ws_part(cls, value: Any) -> str:
@@ -445,13 +491,21 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
         upstream_host = parsed.hostname or "127.0.0.1"
         upstream_port = parsed.port or (
-            self._DEFAULT_HTTPS_PORT if parsed.scheme in ("wss", "https") else self._DEFAULT_HTTP_PORT
+            self._DEFAULT_HTTPS_PORT
+            if parsed.scheme in ("wss", "https")
+            else self._DEFAULT_HTTP_PORT
         )
 
         try:
-            upstream = socket.create_connection((upstream_host, upstream_port), timeout=self._WS_CONNECT_TIMEOUT)
+            upstream = socket.create_connection(
+                (upstream_host, upstream_port), timeout=self._WS_CONNECT_TIMEOUT
+            )
             if parsed.scheme in ("wss", "https"):
-                ctx = ssl.create_default_context() if get_ssl_verify() else get_insecure_ssl_context()
+                ctx = (
+                    ssl.create_default_context()
+                    if get_ssl_verify()
+                    else get_insecure_ssl_context()
+                )
                 upstream = ctx.wrap_socket(upstream, server_hostname=upstream_host)
         except OSError as exc:
             self.log_error(
@@ -474,7 +528,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             for key, value in self.headers.items():
                 # Optional debug mode: disable websocket compression so frames stay
                 # plain text and can be parsed for req/res/event logging.
-                if self.ws_disable_compress and key.lower() == "sec-websocket-extensions":
+                if (
+                    self.ws_disable_compress
+                    and key.lower() == "sec-websocket-extensions"
+                ):
                     continue
                 if key.lower() == "host":
                     request_lines.append(f"Host: {upstream_host}:{upstream_port}")
@@ -511,7 +568,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             self.connection.sendall(response_head)
 
             if b" 101 " not in response_head.split(b"\r\n", 1)[0]:
-                status_line = response_head.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+                status_line = response_head.split(b"\r\n", 1)[0].decode(
+                    "latin-1", errors="replace"
+                )
                 self.logger.info(
                     "[ws][handshake] upstream returned non-101, tunnel closed: %s",
                     format_ws_diagnostics(
@@ -527,7 +586,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
             self.logger.info(
                 "[ws][handshake] tunnel established %s <-> %s:%s",
-                self.client_address[0], upstream_host, upstream_port,
+                self.client_address[0],
+                upstream_host,
+                upstream_port,
             )
             self.connection.setblocking(False)
             upstream.setblocking(False)
@@ -535,7 +596,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             client_parser = self._WsTextFrameParser()
             server_parser = self._WsTextFrameParser()
             while True:
-                readable, _, errored = select.select(sockets, [], sockets, self._WS_SELECT_TIMEOUT)
+                readable, _, errored = select.select(
+                    sockets, [], sockets, self._WS_SELECT_TIMEOUT
+                )
                 if errored:
                     self.log_error(
                         "proxy ws socket error, closing tunnel: %s",
@@ -555,7 +618,11 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 if not readable:
                     continue
                 for sock in readable:
-                    direction = "frontend->backend" if sock is self.connection else "backend->frontend"
+                    direction = (
+                        "frontend->backend"
+                        if sock is self.connection
+                        else "backend->frontend"
+                    )
                     try:
                         data = sock.recv(self._WS_RECV_BUFFER)
                     except OSError as recv_exc:
@@ -588,10 +655,14 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     target = upstream if sock is self.connection else self.connection
                     if sock is self.connection:
                         for text_message in client_parser.feed(data):
-                            self._log_ws_business_message("frontend->backend", text_message)
+                            self._log_ws_business_message(
+                                "frontend->backend", text_message
+                            )
                     else:
                         for text_message in server_parser.feed(data):
-                            self._log_ws_business_message("backend->frontend", text_message)
+                            self._log_ws_business_message(
+                                "backend->frontend", text_message
+                            )
                     # 非阻塞 socket 写入：循环增量 send，缓冲区满时等待可写后继续，
                     # 跨平台覆盖 Windows WSAEWOULDBLOCK (10035) 与 POSIX EAGAIN/EWOULDBLOCK。
                     pending = data
@@ -599,10 +670,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                         try:
                             sent = target.send(pending)
                         except OSError as e:
-                            would_block = (
-                                getattr(e, "winerror", None) == 10035
-                                or e.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
-                            )
+                            would_block = getattr(
+                                e, "winerror", None
+                            ) == 10035 or e.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
                             if not would_block:
                                 raise
                             _, writable, _ = select.select([], [target], [], 1.0)
@@ -666,16 +736,27 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     def _is_path_under_allowed_root(cls, target: Path) -> bool:
         target_resolved = target.resolve()
         try:
-            in_workspace = (
-                os.path.commonpath([str(cls.workspace_root), str(target_resolved)])
-                == str(cls.workspace_root)
-            )
-            in_agent_teams = (
-                os.path.commonpath([str(cls.agent_teams_root), str(target_resolved)]) == str(cls.agent_teams_root)
-            )
-            in_logs = os.path.commonpath([str(cls.logs_root), str(target_resolved)]) == str(cls.logs_root)
-            in_auto_harness = \
-                os.path.commonpath([str(cls.auto_harness_root), str(target_resolved)]) == str(cls.auto_harness_root)
+            in_workspace = os.path.commonpath(
+                [str(cls.workspace_root), str(target_resolved)]
+            ) == str(cls.workspace_root)
+            in_agent_teams = os.path.commonpath(
+                [str(cls.agent_teams_root), str(target_resolved)]
+            ) == str(cls.agent_teams_root)
+            in_logs = os.path.commonpath(
+                [str(cls.logs_root), str(target_resolved)]
+            ) == str(cls.logs_root)
+            # 外层日期布局激活时日志在 <DATE_ROOT>/<日期>/<…>/<uidKey>/ 下
+            # （与 logs_root 不相交），仅放行本用户的日志子树——不能放宽到
+            # 整个 DATE_ROOT，那会暴露桌面端 system.log 与其他用户日志。
+            for dated_root in _dated_user_log_roots(cls.logs_root):
+                if os.path.commonpath(
+                    [str(dated_root), str(target_resolved)]
+                ) == str(dated_root):
+                    in_logs = True
+                    break
+            in_auto_harness = os.path.commonpath(
+                [str(cls.auto_harness_root), str(target_resolved)]
+            ) == str(cls.auto_harness_root)
             return in_workspace or in_agent_teams or in_logs or in_auto_harness
         except ValueError:
             return False
@@ -702,7 +783,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             parsed[unquote(k)] = unquote(v)
         return parsed
 
-    def _resolve_session_title(self, session_dir: Path, history: list[dict[str, Any]]) -> str:
+    def _resolve_session_title(
+        self, session_dir: Path, history: list[dict[str, Any]]
+    ) -> str:
         metadata_path = session_dir / "metadata.json"
         if metadata_path.exists():
             try:
@@ -727,7 +810,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         sessions_root = get_agent_sessions_dir().resolve()
         session_dir = (sessions_root / session_id).resolve()
         try:
-            if os.path.commonpath([str(sessions_root), str(session_dir)]) != str(sessions_root):
+            if os.path.commonpath([str(sessions_root), str(session_dir)]) != str(
+                sessions_root
+            ):
                 raise FileNotFoundError("history_not_found")
         except ValueError as exc:
             raise FileNotFoundError("history_not_found") from exc
@@ -828,7 +913,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     {
                         "name": entry.name,
                         "path": str(entry.relative_to(self.project_root)),
-                        "isMarkdown": self._is_markdown(entry) if entry.is_file() else False,
+                        "isMarkdown": self._is_markdown(entry)
+                        if entry.is_file()
+                        else False,
                         "isDirectory": entry.is_dir(),
                     }
                 )
@@ -878,15 +965,22 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     try:
                         _generate_agent_data(self.project_root)
                     except Exception as exc:  # noqa: BLE001
-                        self._write_json(500, {"error": "generate_failed", "detail": str(exc)})
+                        self._write_json(
+                            500, {"error": "generate_failed", "detail": str(exc)}
+                        )
                         return
                 if not full_path.exists():
-                    self._write_json(404, {"error": "file_not_found", "fullPath": str(full_path)})
+                    self._write_json(
+                        404, {"error": "file_not_found", "fullPath": str(full_path)}
+                    )
                     return
 
-            def read_file_with_encoding(file_path: Path, encoding: str) -> tuple[str, str]:
+            def read_file_with_encoding(
+                file_path: Path, encoding: str
+            ) -> tuple[str, str]:
                 if encoding == "auto":
                     import charset_normalizer
+
                     raw_data = file_path.read_bytes()
                     detected = charset_normalizer.from_bytes(raw_data).best()
                     if detected is None:
@@ -896,12 +990,20 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     try:
                         return raw_data.decode(detected_encoding), detected_encoding
                     except (UnicodeDecodeError, LookupError) as decode_exc:
-                        for try_encoding in ["gbk", "gb2312", "big5", "shift_jis", "euc_kr"]:
+                        for try_encoding in [
+                            "gbk",
+                            "gb2312",
+                            "big5",
+                            "shift_jis",
+                            "euc_kr",
+                        ]:
                             try:
                                 return raw_data.decode(try_encoding), try_encoding
                             except (UnicodeDecodeError, LookupError):
                                 continue
-                        raise OSError(f"Unable to decode file with any known encoding") from decode_exc
+                        raise OSError(
+                            f"Unable to decode file with any known encoding"
+                        ) from decode_exc
                 else:
                     return file_path.read_text(encoding=encoding), encoding
 
@@ -1017,12 +1119,22 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                                 self.wfile.write(chunk)
                                 last_progress = time.time()
                                 remaining -= len(chunk)
-                            except (socket.timeout, TimeoutError, BrokenPipeError,
-                                    ConnectionResetError, ConnectionError) as werr:
-                                self.log_error("file download write failed/timeout: %s", werr)
+                            except (
+                                socket.timeout,
+                                TimeoutError,
+                                BrokenPipeError,
+                                ConnectionResetError,
+                                ConnectionError,
+                            ) as werr:
+                                self.log_error(
+                                    "file download write failed/timeout: %s", werr
+                                )
                                 break
                             if time.time() - last_progress > 120:
-                                self.log_error("file download stalled over 120s, aborting: %s", file_path)
+                                self.log_error(
+                                    "file download stalled over 120s, aborting: %s",
+                                    file_path,
+                                )
                                 break
                 finally:
                     try:
@@ -1100,7 +1212,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 "[jiuwenswarm-web] ws disable compress updated: %s",
                 ws_disable_compress,
             )
-            self._write_json(200, {"ok": True, "wsDisableCompress": ws_disable_compress})
+            self._write_json(
+                200, {"ok": True, "wsDisableCompress": ws_disable_compress}
+            )
             return
 
         self._write_json(404, {"error": "not_found"})
@@ -1195,7 +1309,11 @@ def _normalize_ws_target(value: str) -> str:
 
 
 def _setup_logger(logs_root: Path, log_level: str) -> logging.Logger:
-    logs_root.mkdir(parents=True, exist_ok=True)
+    # 外层日期布局激活时 ws-dev.log 经 make_dated_file_handler 落日期目录
+    # （handler 自建），锚点根不写入，不预建以免遗留空目录；旧布局锚点根
+    # 即写入根，维持预建。
+    if should_precreate_logs_root():
+        logs_root.mkdir(parents=True, exist_ok=True)
     lg = logging.getLogger(__name__)
     lg.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     lg.propagate = True
@@ -1204,7 +1322,7 @@ def _setup_logger(logs_root: Path, log_level: str) -> logging.Logger:
         lg.removeHandler(h)
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -1214,7 +1332,9 @@ def _setup_logger(logs_root: Path, log_level: str) -> logging.Logger:
     # 但本 handler 自身需独立挂载，才能保证 ws-dev.log 也脱敏。
     privacy_filter = SensitiveDataFilter()
 
-    file_handler = logging.FileHandler(logs_root / "ws-dev.log", mode="w", encoding="utf-8")
+    # 按天切分：<logs_root>/<YYYY-MM-DD>/ws-dev.log（追加模式，dev 日志；
+    # 外层日期布局激活时 <DATE_ROOT>/<日期>/jiuwenswarm/<uidKey>/ws-dev.log）
+    file_handler = make_dated_file_handler("ws-dev.log")
     file_handler.setFormatter(formatter)
     file_handler.addFilter(privacy_filter)
     lg.addHandler(file_handler)
@@ -1227,7 +1347,9 @@ def _wait_for_gateway(ws_target: str, logger: logging.Logger) -> None:
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme in ("wss", "https") else 80)
     logger.info("[jiuwenswarm-web] waiting for gateway %s:%s ...", host, port)
-    if wait_for_tcp_port(host, port, timeout=15.0, max_attempts=15, target_state="connected"):
+    if wait_for_tcp_port(
+        host, port, timeout=15.0, max_attempts=15, target_state="connected"
+    ):
         logger.info("[jiuwenswarm-web] gateway available")
     else:
         logger.warning("[jiuwenswarm-web] gateway not available after 15 seconds")
@@ -1253,10 +1375,14 @@ def main() -> None:
     # WEB_PORT is the WebChannel websocket endpoint that this server proxies to
     default_host = os.getenv("FRONTEND_HOST", "localhost")
     default_port = int(os.getenv("FRONTEND_PORT", "5173"))
-    web_port = os.getenv("WEB_PORT", "19000")  # WebChannel websocket port (proxy target)
+    web_port = os.getenv(
+        "WEB_PORT", "19000"
+    )  # WebChannel websocket port (proxy target)
     default_proxy = os.getenv("GATEWAY_URL", f"http://127.0.0.1:{web_port}")
 
-    parser = argparse.ArgumentParser(description="Serve JiuwenSwarm frontend static files.")
+    parser = argparse.ArgumentParser(
+        description="Serve JiuwenSwarm frontend static files."
+    )
     parser.add_argument("--host", default=default_host, help="Host to bind.")
     parser.add_argument("--port", type=int, default=default_port, help="Port to bind.")
     parser.add_argument(
@@ -1345,7 +1471,12 @@ def main() -> None:
     logger.info("[jiuwenswarm-web] /api -> %s", api_target)
     logger.info("[jiuwenswarm-web] /ws  -> %s", ws_target)
     logger.info("[jiuwenswarm-web] ws disable compress: %s", args.ws_disable_compress)
-    logger.info("[jiuwenswarm-web] /file-api roots -> %s, %s, %s", workspace_root, agent_teams_root, logs_root)
+    logger.info(
+        "[jiuwenswarm-web] /file-api roots -> %s, %s, %s",
+        workspace_root,
+        agent_teams_root,
+        logs_root,
+    )
 
     _wait_for_gateway(ws_target, logger)
 

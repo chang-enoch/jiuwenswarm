@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import logging.handlers
 import os
 import sys
 
@@ -24,11 +23,20 @@ from openjiuwen.core.common.logging import LogManager
 
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
 from jiuwenswarm.dotenv_early import parse_dotenv_early, load_dotenv_runtime
+
 parse_dotenv_early("jiuwenswarm-agentserver")
+
+# 统一日志目录须先于其余 jiuwenswarm/openjiuwen import 钉死：import 链上的
+# 注册类模块（connector/parser 等）import 期即按默认配置创建文件 logger，
+# 晚了会在 CWD 下留下 logs/logs 双层空目录。
+from jiuwenswarm.common.utils import configure_agent_core_log_dir
+
+configure_agent_core_log_dir()
 
 # --- Now safe to import jiuwenswarm modules ---
 from jiuwenswarm.common.debug_dump import install_async_dump_handler
 from jiuwenswarm.common.utils import (
+    configure_agent_core_log_dir,
     ensure_builtin_skills_installed,
     get_env_file,
     get_root_dir,
@@ -59,24 +67,31 @@ ensure_builtin_skills_installed()
 _logging_yaml = get_root_dir() / "config" / "logging.yaml"
 if _logging_yaml.exists():
     from openjiuwen.core.common.logging.log_config import configure_log
+
     configure_log(str(_logging_yaml))
 else:
     for _lg in LogManager.get_all_loggers().values():
         _lg.set_level(logging.CRITICAL)
 
-    from jiuwenswarm.common.utils import get_logs_dir
+    from jiuwenswarm.common.utils import (
+        get_logs_dir,
+        make_dated_file_handler,
+        should_precreate_logs_root,
+    )
+
     _logs_root = get_logs_dir()
-    _logs_root.mkdir(parents=True, exist_ok=True)
+    # 外层日期布局激活时 permissions.log 经 make_dated_file_handler 落日期
+    # 目录（handler 自建），锚点根不写入，不预建以免遗留空目录；旧布局
+    # 锚点根即写入根，维持预建。
+    if should_precreate_logs_root():
+        _logs_root.mkdir(parents=True, exist_ok=True)
     _perm_fmt = logging.Formatter(
-        "%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        "%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    _perm_fh = logging.handlers.RotatingFileHandler(
-        _logs_root / "permissions.log",
-        maxBytes=20 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
+    # 按天切分：<logs_root>/<YYYY-MM-DD>/permissions.log（日内 2MB 轮转；
+    # 外层日期布局激活时 <DATE_ROOT>/<日期>/jiuwenswarm/<uidKey>/permissions.log）
+    _perm_fh = make_dated_file_handler("permissions.log")
     _perm_fh.setLevel(logging.INFO)
     _perm_fh.setFormatter(_perm_fmt)
     _perm_sh = logging.StreamHandler()
@@ -98,12 +113,7 @@ else:
             return "[PermissionEngine]" in record.getMessage()
 
     _perm_filter = _PermissionEngineFilter()
-    _common_fh = logging.handlers.RotatingFileHandler(
-        _logs_root / "permissions.log",
-        maxBytes=20 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
+    _common_fh = make_dated_file_handler("permissions.log")
     _common_fh.setLevel(logging.INFO)
     _common_fh.setFormatter(_perm_fmt)
     _common_fh.addFilter(_perm_filter)
@@ -115,12 +125,18 @@ else:
     _common_logger.addHandler(_common_sh)
     _common_logger.propagate = False
 
-    _perm_ns_logger = logging.getLogger("jiuwenswarm.agents.harness.common.rails.permissions")
+    _perm_ns_logger = logging.getLogger(
+        "jiuwenswarm.agents.harness.common.rails.permissions"
+    )
     _perm_ns_logger.setLevel(logging.INFO)
     if not _perm_ns_logger.handlers:
         _perm_ns_logger.addHandler(_perm_fh)
         _perm_ns_logger.addHandler(_perm_sh)
     _perm_ns_logger.propagate = False
+
+# 桌面端统一日志目录：注入 JIUWENSWARM_LOG_DIR 时，agent-core 日志
+# 同样落到统一目录（见 utils.configure_agent_core_log_dir）。
+configure_agent_core_log_dir()
 
 # Load env from user workspace config/.env
 load_dotenv_runtime(dotenv_path=get_env_file(), override=True)
@@ -137,7 +153,10 @@ install_shell_tool_safety_hooks()
 install_connector_host_exec_hooks()
 
 # 兼容 SSE-only 网关：让非流式 invoke()（subagent / 心跳等）能解析 text/event-stream 响应
-from jiuwenswarm.llm_sse_patch import apply_openai_sse_invoke_patch, apply_openai_sse_stream_patch
+from jiuwenswarm.llm_sse_patch import (
+    apply_openai_sse_invoke_patch,
+    apply_openai_sse_stream_patch,
+)
 
 apply_openai_sse_invoke_patch()
 # 流式同兼容：网关 chunk 内容在 choices[0].message.token_text（非标准 delta.content），
@@ -159,11 +178,12 @@ from jiuwenswarm.server.runtime.debug_trace.task_tool_patch import (
 apply_task_tool_debug_patch()
 
 
-
 async def _run(host: str, port: int) -> None:
     from openjiuwen.core.runner import Runner
     from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
-    from jiuwenswarm.agents.harness.team.remote_member_bootstrap import run_teammate_bootstrap_daemon
+    from jiuwenswarm.agents.harness.team.remote_member_bootstrap import (
+        run_teammate_bootstrap_daemon,
+    )
     from jiuwenswarm.extensions.manager import ExtensionManager
     from jiuwenswarm.extensions.registry import ExtensionRegistry
     from jiuwenswarm.common.config import get_config
@@ -186,15 +206,14 @@ async def _run(host: str, port: int) -> None:
         registry=extension_registry,
     )
     await extension_manager.load_all_extensions()
-    logger.info("[AgentServer] 扩展加载完成，共 %d 个", len(extension_manager.list_extensions()))
+    logger.info(
+        "[AgentServer] 扩展加载完成，共 %d 个", len(extension_manager.list_extensions())
+    )
 
     # 会话 metadata 的字段补全已改为惰性迁移:读取时按需推断并写回磁盘
     # (见 session_metadata._apply_metadata_defaults_with_inference),无需启动全量扫描。
 
-    server = AgentWebSocketServer.get_instance(
-        host=host,
-        port=port
-    )
+    server = AgentWebSocketServer.get_instance(host=host, port=port)
 
     stop_event = asyncio.Event()
 
@@ -216,7 +235,12 @@ async def _run(host: str, port: int) -> None:
     # 适配逻辑（建专用 agent + 触发主 agent 回调）封装在 proactive_adapter，
     # app_agentserver 只调 init_proactive_engine。
     from jiuwenswarm.server.runtime.proactive_adapter import init_proactive_engine
-    proactive_config = full_cfg.get("proactive_recommendation", {}) if isinstance(full_cfg, dict) else {}
+
+    proactive_config = (
+        full_cfg.get("proactive_recommendation", {})
+        if isinstance(full_cfg, dict)
+        else {}
+    )
     await init_proactive_engine(server, proactive_config)
 
     if desktop_channels is None:
@@ -257,7 +281,9 @@ async def _run(host: str, port: int) -> None:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.warning("[AgentServer] teammate bootstrap daemon stop failed: %s", exc)
+                logger.warning(
+                    "[AgentServer] teammate bootstrap daemon stop failed: %s", exc
+                )
         if desktop_channels is not None:
             await desktop_channels.stop()
         await server.stop()
@@ -274,12 +300,15 @@ async def _run(host: str, port: int) -> None:
                 shutdown_jiuwenbox_sandboxes,
             )
 
-            logger.info("[AgentServer][sandbox] step 1: DELETE 远端沙箱 (box-server 活着)")
+            logger.info(
+                "[AgentServer][sandbox] step 1: DELETE 远端沙箱 (box-server 活着)"
+            )
             released = await asyncio.to_thread(shutdown_jiuwenbox_sandboxes)
             logger.info("[AgentServer][sandbox] step 1 done: released=%s", released)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[AgentServer] jiuwenbox sandbox cleanup failed: %s", exc,
+                "[AgentServer] jiuwenbox sandbox cleanup failed: %s",
+                exc,
             )
         # 停 internal 模式下由本 agent-server 拉起的 box-server 子进程。box-server
         # 进程退出时其 FastAPI lifespan shutdown 会兜底调 shutdown_all_sandboxes
@@ -307,7 +336,10 @@ async def _run(host: str, port: int) -> None:
             logger.warning("[AgentServer] Celia shutdown failed: %s", exc)
         # Shutdown team observability (flush & close spans)
         try:
-            from jiuwenswarm.agents.harness.team.team_manager import shutdown_team_observability
+            from jiuwenswarm.agents.harness.team.team_manager import (
+                shutdown_team_observability,
+            )
+
             shutdown_team_observability()
         except Exception as exc:
             logger.warning("[AgentServer] team observability shutdown failed: %s", exc)
@@ -318,6 +350,7 @@ async def _run(host: str, port: int) -> None:
             from jiuwenswarm.agents.harness.agent_observability import (
                 shutdown_agent_observability,
             )
+
             shutdown_agent_observability()
         except Exception as exc:
             logger.warning("[AgentServer] agent observability shutdown failed: %s", exc)
@@ -374,5 +407,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
