@@ -315,14 +315,15 @@ _SKILL_TURBO_INTERACTIVE_ASK_TOKEN_EXTRA_KEY = "_jiuwenswarm_skill_turbo_interac
 _SKILL_TURBO_RESUME_ANSWERS_TOKEN_EXTRA_KEY = "_jiuwenswarm_skill_turbo_resume_answers_token"
 _SKILL_TURBO_OUTER_TODO_TOKEN_EXTRA_KEY = "_jiuwenswarm_skill_turbo_outer_todo_token"
 _SUBAGENT_PARENT_SESSION_TOKEN_EXTRA_KEY = "_jiuwenswarm_subagent_parent_session_token"
+_STREAM_TOKENS_ATTR = "_jiuwenswarm_stream_tokens"
 
 
 def _tool_context_tokens(ctx: AgentCallbackContext) -> dict:
     """Keep task-local reset tokens off the shared cross-rail extra dict."""
-    tokens = getattr(ctx, "_jiuwenswarm_stream_tokens", None)
-    if tokens is None:
+    tokens = getattr(ctx, _STREAM_TOKENS_ATTR, None)
+    if not isinstance(tokens, dict):
         tokens = {}
-        ctx._jiuwenswarm_stream_tokens = tokens
+        setattr(ctx, _STREAM_TOKENS_ATTR, tokens)
     return tokens
 
 
