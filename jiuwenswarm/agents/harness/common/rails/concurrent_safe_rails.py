@@ -16,6 +16,7 @@ the agent can use them.
 from __future__ import annotations
 
 import logging
+from copy import copy
 
 from openjiuwen.core.runner import Runner
 from openjiuwen.harness.rails import SysOperationRail
@@ -117,6 +118,7 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
             return
 
         self.system_prompt_builder = getattr(agent, "system_prompt_builder", None)
+        self._state_agent = agent
 
         if not self.sys_operation:
             self.set_sys_operation(agent.deep_config.sys_operation)
@@ -149,9 +151,10 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
             for tool_class, found in tool_configs:
                 if not found:
                     new_tool = tool_class(self.sys_operation, workspace_dir, language, agent_id)
-                    if Runner.resource_mgr.get_tool(new_tool.card.id) is not None:
-                        agent.ability_manager.add(new_tool.card)
-                        tools.append(new_tool)
+                    registered_tool = Runner.resource_mgr.get_tool(new_tool.card.id)
+                    if registered_tool is not None:
+                        agent.ability_manager.add(registered_tool.card)
+                        tools.append(registered_tool)
                         continue
                     Runner.resource_mgr.add_tool(new_tool)
                     agent.ability_manager.add(new_tool.card)
@@ -161,6 +164,16 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
             logger.warning("ConcurrentSafeTaskPlanningRail: failed to add tool, error: %s", exc)
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
+        # Tool callbacks run on the inner ReActAgent; TaskPlan belongs to
+        # the DeepAgent that initialized this rail. Do not mutate shared ctx.
+        if not callable(getattr(ctx.agent, "load_state", None)):
+            state_agent = getattr(self, "_state_agent", None)
+            if not callable(getattr(state_agent, "load_state", None)) or not callable(
+                getattr(state_agent, "save_state", None)
+            ):
+                return
+            ctx = copy(ctx)
+            ctx.agent = state_agent
         await super().after_tool_call(ctx)
         if not isinstance(ctx.inputs, ToolCallInputs):
             return
