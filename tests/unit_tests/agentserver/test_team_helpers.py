@@ -123,6 +123,16 @@ class _InactiveTeamRuntimeManagerMixin:
     def __init__(self) -> None:
         self._seen_team_events: dict[str, bool] = {}
         self._workflow_completed: dict[str, bool] = {}
+        self._stream_round_terminal: dict[str, bool] = {}
+
+    def mark_stream_round_terminal(self, session_id: str) -> None:
+        self._stream_round_terminal[session_id] = True
+
+    def clear_stream_round_terminal(self, session_id: str) -> None:
+        self._stream_round_terminal.pop(session_id, None)
+
+    def is_stream_round_terminal(self, session_id: str) -> bool:
+        return self._stream_round_terminal.get(session_id, False)
 
     def mark_seen_team_events(self, session_id: str) -> None:
         self._seen_team_events[session_id] = True

@@ -409,6 +409,21 @@ class TeamManager:
         # is received.  When True, chat.final is no longer suppressed
         # even if seen_team_events is True.
         self._workflow_completed: dict[str, bool] = {}
+        # session_id → True 当长寿命流上最近一个回合已广播终态（processing_status
+        # is_complete）。用于区分「回合进行中」与「回合已结束但流未收」——后者
+        # 下一条用户消息应按新流首请求处理而非 follow-up 复用旧流（否则回答帧
+        # 带旧 request_id，前端归属/归组断链）。新一轮内容帧到达时清除。
+        self._stream_round_terminal: dict[str, bool] = {}
+
+    def mark_stream_round_terminal(self, session_id: str) -> None:
+        """标记会话长寿命流的最近回合已终态收尾。"""
+        self._stream_round_terminal[session_id] = True
+
+    def clear_stream_round_terminal(self, session_id: str) -> None:
+        self._stream_round_terminal.pop(session_id, None)
+
+    def is_stream_round_terminal(self, session_id: str) -> bool:
+        return self._stream_round_terminal.get(session_id, False) is True
 
     def has_stream_task(self, session_id: str) -> bool:
         return session_id in self._stream_tasks
@@ -442,6 +457,11 @@ class TeamManager:
             self._pending_waiters[session_id] = remaining
         else:
             self._pending_waiters.pop(session_id, None)
+
+    def clear_waiters(self, session_id: str) -> None:
+        """移除会话的全部 waiter（回合已终态的旧流收尾时调用；旧 WS 发送循环
+        靠 has_stream_task=False 自行退出，其 finally 的 remove_waiter 幂等）。"""
+        self._pending_waiters.pop(session_id, None)
 
     async def broadcast_event(self, session_id: str, event: dict[str, Any]) -> None:
         """Broadcast an event with backpressure to every active waiter.
@@ -1889,6 +1909,8 @@ class TeamManager:
 
     def register_stream_task(self, session_id: str, task: asyncio.Task) -> None:
         self._stream_tasks[session_id] = task
+        # 新流 = 全新回合序列：终态标记清零
+        self._stream_round_terminal.pop(session_id, None)
 
     def _has_local_team_runtime(self, session_id: str) -> bool:
         """Return whether the session should use the legacy in-memory TeamAgent path."""
