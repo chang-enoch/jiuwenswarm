@@ -208,12 +208,15 @@ def schedule_team_stall_watchdog(
         liveness: Callable[[], int],
         completion_signals: Callable[[], int],
         broadcast: BroadcastFn,
+        on_terminal: Callable[[], None] | None = None,
 ) -> asyncio.Task:
     """启动停摆看门狗，返回任务供调用方持有/随流取消。
 
     liveness / completion_signals: 零参数可调用，分别返回本流已消费 chunk 数
     （停摆语义的活性口径是全量流帧——任何成员/团队事件都算活动，与死亡探针
     "只数 leader 帧"不同）与已广播的回合收尾信号数。
+    on_terminal: 判死终态广播后的零参数回调（调用方注入级联收流，本模块不
+    反向依赖 team_helpers，防循环依赖）。
     """
 
     async def _watchdog() -> None:
@@ -306,6 +309,18 @@ def schedule_team_stall_watchdog(
                         ),
                     },
                 )
+                # 判死级联收流 + park 运行时（调用方注入），
+                # 追问才能按新首请求走 RESUME_FROM_PAUSE，而非进旧流断归属
+                if callable(on_terminal):
+                    try:
+                        on_terminal()
+                    except Exception:
+                        logger.debug(
+                            "[TeamStallWatchdog] on_terminal hook failed: "
+                            "session_id=%s",
+                            session_id,
+                            exc_info=True,
+                        )
                 return
             except asyncio.CancelledError:
                 raise

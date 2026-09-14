@@ -657,6 +657,42 @@ def _normalize_team_query(query: Any, *, channel_id: str | None, language: str) 
     return query
 
 
+async def _fresh_start_if_round_terminal(
+        team_manager: Any, session_id: str, query: Any
+) -> bool:
+    """回合已终态但长寿命流未收时，把本消息转为新流首请求。
+
+    触发条件：流任务在 + 最近回合已广播终态（is_stream_round_terminal）。
+    动作：stop 运行时（pool 移除；cold recover 重建）→ 清 initialized/waiter/
+    终态标记 → 调用方按 first-request 起新流（新 request_id，帧归属/归组
+    不再断链）。HITL 答案（InteractiveInput）不拦截：它必须走既有暂停恢复链。
+    返回是否执行了 fresh-start 收流。
+
+    为何 stop 而非 pause：fresh-start 的 resume 是同步紧随的，正中该窗口；cold
+    recover（pool 移除后重建）是唯一实证可靠的下一轮重入路径。
+    """
+    from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+
+    if isinstance(query, InteractiveInput):
+        return False
+    if not team_manager.has_stream_task(session_id):
+        return False
+    if not team_manager.is_stream_round_terminal(session_id):
+        return False
+    logger.info(
+        "[TeamHelpers] stream alive but round terminal, starting fresh stream "
+        "for new question: session_id=%s",
+        session_id,
+    )
+    await team_manager.cancel_session_runtime(
+        session_id, reason="round-terminal fresh start"
+    )
+    team_manager.clear_session_initialized(session_id)
+    team_manager.clear_waiters(session_id)
+    team_manager.clear_stream_round_terminal(session_id)
+    return True
+
+
 async def _team_session_has_runtime(team_manager: TeamManager, session_id: str) -> bool:
     # Keep ordinary team first-request detection scoped to claw-local
     # live markers only. Resumable Runner-pool entries are reserved for
@@ -1598,6 +1634,10 @@ async def process_team_message_stream(
     # 2. 已有同 session 的 waiter → False
     # 3. session 已初始化过 team runtime → False
     # 4. 否则 → True（首次请求，需要创建 team spec + stream）
+    # 例外见 _fresh_start_if_round_terminal：回合已终态但长寿命流未收时，
+    # 本消息按新流首请求处理（收旧流、清标记），不落入 follow-up 旧流断链。
+    await _fresh_start_if_round_terminal(team_manager, session_id, query)
+
     has_active_waiters = team_manager.has_waiters(session_id)
     is_first_request = (
         not team_manager.has_stream_task(session_id)
@@ -2101,6 +2141,9 @@ async def process_team_message_stream(
 # 且期间无回合收尾信号，才认定本轮死亡。需大于模型重试回退周期（agent-core
 # StreamController 的重试间隔为数秒级），30s 覆盖典型回退且不至于让用户等太久。
 _LEADER_ROUND_DEATH_PROBE_SEC = 30.0
+# settle 补判终态的静默确认窗（秒）：settle 是瞬时快照，leader 发言当口任务板
+# 恰空会被误判"回合落定"——终态延迟一个窗口发出，窗口内有新流帧即作废。
+_SETTLE_TERMINAL_QUIET_SEC = 2.0
 
 # 主理人死亡但成员仍在工作时不补终态：成员回报会经 mailbox 唤醒主理人续跑，
 # 收尾由恢复后的正常路径负责，探针按窗口续探。上限兜底成员永忙（卡死）
@@ -2242,6 +2285,12 @@ def _schedule_leader_round_death_probe(
                 )
                 if callable(on_fired):
                     on_fired()
+                # 判死级联收流 + park 运行时——否则追问被判
+                # follow-up，真产出走旧流（帧带旧 request_id），前端新 run
+                # 归属断链（先「本轮无响应」再永久「正在思考」）
+                _cascade_park_runtime_after_terminal(
+                    channel_id, session_id, round_id, source="leader-death-probe"
+                )
                 return
             except asyncio.CancelledError:
                 raise
@@ -2254,6 +2303,183 @@ def _schedule_leader_round_death_probe(
                 return
 
     return asyncio.create_task(_probe(), name=f"leader-death-probe-{session_id}")
+
+
+_TERMINAL_CASCADE_PAUSE_TIMEOUT_SEC = 15.0
+_TERMINAL_CASCADE_STOP_TIMEOUT_SEC = 10.0
+
+
+async def _team_round_settled(channel_id: str | None, session_id: str) -> bool:
+    """零任务问答轮的收尾补判。
+
+    team.completed 的门禁要求「有任务且全终态」（agent-core is_team_completed
+    条件①），消息制委派/纯问答团从不建任务行 → 回合无任何终态帧、长寿命流
+    永挂、前端永久「正在思考」。chat.final 到达时按 settle 三件套补判：
+    零在途成员 + 零非终态任务 + 零未读消息。
+
+    退化方向：任一读数不可得（快照/DB/team_name 解析失败）按「未落定」处理
+    ——不补终态、维持旧行为，不会更糟。
+    """
+    try:
+        from jiuwenswarm.server.runtime.agent_adapter.team_stall_watchdog import (
+            team_progress_snapshot,
+        )
+
+        progress = await team_progress_snapshot(channel_id, session_id)
+        if progress is None:
+            return False
+        in_flight, pending, _recent = progress
+        if in_flight > 0 or pending > 0:
+            return False
+        unread = await _team_has_unread_messages(channel_id, session_id)
+        if unread is None or unread:
+            return False
+        return True
+    except Exception:
+        logger.debug(
+            "[TeamHelpers] team round settle check failed: session_id=%s",
+            session_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _team_has_unread_messages(channel_id: str | None, session_id: str) -> bool | None:
+    """team.db 未读消息真值（直读 DAO；与 is_team_completed 条件③同口径）。
+
+    访问链与 team_stall_watchdog.team_progress_snapshot_db 一致；解析不到
+    team_name / DB 不可用返回 None（调用方按「未落定」退化）。
+    """
+    try:
+        from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+        from openjiuwen.agent_teams.spawn.shared_resources import get_shared_db
+        from openjiuwen.agent_teams.tools.database.config import DatabaseConfig
+
+        from jiuwenswarm.agents.harness.team.config_loader import (
+            resolve_team_sqlite_db_path,
+        )
+        from jiuwenswarm.common.config import get_config
+        from jiuwenswarm.server.runtime.session.session_metadata import (
+            get_session_metadata,
+        )
+
+        tm = get_team_manager(channel_id)
+        team_name = str(tm.get_active_team_name(session_id) or "").strip()
+        if not team_name:
+            team_name = str(
+                (get_session_metadata(session_id) or {}).get("team_name") or ""
+            ).strip()
+        if not team_name:
+            return None
+        db_path = resolve_team_sqlite_db_path(get_config())
+        if db_path is None:
+            return None
+        db = get_shared_db(
+            DatabaseConfig(db_type="sqlite", connection_string=str(db_path))
+        )
+        token = set_session_id(session_id)
+        try:
+            await db.initialize()
+            await db.create_cur_session_tables()
+            if db.message is None:
+                return None
+            return await db.message.has_unread_messages(team_name)
+        finally:
+            reset_session_id(token)
+    except Exception:
+        logger.debug(
+            "[TeamHelpers] team unread-messages check failed: session_id=%s",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _cascade_park_runtime_after_terminal(
+        channel_id: str | None,
+        session_id: str,
+        round_id: Any,
+        *,
+        source: str,
+) -> asyncio.Task:
+    """判死补终态后的级联收流，fire-and-forget。
+
+    探针/看门狗补终态只解锁前端；若首请求流与运行时继续活着，追问会被判
+    follow-up，真产出走旧流（帧带旧 request_id）——前端新 run 归属断链，
+    表现为先「本轮无响应」再永久「正在思考」。级联把运行时 park 成 PAUSED：
+    kernel close_stream → runner 流自然结束 → 流任务退出（has_stream_task
+    变 False）→ 追问按新首请求走 RESUME_FROM_PAUSE，帧带新 request_id，
+    归属链恢复；运行时现场保留可续跑（不丢在途成员状态）。
+
+    pause 挂死（agent-core A3：harness ack 无超时）时降级 stop（pool 移除，
+    追问走 COLD_RECOVER）。必须独立任务逃生：探针/看门狗会被流收尾的
+    finally 取消，在自身任务内 await 级联会被自我取消打断。
+    """
+
+    async def _cascade() -> None:
+        try:
+            tm = get_team_manager(channel_id)
+            if not tm.has_stream_task(session_id):
+                return
+            try:
+                await asyncio.wait_for(
+                    tm.pause_session_runtime(
+                        session_id, reason=f"{source} terminal-cascade"
+                    ),
+                    timeout=_TERMINAL_CASCADE_PAUSE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[TeamHelpers] terminal cascade pause timed out, fallback to "
+                    "stop: channel_id=%s session_id=%s round_id=%s source=%s",
+                    _resolve_channel_id(channel_id),
+                    session_id,
+                    round_id,
+                    source,
+                )
+                try:
+                    await asyncio.wait_for(
+                        tm.cancel_session_runtime(
+                            session_id, reason=f"{source} pause-timeout-fallback"
+                        ),
+                        timeout=_TERMINAL_CASCADE_STOP_TIMEOUT_SEC,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[TeamHelpers] terminal cascade stop fallback failed: "
+                        "session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+            if tm.has_stream_task(session_id):
+                # pause/stop 的清理路径都应已收流；仍活着说明清理异常，兜底
+                # 直杀——否则追问永远走 follow-up 旧流。
+                leftover = tm.pop_stream_task(session_id)
+                if leftover is not None and not leftover.done():
+                    leftover.cancel()
+                logger.warning(
+                    "[TeamHelpers] terminal cascade force-closed leftover stream "
+                    "task: session_id=%s source=%s",
+                    session_id,
+                    source,
+                )
+            logger.info(
+                "[TeamHelpers] terminal cascade done: channel_id=%s session_id=%s "
+                "round_id=%s source=%s",
+                _resolve_channel_id(channel_id),
+                session_id,
+                round_id,
+                source,
+            )
+        except Exception:
+            logger.warning(
+                "[TeamHelpers] terminal cascade failed: session_id=%s source=%s",
+                session_id,
+                source,
+                exc_info=True,
+            )
+
+    return asyncio.create_task(_cascade(), name=f"team-terminal-cascade-{session_id}")
 
 
 async def _consume_stream_with_query(
@@ -2308,6 +2534,11 @@ async def _consume_stream_with_query(
     # leader 正常收尾但任务已下发、零成员在途（重试断片未派发/成员未启动），
     # 回合无人推进且 team.completed 永不成立。回合开始广播后启动，随流回收
     stall_watchdog_task: asyncio.Task | None = None
+    # settle 补判终态的静默窗任务：settle 是瞬时快照（leader 发言当口任务板
+    # 恰空即误判落定），终态延迟 _SETTLE_TERMINAL_QUIET_SEC 发出；窗口内有
+    # 新流帧即作废；流先结束则 finally 立即补发（流尽=回合已了）。
+    settle_terminal_task: asyncio.Task | None = None
+    settle_terminal_fired = False
     # 本流已广播的回合收尾信号数（processing_status is_complete=true 等）：
     # 探针据此判断"错误之后回合已正常收尾"，避免迟到误杀已完成回合
     completion_signals = 0
@@ -2361,6 +2592,11 @@ async def _consume_stream_with_query(
             # 广播函数注入（本模块的广播有 team.error 改名/建团事件标记/cron 收尾
             # 副作用）；看门狗模块不反向 import 本文件，防循环依赖
             broadcast=_broadcast_event,
+            # 判死级联收流 + park 运行时：追问按新首请求走
+            # RESUME_FROM_PAUSE，帧带新 request_id，前端归属链不断
+            on_terminal=lambda: _cascade_park_runtime_after_terminal(
+                channel_id, session_id, round_id, source="stall-watchdog"
+            ),
         )
         stream_trace_enabled = bool(
             _envs.get(_STREAM_TRACE_ENV_KEY) or os.environ.get(_STREAM_TRACE_ENV_KEY)
@@ -2378,6 +2614,52 @@ async def _consume_stream_with_query(
             round_id,
             _safe_query_preview(initial_query),
         )
+        async def _emit_settle_terminal() -> None:
+            """补发 settle 终态（带复核与去重）：静默窗后到点与流末兜底共用。"""
+            nonlocal completion_signals, settle_terminal_fired
+            if settle_terminal_fired or not tm_.has_stream_task(session_id):
+                return
+            # 复核三件套：成员可能在这窗口里刚起跑/任务刚下发/回报刚到达
+            if not await _team_round_settled(channel_id, session_id):
+                return
+            await _broadcast_event(
+                channel_id,
+                session_id,
+                {
+                    "event_type": "chat.processing_status",
+                    "session_id": session_id,
+                    "rid": round_id,
+                    "is_processing": False,
+                    "is_complete": True,
+                },
+            )
+            completion_signals += 1
+            settle_terminal_fired = True
+            tm_.mark_stream_round_terminal(session_id)
+
+        def _schedule_settle_terminal() -> None:
+            """settle 终态延迟静默窗确认：窗口内有新流帧（团队还在干活）即作废。"""
+            nonlocal settle_terminal_task
+            if settle_terminal_task is not None and not settle_terminal_task.done():
+                settle_terminal_task.cancel()
+            baseline_chunks = received_chunks
+            baseline_signals = completion_signals
+
+            async def _delayed() -> None:
+                try:
+                    await asyncio.sleep(_SETTLE_TERMINAL_QUIET_SEC)
+                except asyncio.CancelledError:
+                    return
+                if received_chunks != baseline_chunks:
+                    return
+                if completion_signals != baseline_signals:
+                    return
+                await _emit_settle_terminal()
+
+            settle_terminal_task = asyncio.create_task(
+                _delayed(), name=f"settle-terminal-{session_id}"
+            )
+
         runner_entered_at = time.monotonic()
         async for chunk in Runner.run_agent_team_streaming(
             agent_team=team_spec,
@@ -2490,6 +2772,16 @@ async def _consume_stream_with_query(
                         # 合成即重置：buffer 已完成本轮使命
                         leader_round_text = ""
             if parsed is not None:
+                # 新一轮内容到达 = 旧流上已有新回合在跑（团队自发续跑/迟到回报
+                # 唤醒）——清除回合终态标记，让下一条用户消息回归 follow-up 判定。
+                # 只认内容帧（delta/final/reasoning/tool_call）：终态帧与 usage 等
+                # 收尾尾随帧不清除（它们紧跟着 terminal 到达，会误清刚打的标记）。
+                if (
+                    tm_.is_stream_round_terminal(session_id)
+                    and parsed.get("event_type")
+                    in ("chat.delta", "chat.reasoning", "chat.tool_call")
+                ):
+                    tm_.clear_stream_round_terminal(session_id)
                 # Time to first token: the first frame actually produced by a
                 # model (reasoning counts — on a thinking model it comes first).
                 if first_model_output_at is None and parsed.get("event_type") in _MODEL_OUTPUT_EVENT_TYPES:
@@ -2652,6 +2944,12 @@ async def _consume_stream_with_query(
                     round_unrecovered_error = None
                     await _broadcast_event(channel_id, session_id, completion_event)
                     completion_signals += 1
+                    # 回合终态发出后复位流级轮次标记，
+                    # 让后续纯文本追问轮仍有 finish_after_final 即时收尾资格
+                    saw_tool_call = False
+                    saw_teammate_output = False
+                    # 回合已终态：下一条用户消息应按新流首请求处理
+                    tm_.mark_stream_round_terminal(session_id)
                     continue
                 elif parsed.get("event_type") == "chat.error":
                     await _broadcast_event(channel_id, session_id, parsed)
@@ -2757,6 +3055,26 @@ async def _consume_stream_with_query(
                     # round is complete. Clients may stop consuming the stream
                     # as soon as processing_status(False) arrives.
                     await _broadcast_event(channel_id, session_id, parsed)
+                    settle_terminal = False
+                    if not should_finish_round and is_leader:
+                        # 零任务问答轮补判——team.completed 门禁
+                        # 要求任务行存在（is_team_completed 条件①），消息制委派/
+                        # 纯问答团从不建任务行，seen_team_events 又被成员状态帧
+                        # 置位 → 没有任何终态帧、流永挂。按 settle 三件套补判
+                        # （零在途成员+零非终态任务+零未读消息），团队还在推进
+                        # 时补判自然失败、维持等 team.completed 的旧行为。
+                        should_finish_round = await _team_round_settled(
+                            channel_id, session_id
+                        )
+                        settle_terminal = should_finish_round
+                    if should_finish_round and settle_terminal:
+                        # 长流协作防误杀（用户实报"动不动变成已完成"）：settle 补判
+                        # 是瞬时快照——leader 说一句"好的我来拆解"的当口，任务板恰空、
+                        # 无未读、成员空闲，即发终态会把仍在干活的回合误判收尾。
+                        # 改静默窗确认：窗口内有新流帧（团队在干活）则作废，窗口后
+                        # 复核三件套仍成立才发终态。
+                        _schedule_settle_terminal()
+                        continue
                     if should_finish_round:
                         await _broadcast_event(
                             channel_id,
@@ -2782,6 +3100,16 @@ async def _consume_stream_with_query(
                             and not saw_teammate_output
                         ):
                             finish_after_final = True
+                        # saw_tool_call/saw_teammate_output 原为
+                        # 流级标记、跨轮不重置——某轮用过工具后，该流上后续所有
+                        # 纯文本追问轮永远失去 finish_after_final 即时收尾资格，
+                        # 流永挂、追问永远走 follow-up 旧流（帧带旧 request_id，
+                        # 前端归属断链）。回合终态发出后即复位，下一轮重新评估。
+                        saw_tool_call = False
+                        saw_teammate_output = False
+                        # 回合已终态：下一条用户消息应按新流首请求处理
+                        #（process_team_message_stream 的判定依据）
+                        tm_.mark_stream_round_terminal(session_id)
                     continue
                 await _broadcast_event(channel_id, session_id, parsed)
 
@@ -2843,6 +3171,8 @@ async def _consume_stream_with_query(
             death_probe_task.cancel()
         if stall_watchdog_task is not None and not stall_watchdog_task.done():
             stall_watchdog_task.cancel()
+        if settle_terminal_task is not None and not settle_terminal_task.done():
+            settle_terminal_task.cancel()
         # Flush & close the stream trace logger if one was opened.
         if lg is not None:
             try:
@@ -2851,6 +3181,11 @@ async def _consume_stream_with_query(
                 logger.warning(f"TeamStreamLogger flush failed, error is {e}")
         try:
             if not stream_cancelled:
+                # 流先结束且 settle 静默窗已挂起未发：流尽=回合已了，立即补发
+                #（仅限 settle 补判已命中的回合；从未评估过 settle 的流不在此列。
+                #  _emit 内部复核三件套 + 去重，已发过则幂等跳过）
+                if settle_terminal_task is not None and not settle_terminal_fired:
+                    await _emit_settle_terminal()
                 # Broadcast team.completed so cron round watchers (both the
                 # agent adapter's _wait_for_cron_team_round_events and the cron
                 # scheduler's own round_state) can finalise when the stream
