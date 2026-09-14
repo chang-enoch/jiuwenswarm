@@ -850,6 +850,26 @@ class RuntimePromptRail(DeepAgentRail):
                         f"- Other readable and writable directories that are not the current project: {trusted_dirs_display}\n"
                         "- Ask the user before operating outside the current project and these authorized directories."
                     )
+            # Desktop used to append this policy to every user message. Keep the
+            # same user-visible behavior, but place it in the per-request
+            # runtime tail so it is represented once in system context rather
+            # than copied into history and memory wrappers on every turn.
+            if self._channel == "desktop" and has_project:
+                if is_cn:
+                    directory_content += (
+                        "\n\n## 小艺 Work 工作空间约束\n\n"
+                        f"- 当前用户工作空间：`{prompt_project_dir}`。\n"
+                        "- 除非用户明确指定其他位置，否则所有新建、修改和写入的用户任务产物必须落在该目录下；"
+                        "用户任务中的相对路径可相对此目录解析。"
+                    )
+                else:
+                    directory_content += (
+                        "\n\n## XiaoYi Work Workspace Policy\n\n"
+                        f"- Current user workspace: `{prompt_project_dir}`.\n"
+                        "- Unless the user explicitly specifies another location, all newly created, modified, "
+                        "or written user-task deliverables must be placed in this directory; relative paths in "
+                        "user tasks may be resolved from it."
+                    )
             self.system_prompt_builder.add_section(PromptSection(
                 name="directory_boundaries",
                 content={"cn": directory_content, "en": directory_content},

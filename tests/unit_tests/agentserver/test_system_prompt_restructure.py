@@ -867,6 +867,32 @@ async def test_runtime_environment_section_participates_in_priority_order():
 
 
 @pytest.mark.asyncio
+async def test_desktop_workspace_policy_is_one_dynamic_system_tail(tmp_path):
+    builder = SystemPromptBuilder(language="cn")
+    agent = _FakeAgent(builder)
+    runtime_rail = RuntimePromptRail(language="cn", channel="desktop")
+    runtime_rail.init(agent)
+    runtime_rail.set_runtime_paths(
+        cwd=str(tmp_path),
+        project_dir=str(tmp_path),
+    )
+
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=None,
+        session=_FakeSession(),
+        extra={},
+    )
+    await runtime_rail.before_model_call(ctx)
+    prompt = builder.build()
+
+    assert prompt.count("## 小艺 Work 工作空间约束") == 1
+    assert f"当前用户工作空间：`{tmp_path}`" in prompt
+    assert "所有新建、修改和写入的用户任务产物必须落在该目录下" in prompt
+    assert prompt.rfind("## 小艺 Work 工作空间约束") > prompt.rfind("# 目录与运行时上下文")
+
+
+@pytest.mark.asyncio
 async def test_runtime_dynamic_sections_go_to_prompt_attachment_when_manager_available(tmp_path, monkeypatch):
     monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
     builder = SystemPromptBuilder(language="en")
