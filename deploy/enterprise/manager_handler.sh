@@ -28,6 +28,14 @@ gen_identity_file() {
     render_config_template "${template_file}" "${file}" "DEPLOY_VARS"
     enable_dev_mode_if_needed ${file} identity
 
+    # yq quotes arbitrary password characters correctly in the generated YAML.
+    IDENTITY_ADMIN_PASSWORD="${DEPLOY_VARS[IDENTITY_ADMIN_PASSWORD]}" \
+    IDENTITY_USER1_PASSWORD="${DEPLOY_VARS[IDENTITY_USER1_PASSWORD]}" \
+        yq eval '(. | select(.kind == "Deployment") | .spec.template.spec.containers[0].env) += [
+            {"name": "IDENTITY_ADMIN_PASSWORD", "value": strenv(IDENTITY_ADMIN_PASSWORD)},
+            {"name": "IDENTITY_USER1_PASSWORD", "value": strenv(IDENTITY_USER1_PASSWORD)}
+        ]' -i "${file}"
+
     if [ "${DEPLOY_VARS["DB_TYPE"]}" == "postgresql" ]; then
         yq eval '
         select(.kind == "Deployment").spec.template.spec.containers[0].env += [

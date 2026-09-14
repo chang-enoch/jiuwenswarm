@@ -119,6 +119,9 @@ if [[ "${TYPE}" == "dev" ]]; then
 cat <<EOF
 # MANAGER_SERVER_NODE_PORT=30086
 # MANAGER_WEB_NODE_PORT=30273
+# 首次创建 Identity 账号时的密码；不配置则使用默认值 admin / user1
+# IDENTITY_ADMIN_PASSWORD=""
+# IDENTITY_USER1_PASSWORD=""
 EOF
 fi
 
