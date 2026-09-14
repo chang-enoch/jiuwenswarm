@@ -139,6 +139,43 @@ async def test_uninitialized_rail_skips_inner_callback():
     assert not hasattr(ctx.agent, "load_state")
 
 
+@pytest.mark.parametrize("conflict", ["type", "workspace", "fs"])
+def test_late_binding_conflict_fails_without_partial_registration(tmp_path, monkeypatch, conflict):
+    fs = LocalFiles()
+    agent = make_agent(tmp_path, fs)
+    stale = module.TodoCreateTool(
+        agent.deep_config.sys_operation, str(tmp_path / "old"), "cn", "old",
+    )
+    agent.ability_manager.list.return_value = [stale.card]
+    wrong = SimpleNamespace(workspace=str(tmp_path), fs=fs)
+    if conflict != "type":
+        wrong = module.TodoModifyTool(
+            agent.deep_config.sys_operation, str(tmp_path), "cn", "conflict",
+        )
+        if conflict == "workspace":
+            wrong.workspace = str(tmp_path / "other")
+        else:
+            wrong.fs = LocalFiles()
+
+    def get_tool(tool_id):
+        if tool_id == stale.card.id:
+            return stale
+        if tool_id.startswith("TodoModifyTool_"):
+            return wrong
+        return None
+
+    manager = SimpleNamespace(get_tool=get_tool, add_tool=Mock())
+    monkeypatch.setattr(module, "Runner", SimpleNamespace(resource_mgr=manager))
+    rail = module.ConcurrentSafeTaskPlanningRail()
+    previous_tools = rail.tools
+    with pytest.raises(RuntimeError, match="Todo tool binding mismatch"):
+        rail.init(agent)
+    assert rail.tools is previous_tools
+    agent.ability_manager.add.assert_not_called()
+    agent.ability_manager.remove.assert_not_called()
+    manager.add_tool.assert_not_called()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("different_workspace,different_fs", [(True, False), (False, True), (True, True)])
 async def test_registry_keeps_workspace_and_filesystem_bindings_isolated(

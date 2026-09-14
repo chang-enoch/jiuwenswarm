@@ -48,6 +48,10 @@ logger = logging.getLogger(__name__)
 _TODO_WRITE_TOOLS = frozenset({"todo_create", "todo_modify"})
 
 
+class _TodoBindingMismatchError(RuntimeError):
+    """A registered todo tool belongs to a different binding."""
+
+
 class ConcurrentSafeSysOperationRail(SysOperationRail):
     """SysOperationRail subclass that skips duplicate tool registration."""
 
@@ -148,6 +152,7 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
         ]
 
         existing_tools = []
+        stale_abilities = []
         for ability in agent.ability_manager.list():
             if isinstance(ability, ToolCard):
                 tool_instance = Runner.resource_mgr.get_tool(tool_id=ability.id)
@@ -155,7 +160,7 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
                     for i, (tool_class, found) in enumerate(tool_configs):
                         if isinstance(tool_instance, tool_class):
                             if not matches_binding(tool_instance):
-                                agent.ability_manager.remove(ability.name)
+                                stale_abilities.append(ability.name)
                                 break
                             tool_configs[i] = (tool_class, True)
                             existing_tools.append(tool_instance)
@@ -163,20 +168,30 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
 
         tools = existing_tools.copy()
         try:
+            new_tools = []
             for tool_class, found in tool_configs:
                 if not found:
                     new_tool = tool_class(self.sys_operation, workspace_dir, language, scoped_agent_id)
                     registered_tool = Runner.resource_mgr.get_tool(new_tool.card.id)
                     if registered_tool is not None:
                         if not isinstance(registered_tool, tool_class) or not matches_binding(registered_tool):
-                            raise RuntimeError(f"Todo tool binding mismatch: {new_tool.card.id}")
-                        agent.ability_manager.add(registered_tool.card)
+                            raise _TodoBindingMismatchError(f"Todo tool binding mismatch: {new_tool.card.id}")
                         tools.append(registered_tool)
                         continue
-                    Runner.resource_mgr.add_tool(new_tool)
-                    agent.ability_manager.add(new_tool.card)
+                    new_tools.append(new_tool)
                     tools.append(new_tool)
+            # Validate every binding before changing either registry or
+            # abilities, so a late mismatch leaves initialization untouched.
+            for name in stale_abilities:
+                agent.ability_manager.remove(name)
+            for tool in new_tools:
+                Runner.resource_mgr.add_tool(tool)
+            for tool in tools:
+                agent.ability_manager.add(tool.card)
             self.tools = tools
+        except _TodoBindingMismatchError:
+            logger.exception("ConcurrentSafeTaskPlanningRail: todo binding conflict")
+            raise
         except Exception as exc:
             logger.warning("ConcurrentSafeTaskPlanningRail: failed to add tool, error: %s", exc)
 
