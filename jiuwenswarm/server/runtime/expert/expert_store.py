@@ -14,7 +14,7 @@ import json
 import os
 import shutil
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -40,7 +40,7 @@ class ExpertSummary:
     id: str
     name: str
     description: str
-    source: str  # "repo" | "local"
+    source: str  # "repo" | "local" | "cache"
     available: bool
     unavailable_reason: str = ""
     tags: list[str] = field(default_factory=list)
@@ -400,8 +400,33 @@ class LocalDirExpertPackageSource:
         return package_dir
 
 
+class CachedExpertPackageSource(LocalDirExpertPackageSource):
+    """专家包缓存来源（``experts_cache/``）：已下载过的专家/专家团始终可见。
+
+    挂链尾（仓库之后）：
+    - list：同名条目以仓库元数据为准（版本更新/下架信息新鲜），缓存只补充仓库没有的；
+    - fetch：先走仓库（下载产物本来就落 experts_cache，版本更新语义不变），
+      仓库 404（下架）时回退缓存目录——已下载专家仍可装载/重装；
+    - 列表只收校验通过的包：下载中断的残留目录（available=False）不进列表。
+
+    缓存目录按用户动态解析（``get_expert_cache_dir()`` = 工作区下 experts_cache），
+    不写死任何 uid 路径。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(experts_dir=get_expert_cache_dir())
+
+    async def list(self) -> list[ExpertSummary]:
+        summaries = await super().list()
+        return [
+            replace(summary, source="cache")
+            for summary in summaries
+            if summary.available
+        ]
+
+
 class ChainExpertPackageSource:
-    """多来源链：local override 优先（同名覆盖 repo），其余回退到 repo。"""
+    """多来源链：靠前来源优先（list 同名覆盖、fetch 先尝试），ExpertNotFound 落到下一源。"""
 
     def __init__(self, sources: list[ExpertPackageSource]) -> None:
         self._sources = sources
@@ -434,7 +459,7 @@ _default_source: ExpertPackageSource | None = None
 
 
 def get_expert_source() -> ExpertPackageSource:
-    """source 工厂：local override（env 开启时）+ 仓库。"""
+    """source 工厂：local override（env 开启时）> 仓库 > 包缓存（experts_cache）。"""
     global _default_source
     if _default_source is None:
         sources: list[ExpertPackageSource] = []
@@ -442,9 +467,8 @@ def get_expert_source() -> ExpertPackageSource:
             sources.append(LocalDirExpertPackageSource())
             logger.info("expert local dir override enabled (%s)", get_agent_experts_dir())
         sources.append(HttpRepoExpertPackageSource())
-        _default_source = (
-            sources[0] if len(sources) == 1 else ChainExpertPackageSource(sources)
-        )
+        sources.append(CachedExpertPackageSource())
+        _default_source = ChainExpertPackageSource(sources)
     return _default_source
 
 

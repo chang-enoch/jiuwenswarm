@@ -326,6 +326,71 @@ async def test_chain_list_raises_when_all_empty_and_repo_down(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_cached_source_lists_only_available_packages(cache_dir: Path) -> None:
+    """缓存源只列出校验通过的包：下载中断的残留目录（无 manifest）不进列表。"""
+    _make_package(cache_dir, "cached-expert")
+    (cache_dir / "partial-download").mkdir()  # 无 manifest.json 的残留目录
+    source = es.CachedExpertPackageSource()
+    (summary,) = await source.list()
+    assert summary.id == "cached-expert"
+    assert summary.source == "cache"
+    assert summary.available is True
+
+
+@pytest.mark.asyncio
+async def test_chain_list_repo_overrides_cache(cache_dir: Path) -> None:
+    """同名条目仓库元数据覆盖缓存；缓存独有专家（下架/旧下载）仍在列表。"""
+    _make_package(cache_dir, "shared")
+    _make_package(cache_dir, "cached-only")
+    cache = es.CachedExpertPackageSource()
+    repo = es.HttpRepoExpertPackageSource(
+        client=_mock_client(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "experts": [
+                        {"id": "shared", "name": "仓库版", "available": True},
+                    ]
+                },
+            )
+        )
+    )
+    chain = es.ChainExpertPackageSource([repo, cache])
+    summaries = {s.id: s for s in await chain.list()}
+    assert summaries["shared"].source == "repo", "同名时仓库覆盖缓存"
+    assert summaries["shared"].name == "仓库版"
+    assert summaries["cached-only"].source == "cache"
+
+
+@pytest.mark.asyncio
+async def test_chain_fetch_falls_back_to_cache_on_repo_404(cache_dir: Path) -> None:
+    """仓库 404（下架）时 fetch 回退缓存目录：已下载专家仍可装载。"""
+    _make_package(cache_dir, "delisted")
+    cache = es.CachedExpertPackageSource()
+    repo = es.HttpRepoExpertPackageSource(
+        client=_mock_client(lambda request: httpx.Response(404))
+    )
+    chain = es.ChainExpertPackageSource([repo, cache])
+    assert await chain.fetch("delisted") == cache_dir / "delisted"
+
+
+@pytest.mark.asyncio
+async def test_chain_list_survives_repo_down_with_cache(cache_dir: Path) -> None:
+    """仓库不可达时缓存条目仍可见（缓存非空即不向上抛 REPO_UNAVAILABLE）。"""
+    _make_package(cache_dir, "cached-expert")
+    cache = es.CachedExpertPackageSource()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    repo = es.HttpRepoExpertPackageSource(client=_mock_client(handler))
+    chain = es.ChainExpertPackageSource([repo, cache])
+    (summary,) = await chain.list()
+    assert summary.id == "cached-expert"
+    assert summary.source == "cache"
+
+
+@pytest.mark.asyncio
 async def test_resolve_package_dir_cache_hit_skips_fetch(
         cache_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
