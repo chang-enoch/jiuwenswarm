@@ -66,6 +66,8 @@ from jiuwenswarm.common.config import (
     get_skill_evolution_enabled,
 )
 from jiuwenswarm.agents.harness.observability_runtime import build_observability_config
+from jiuwenswarm.observability.config import load_trajectory_store_settings  # noqa: E402
+from jiuwenswarm.observability.runtime import sync_trajectory_runtime  # noqa: E402
 from jiuwenswarm.common.reasoning_injector import build_reasoning_model_request_kwargs
 from jiuwenswarm.agents.harness.team.team_runtime_inheritance import (
     MemberInfo,
@@ -138,6 +140,9 @@ def sync_team_observability() -> None:
     Evolution also requests the provider when the explicit switch is disabled.
     """
     global _observability_active, _runtime_managed_observability
+
+    config = get_config()
+    trajectory_settings = load_trajectory_store_settings(config)
     try:
         unified_active = bool(_get_unified_runtime().is_unified_active())
     except Exception as exc:
@@ -160,17 +165,24 @@ def sync_team_observability() -> None:
                 "on unified path: %s",
                 exc,
             )
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime init failed: %s", exc)
         return
     if _runtime_managed_observability:
         _observability_active = False
         _runtime_managed_observability = False
 
-    config = get_config()
     cfg = config.get("team_observability", {}) or {}
     evolution_requested = get_skill_evolution_enabled(config)
-    want_enabled = bool(cfg.get("enabled", False)) or evolution_requested
+    want_enabled = bool(cfg.get("enabled", False)) or trajectory_settings.enabled or evolution_requested
 
     if not want_enabled:
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime stop failed: %s", exc)
         if _observability_active:
             shutdown_team_observability()
         return
@@ -185,6 +197,10 @@ def sync_team_observability() -> None:
         provider_existed = team_observability.acquire_observability(obs_cfg)
         was_active = _observability_active
         _observability_active = True
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime init failed: %s", exc)
         if not was_active and not provider_existed:
             if cfg.get("exporter", "otlp_grpc") == "file":
                 logger.info(

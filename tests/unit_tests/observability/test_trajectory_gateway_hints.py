@@ -97,6 +97,22 @@ async def test_gateway_routes_cross_process_hint_into_webchannel_coalescer() -> 
             ),
         )
     ]
+    invalid_wire = build_server_push_wire(
+        {
+            "request_id": "trajectory:session-1:trace:invalid",
+            "channel_id": "web",
+            "session_id": "session-1",
+            "is_complete": False,
+            "payload": {
+                "event_type": "trace.updated",
+                "session_id": "session-1",
+                "trace_id": "b" * 32,
+                "revision": "invalid",
+            },
+        }
+    )
+    await handler._handle_agent_server_push(invalid_wire)
+    assert len(scheduled) == 1
     test_logger.info("Gateway handed the cross-process hint to WebChannel")
 
 
