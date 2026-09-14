@@ -95,12 +95,6 @@
   background: var(--color-surface-card);
 }
 
-.chat-workspace--trajectory-floating-tools
-  .single-agent-surface--trajectory
-  .chat-surface-view[data-testid='single-agent-trajectory-view'] {
-  right: 364px;
-}
-
 .chat-surface-tabs {
   display: inline-flex;
   flex: 0 0 auto;
