@@ -75,6 +75,7 @@ from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import 
 )
 from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist import persist_cli_trusted_directory
 from jiuwenswarm.extensions.hooks_context import AgentServerChatHookContext
+from jiuwenswarm.server.memory_profile import MEMORY_PROFILE_EVENTS, dispatch_memory_profile
 from jiuwenswarm.server.runtime.agent_manager import AgentManager, ACP_DEFAULT_CAPABILITIES
 from jiuwenswarm.server.invocation_context_builder import build_invocation_context
 from jiuwenswarm.server.runtime.agent_warm_pool import WarmClaim
@@ -1959,6 +1960,15 @@ class AgentWebSocketServer:
 
             if request.req_method == ReqMethod.CHAT_CAPACITY:
                 await self._handle_chat_capacity(ws, request, send_lock)
+                return
+
+            # Memory profile management is a provider-backed unary RPC. Handle it
+            # before the generic chat hook/admission path so a settings/profile
+            # request never starts or prepares an Agent chat turn.
+            if request.req_method in MEMORY_PROFILE_EVENTS:
+                wire = await dispatch_memory_profile(request)
+                async with send_lock:
+                    await send_wire_payload(ws, wire)
                 return
 
             defer_admission_preparation = self._should_defer_admission_preparation(request)

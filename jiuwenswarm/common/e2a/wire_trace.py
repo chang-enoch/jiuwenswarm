@@ -51,6 +51,10 @@ _PENDING_TITLE: dict[str, str] = {}
 _SESSION_TITLE: dict[str, str] = {}
 
 _TRUE_VALUES = {"1", "true", "on", "yes", "enable", "enabled"}
+_PRIVATE_MEMORY_METHODS = {
+    "memory.profile.settings.get", "memory.profile.settings.set",
+    "memory.profile.get", "memory.profile.modify",
+}
 # 开关文件缓存（避免每一帧都读磁盘；改动后最多 3 秒生效）
 _MARKER_TTL_SECONDS = 3.0
 _MARKER_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
@@ -193,6 +197,14 @@ def _append(role: str, session_id: Any, request_id: Any, data: Any) -> None:
         return
     rid = _sanitize(request_id)
     method = _sanitize(_REQUEST_METHOD.get(rid, ""))
+    if isinstance(request_id, str) and _REQUEST_METHOD.get(request_id) in _PRIVATE_MEMORY_METHODS and isinstance(data, dict):
+        # Management requests/results contain private profile text. Keep only
+        # envelope diagnostics, even when raw E2A tracing is explicitly enabled.
+        data = {key: value for key, value in data.items() if key in {
+            "protocol_version", "method", "request_id", "response_id", "channel",
+            "session_id", "timestamp", "is_final", "status", "response_kind",
+        }}
+        data["redacted"] = True
     try:
         with _LOCK:
             dest_dir = _trace_root() / _folder_for(session_id)
@@ -211,6 +223,10 @@ def _append(role: str, session_id: Any, request_id: Any, data: Any) -> None:
 
 def trace_inbound(payload: Any) -> None:
     """记录一条客户端请求（原始 JSON）。"""
+    if (isinstance(payload, dict) and isinstance(payload.get("method"), str)
+            and payload["method"] in _PRIVATE_MEMORY_METHODS):
+        # Remember the method even if tracing is enabled between request/response.
+        _note_request_meta(payload)
     if not _enabled() or not isinstance(payload, dict):
         return
     _note_request_meta(payload)
@@ -224,6 +240,9 @@ def trace_inbound(payload: Any) -> None:
 def trace_outbound(wire: Any) -> None:
     """记录一帧服务端响应（原始 JSON）。"""
     if not _enabled() or not isinstance(wire, dict):
+        if (isinstance(wire, dict) and isinstance(wire.get("request_id"), str)
+                and _REQUEST_METHOD.get(wire["request_id"]) in _PRIVATE_MEMORY_METHODS):
+            _REQUEST_METHOD.pop(wire.get("request_id"), None)
         return
     _note_session_from_result(wire)
     request_id = wire.get("request_id")
@@ -233,6 +252,8 @@ def trace_outbound(wire: Any) -> None:
     if not session_id and wire.get("type") == "event":
         session_id = "__server__"
     _append("out", session_id, request_id, wire)
+    if isinstance(request_id, str) and _REQUEST_METHOD.get(request_id) in _PRIVATE_MEMORY_METHODS:
+        _REQUEST_METHOD.pop(request_id, None)
 
 
 __all__ = ["trace_inbound", "trace_outbound"]

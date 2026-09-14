@@ -27,4 +27,8 @@ class AgentServerHookEvents(HookEventBase):
     BEFORE_CHAT_REQUEST = HookEventBase.get_event("before_chat_request")
     MEMORY_BEFORE_CHAT = HookEventBase.get_event("memory_before_chat")
     MEMORY_AFTER_CHAT = HookEventBase.get_event("memory_after_chat")
+    MEMORY_PROFILE_SETTINGS_GET = HookEventBase.get_event("memory_profile_settings_get")
+    MEMORY_PROFILE_SETTINGS_SET = HookEventBase.get_event("memory_profile_settings_set")
+    MEMORY_PROFILE_GET = HookEventBase.get_event("memory_profile_get")
+    MEMORY_PROFILE_MODIFY = HookEventBase.get_event("memory_profile_modify")
     BEFORE_SYSTEM_PROMPT_BUILD = HookEventBase.get_event("before_system_prompt_build")

@@ -60,6 +60,24 @@ class AgentServerChatHookContext:
 
 
 @dataclass
+class MemoryProfileHookContext:
+    """Deterministic host request; never exposed as an Agent tool.
+
+    A provider claims the context before performing work, then sets result or
+    error (code/message/details). A callback's return value is not used.
+    """
+
+    request_id: str
+    channel_id: str
+    session_id: str | None
+    req_method: str
+    params: dict[str, Any] = field(default_factory=dict)
+    handled: bool = False
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
+@dataclass
 class SystemPromptHookContext:
     # 扩展可设置此目录，用于覆盖默认的 home_dir
     home_dir: str | None = None
