@@ -33,6 +33,8 @@ class PromptPriority(IntEnum):
     A2UI = 61
     WORKSPACE = 70
     TODO = 85
+    # thinking_discipline 紧挨最终可见回复之前：思考与 tool_calls 职责分工，高于 RESPONSE。
+    THINKING_DISCIPLINE = 115
     # final_visible_reply 放在 system 最末，强调约束工具/todo 结束后必须再发一轮完整纯文本 final；
     # UI 主要展示「最后一轮无 tool_calls」的正文。
     FINAL_VISIBLE_REPLY = 120
@@ -42,10 +44,49 @@ class LocalSectionName:
     """Local section names for optional JiuwenSwarm prompt sections."""
 
     A2UI = "a2ui"
+    THINKING_DISCIPLINE = "thinking_discipline"
     FINAL_VISIBLE_REPLY = "final_visible_reply"
 
 
 # ─── response section (shared by both modes via ResponsePromptRail) ───
+
+
+def _thinking_discipline_prompt(language: str) -> PromptSection:
+    if language == "cn":
+        content = """# 思考纪律（强制，针对思考过程 reasoning_content）
+
+思考过程与工具调用参数都会完整落盘并计费。思考的职责是**决策**——做什么、选哪个方案、注意哪些约束；产物的职责是**内容**。二者严禁重叠。
+
+**硬规则（违反任何一条即为错误思考）：**
+
+1. **严禁誊写产物**：按要写入工具参数的具体内容——正文、JSON 字段与数值、表格逐行内容、bullet 每一条文案、长代码——只允许出现在 tool_calls 参数里。严禁在思考中以任何形式起草这些内容。
+2. **严禁复述上下文**：对话历史、工具结果、素材、规格表中已有的内容，不要在思考中重抄或整理一遍。引用时只写编号或关键词（如「素材第2条」「模板第3节」），不抄原文。
+3. **大纲简短 = 关键词行**：生成大段产物前，思考中的大纲每节只写一行关键词，不写完整句子。
+   - ✅ 正确：[核心摘要：交付项 / 进行中项 / 风险项 / 下周目标]
+   - ❌ 错误：[核心摘要：本周完成客户A三期需求评审，确认3个核心模块交付范围……。]（这是把产物文案搬进思考）
+4. **决策 = 结论 + 一句理由**：方案取舍（如表头设计、列数据选择）、约束核对（模糊词查询、日期排算）仍要思考，但每项一两行给出结论即可，不展开成文。
+5. **思考预算**：单轮思考一般不超过 20 行。下一步动作已明确时，压缩到几行直接发起工具调用。
+"""
+    else:
+        content = """# Thinking discipline (mandatory, for reasoning_content)
+
+Both the thinking process and tool-call arguments are fully persisted and billed. Thinking is for **decisions**—what to do, which option to pick, which constraints to watch. Artifacts are for **content**. The two must not overlap.
+
+**Hard rules (breaking any one is incorrect thinking):**
+
+1. **Do not transcribe artifacts**: Concrete content destined for tool arguments—body text, JSON fields and values, table rows, each bullet's wording, long code—may appear only in `tool_calls` arguments. Never draft that content in thinking in any form.
+2. **Do not restate context**: Do not recopy or reorganize dialogue history, tool results, source material, or spec tables. Cite by number or keyword only (e.g. "source item 2", "template section 3"); never paste the original.
+3. **Outlines = keyword lines**: Before generating a long artifact, each outline section in thinking is one keyword line, not full sentences.
+   - Correct: [Core summary: delivered / in progress / risks / next-week goals]
+   - Wrong: [Core summary: This week finished the phase-3 review for customer A and confirmed the delivery scope of 3 core modules...] (that moves artifact copy into thinking)
+4. **Decision = conclusion + one reason**: Tradeoffs (headers, column choices) and constraint checks (fuzzy-term lookup, date arithmetic) still belong in thinking, but one or two lines per item—do not expand into prose.
+5. **Thinking budget**: Keep a single turn of thinking to about 20 lines. When the next action is already clear, compress to a few lines and issue the tool call.
+"""
+    return PromptSection(
+        name=LocalSectionName.THINKING_DISCIPLINE,
+        content={language: content},
+        priority=PromptPriority.THINKING_DISCIPLINE,
+    )
 
 
 def _final_visible_reply_prompt(language: str) -> PromptSection:
