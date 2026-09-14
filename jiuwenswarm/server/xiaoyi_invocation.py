@@ -31,6 +31,7 @@ from jiuwenswarm.common.invocation_context.billing_trace import (
     MAX_CORE_LEN,
     MAX_TRACE_ID_LEN,
     build_billing_core,
+    build_cron_trace_id,
 )
 
 
@@ -188,7 +189,7 @@ def build_xiaoyi_trace_context(request: AgentRequest) -> TraceContext | None:
         encoded_run_id = quote(run_id, safe="")
         return TraceContext(
             version=TRACE_CONTEXT_VERSION,
-            trace_id=f"cron_{encoded_run_id}",
+            trace_id=build_cron_trace_id(run_id),
             conversation_id=encoded_job_id,
             interaction_id=encoded_run_id,
         )

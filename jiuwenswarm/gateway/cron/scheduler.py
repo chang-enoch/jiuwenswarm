@@ -4,11 +4,13 @@ import asyncio
 import heapq
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from jiuwenswarm.gateway.routing.agent_client import AgentServerClient, AgentServerUnaryTimeout
@@ -26,7 +28,12 @@ from jiuwenswarm.gateway.cron.models import (
 )
 from jiuwenswarm.gateway.cron.store import CronJobStore
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
+from jiuwenswarm.common.billing_client import (
+    report_new as billing_report_new,
+    report_terminal as billing_report_terminal,
+)
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
+from jiuwenswarm.common.invocation_context.billing_trace import build_cron_trace_id
 from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
 from jiuwenswarm.common.work_mode import DEFAULT_WEB_WORK_MODE, is_default_project_id
 from jiuwenswarm.server.runtime.session.session_history import append_history_record
@@ -40,6 +47,16 @@ def _now_utc_ts() -> float:
 
 _WORKSPACE_OPEN = "<claw_workspace>"
 _WORKSPACE_CLOSE = "</claw_workspace>"
+
+
+def _cron_billing_enabled() -> bool:
+    """cron 调度计费开关（默认开；JIUWEN_CRON_BILLING=off 关闭本路径）。
+
+    上报通道复用 xiaoyi 渠道的 np://claw-billing 管道（密钥包缺位即静默禁用；
+    JIUWEN_XIAOYI_BILLING=off 会在管道客户端侧一并关闭全部上报），本开关仅收口
+    cron 调度路径，互不影响。
+    """
+    return os.getenv("JIUWEN_CRON_BILLING", "").strip().lower() != "off"
 
 
 def with_workspace_dir(text: str, workspace_dir: str | None) -> str:
@@ -1034,6 +1051,7 @@ class CronSchedulerService:
             channel_id = ""
             exec_session_id = ""
             envelope = None
+            billing_trace_id = ""
             try:
                 mode = str(job.mode or CRON_JOB_DEFAULT_MODE).strip() or CRON_JOB_DEFAULT_MODE
                 if state.exec_channel_id and state.exec_session_id:
@@ -1104,6 +1122,18 @@ class CronSchedulerService:
                     metadata=request_metadata,
                     user_id=getattr(job, "user_id", None),
                 )
+                # 计费 NEW（fire-and-forget；无人值守无余额拦截语义，与 xiaoyi 渠道
+                # 同口径）：session 就绪、chat.send 派发前上报一轮开始。trace 与
+                # AgentServer cron 分支（xiaoyi_invocation）派生的 x-hag-trace-id
+                # 同值（build_cron_trace_id 共享构造），终态在下方 finally 收口。
+                # query 用 job.description 原文——with_workspace_dir 拼入 task_text
+                # 的工作空间尾段（本地路径）不随计费出网。
+                if _cron_billing_enabled():
+                    try:
+                        billing_trace_id = build_cron_trace_id(run_id)
+                        billing_report_new(str(job.description or ""), billing_trace_id)
+                    except Exception:  # noqa: BLE001 - 计费永不影响主路径
+                        logger.debug("[billing] cron NEW 派发失败 run_id=%s", run_id, exc_info=True)
                 if is_team_cron_mode(mode):
                     timeout_seconds = resolve_cron_job_timeout_seconds(job)
                     text, ok = await self._run_team_stream_job(
@@ -1137,6 +1167,19 @@ class CronSchedulerService:
                 state.error = str(exc)
             finally:
                 state.finished_at = self._now_fn()
+                # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由 report_terminal
+                # 登记守卫跳过。取消（删任务/编辑重载/进程关停）按 FINISH——对齐
+                # xiaoyi 渠道与桌面「用户主动停止按正常完成计费」语义。
+                if billing_trace_id:
+                    try:
+                        billing_report_terminal(
+                            billing_trace_id,
+                            session_id=quote(job.id, safe=""),
+                            interaction_id=quote(run_id, safe=""),
+                            ok=state.status == "succeeded" or state.error == "cancelled",
+                        )
+                    except Exception:  # noqa: BLE001 - 计费永不影响主路径
+                        logger.debug("[billing] cron 终态派发失败 run_id=%s", run_id, exc_info=True)
                 is_cancelled_ghost = state.error == "cancelled"
                 should_deliver_result = bool(state.result_text) and not is_cancelled_ghost  # noqa: F841  # pre-existing
                 # Ensure failed runs also produce result_text so push logic can deliver it.

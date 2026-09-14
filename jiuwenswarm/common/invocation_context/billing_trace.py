@@ -22,6 +22,7 @@ core 上限 45（历史前缀形态余量 + "core < 50" 约束，取严）；超
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,22 @@ def build_billing_core(session_id: str, interaction_id: str) -> str:
     return core[:MAX_CORE_LEN]
 
 
+def build_cron_trace_id(run_id: str) -> str:
+    """gateway cron 轮次的 x-hag-trace-id：``cron_{quote(run_id)}``。
+
+    与 server.xiaoyi_invocation.build_xiaoyi_trace_context 的 cron 分支同口径——
+    入站请求 request_id 以 "cron-" 开头且携带 cron.job_id/run_id 时派生此值。
+    gateway 调度器（gateway/cron/scheduler.py）的计费上报（np://claw-billing
+    NEW/FINISH/FAILED）必须与本轮全部模型调用的 x-hag-trace-id 完全同值，
+    两侧统一走本函数，禁止各自拼串。
+    """
+    return f"cron_{quote(str(run_id or ''), safe='')}"
+
+
 __all__ = [
     "MAX_CORE_LEN",
     "MAX_TRACE_ID_LEN",
     "SHORT_INTERACTION_ID_MAX_LEN",
     "build_billing_core",
+    "build_cron_trace_id",
 ]

@@ -2146,3 +2146,174 @@ class TestBootTimeReset:
         await svc.start()
         assert svc.boot_time == 1500.0
         await svc.stop()
+
+
+# ── Gateway cron 计费上报（np://claw-billing，经 billing_client） ─────────────
+
+
+class TestCronBilling:
+    """Gateway 调度执行的 cron 轮次：chat.send 派发前报 NEW，每轮 finally 报终态。
+
+    桌面对话与桌面手动「立即执行」（fireCronJob）由桌面侧计费，不经本路径；
+    trace 必须与 AgentServer cron 分支派生的 x-hag-trace-id 同值
+    （build_cron_trace_id 共享构造）。
+    """
+
+    @staticmethod
+    def _patch_billing(monkeypatch, calls):
+        def _fake_new(query, trace_id):
+            calls.append(("new", query, trace_id))
+            return True
+
+        def _fake_terminal(trace_id, *, session_id, interaction_id, ok):
+            calls.append(("terminal", trace_id, session_id, interaction_id, ok))
+            return True
+
+        monkeypatch.setattr(cron_scheduler_module, "billing_report_new", _fake_new)
+        monkeypatch.setattr(cron_scheduler_module, "billing_report_terminal", _fake_terminal)
+
+    @pytest.mark.asyncio
+    async def test_success_reports_new_then_finish(self, tmp_path, monkeypatch):
+        from urllib.parse import quote
+
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        agent_client = FakeAgentClient()
+        svc = _make_scheduler(store, agent_client=agent_client)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        expected_trace = f"cron_{quote(run_id, safe='')}"
+        assert calls == [
+            ("new", "reminder", expected_trace),
+            ("terminal", expected_trace, quote(job.id, safe=""), quote(run_id, safe=""), True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_new_dispatched_before_chat_send(self, tmp_path, monkeypatch):
+        """NEW 必须在 chat.send 派发前上报（余额/生命周期语义以 NEW 先行）。"""
+        agent_client = FakeAgentClient()
+        chat_send_seen_at_new = []
+
+        def _fake_new(query, trace_id):
+            chat_send_seen_at_new.append(
+                any(e.method == "chat.send" for e in agent_client.unary_requests)
+            )
+            return True
+
+        monkeypatch.setattr(cron_scheduler_module, "billing_report_new", _fake_new)
+        monkeypatch.setattr(
+            cron_scheduler_module, "billing_report_terminal", lambda *a, **kw: True
+        )
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        svc = _make_scheduler(store, agent_client=agent_client)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert chat_send_seen_at_new == [False]
+
+    @pytest.mark.asyncio
+    async def test_failure_reports_failed(self, tmp_path, monkeypatch):
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        svc = _make_scheduler(store, agent_client=FailingAgentClient())
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        terminals = [c for c in calls if c[0] == "terminal"]
+        assert len(terminals) == 1
+        assert terminals[0][-1] is False  # ok=False → FAILED
+
+    @pytest.mark.asyncio
+    async def test_team_mode_reports_new_then_finish(self, tmp_path, monkeypatch):
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await store.create_job(
+            name="team-job",
+            cron_expr="0 0 9 * * ? *",
+            timezone="Asia/Shanghai",
+            description="team reminder",
+            targets="web",
+            mode="team",
+        )
+        svc = _make_scheduler(store)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        kinds = [c[0] for c in calls]
+        assert kinds == ["new", "terminal"]
+        assert calls[0][1] == "team reminder"
+        assert calls[1][-1] is True
+
+    @pytest.mark.asyncio
+    async def test_session_create_failure_reports_nothing(self, tmp_path, monkeypatch):
+        """session.create 失败 = 本轮未开跑：不报 NEW，也不报 orphan 终态。"""
+
+        class _SessionCreateFailingClient(FakeAgentClient):
+            async def send_request(self, envelope, *a, **kw):
+                if envelope.method == "session.create":
+                    raise RuntimeError("session create failed")
+                return await super().send_request(envelope, *a, **kw)
+
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        svc = _make_scheduler(store, agent_client=_SessionCreateFailingClient())
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_env_kill_switch_disables_billing(self, tmp_path, monkeypatch):
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        monkeypatch.setenv("JIUWEN_CRON_BILLING", "off")
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        svc = _make_scheduler(store)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_proactive_tick_reports_nothing(self, tmp_path, monkeypatch):
+        """proactive.tick 走专属分支（PROACTIVE_TICK 请求，非 chat.send），不计费。"""
+        calls = []
+        self._patch_billing(monkeypatch, calls)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await store.create_job(
+            name="proactive",
+            cron_expr="0 0 * * * ? *",
+            timezone="Asia/Shanghai",
+            description="tick",
+            targets="web",
+            mode="proactive.tick",
+        )
+        svc = _make_scheduler(store)
+        await svc.reload()
+
+        ev = _Event(at_ts=time.time(), seq=1, kind="wake", job_id=job.id, run_id=f"{job.id}:1234")
+        await svc.handle_event(ev)
+
+        assert calls == []
