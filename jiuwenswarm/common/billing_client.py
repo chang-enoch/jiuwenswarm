@@ -1,14 +1,16 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""xiaoyi 渠道计费上报客户端（task/status/update，经 np://claw-billing 管道）。
+"""xiaoyi 渠道 / gateway cron 计费上报客户端（task/status/update，经 np://claw-billing 管道）。
 
 正式计费方案（2026-09-02 起，替代 x-hag-trace-id 标记方案——
 common/invocation_context/billing_trace.py 的 NO_REPLY 虚拟调用机制已删除）：
 
-xiaoyi 渠道（手机端 ws/link 触发）的会话由 gateway 驱动、桌面主进程不可见，
-因此生命周期判定在本进程（interface_deep 挂点）完成，但**上报不直接出网**——
-请求打向桌面主进程的计费代理管道 ``np://claw-billing``（BillingProxy），由主进程
-注入 businessCredential/x-uid/x-device-id/x-request-from=xiaoyiWork 后转发
+xiaoyi 渠道（手机端 ws/link 触发）与 gateway 调度 cron（gateway/cron/scheduler.py
+到点自跑，桌面主进程不经手）的会话都由 gateway 驱动、桌面主进程不可见，
+因此生命周期判定在本进程完成（xiaoyi 挂 interface_deep；cron 挂 scheduler
+_run_agent——NEW 在 chat.send 派发前、终态在每轮 finally 收口），但**上报不直接
+出网**——请求打向桌面主进程的计费代理管道 ``np://claw-billing``（BillingProxy），
+由主进程注入 businessCredential/x-uid/x-device-id/x-request-from=xiaoyiWork 后转发
 fulfillment 服务（与模型访问 np://claw-model 同一套「鉴权收拢主进程」封装，
 本进程零业务凭证）。
 
@@ -31,7 +33,8 @@ x-hag-trace-id = 裸核心段（``sessionId&interactionId短码``，≤45），�
 
 启用条件（缺一静默禁用——旧桌面/非桌面形态零影响）：
   密钥包携带 ``pipes.billing`` + ``billingToken`` + ``uid``。
-  env ``JIUWEN_XIAOYI_BILLING=off`` 可整体关闭。
+  env ``JIUWEN_XIAOYI_BILLING=off`` 可整体关闭；cron 调度路径另有独立开关
+  ``JIUWEN_CRON_BILLING=off``（gateway/cron/scheduler.py）。
 """
 
 from __future__ import annotations

@@ -413,7 +413,9 @@ logger = logging.getLogger(__name__)
 
 def _maybe_report_xiaoyi_billing_new(request: Any, query: str, invocation: Any) -> None:
     """xiaoyi 渠道一轮 query 的 NEW 上报（fire-and-forget；每 core 只发一次，
-    HITL 续跑同 core 不重复）。非 xiaoyi 渠道（桌面/cron 由桌面侧计费）静默跳过。
+    HITL 续跑同 core 不重复）。非 xiaoyi 渠道静默跳过——桌面对话与 cron 手动执行
+    由桌面侧计费，gateway 调度 cron（channel_id=__cron__）由 scheduler._run_agent
+    计费（同 common/billing_client.py 管道），本函数均不重复上报。
     计费永不影响会话主路径（任何异常仅记日志）。
     """
     try:

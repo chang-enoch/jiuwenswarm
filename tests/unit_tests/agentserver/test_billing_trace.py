@@ -256,3 +256,51 @@ class TestXiaoyiBillingClient:
 
 async def _no_sleep(_delay: float) -> None:
     return None
+
+
+class TestBuildCronTraceId:
+    """gateway cron 计费 trace 与 AgentServer cron 分支派生同源（防双处拼串漂移）。
+
+    scheduler._run_agent 的计费上报（np://claw-billing）x-hag-trace-id 必须与本轮
+    全部模型调用同值——后者由 build_xiaoyi_trace_context 的 cron 分支派生。
+    """
+
+    def test_matches_xiaoyi_invocation_cron_branch(self) -> None:
+        from jiuwenswarm.common.schema.agent import AgentRequest
+        from jiuwenswarm.server.xiaoyi_invocation import build_xiaoyi_trace_context
+
+        run_id = "job-abc:1726000000"  # 含冒号：cron 分支 quote 编码
+        request = AgentRequest(
+            request_id=f"cron-{run_id}",
+            channel_id="__cron__",
+            session_id="cron_exec_sess_1",
+            metadata={"cron": {"job_id": "job-abc", "run_id": run_id}},
+        )
+        trace = build_xiaoyi_trace_context(request)
+        assert trace is not None
+        assert trace.trace_id == billing_trace.build_cron_trace_id(run_id)
+        assert trace.trace_id == "cron_job-abc%3A1726000000"
+
+    def test_empty_run_id_safe(self) -> None:
+        assert billing_trace.build_cron_trace_id("") == "cron_"
+
+    def test_desktop_explicit_interaction_id_takes_priority(self) -> None:
+        """桌面手动执行（metadata.interaction_id 下发）优先于 cron 分支——
+        gateway 调度（无 interaction_id）才走 cron_{run_id} 形态。"""
+        from jiuwenswarm.common.schema.agent import AgentRequest
+        from jiuwenswarm.server.xiaoyi_invocation import build_xiaoyi_trace_context
+
+        request = AgentRequest(
+            request_id="cron-job-1:1234",
+            channel_id="desktop",
+            session_id="sess-1",
+            metadata={
+                "interaction_id": "cron-abcdef01-2345",
+                "cron": {"job_id": "job-1", "run_id": "job-1:1234"},
+            },
+        )
+        trace = build_xiaoyi_trace_context(request)
+        assert trace is not None
+        assert trace.trace_id == billing_trace.build_billing_core(
+            "sess-1", "cron-abcdef01-2345"
+        )
