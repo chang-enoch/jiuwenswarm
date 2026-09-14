@@ -71,7 +71,7 @@ post_and_validate() {
 #        与 check_runtime_up_dependency 预创建的内置 NFS 数据目录同名)
 # 用法: inject_data_volume <json_file>
 inject_data_volume() {
-    local json_file="$1"
+    local json_file="${CONFIG["AS_JSON_FILE"]}"
     local mount_type="${DEPLOY_VARS["CLAW_MOUNT_TYPE"]}"
     local data_volume
     if [ "${mount_type}" == "pvc" ]; then
@@ -94,6 +94,18 @@ inject_data_volume() {
         "${json_file}" > "${json_file}.tmp" && mv -f "${json_file}.tmp" "${json_file}"
 }
 
+# product 模式下镜像内置代码、Pod 无需固定调度到当前节点,
+# 删除 pod template 里的 nodeName 字段让 K8s 调度器自由调度
+# (dev 模式靠 nodeName 固定到当前节点以便 hostPath 挂源码)。
+# 用法: drop_nodename_field <json_file>
+drop_nodename_field() {
+    local json_file="${CONFIG["AS_JSON_FILE"]}"
+    if [[ "${DEPLOY_VARS["MODE"]}" == "product" ]]; then
+        jq 'del(.rawdata.templates[].nodeName)' "${json_file}" > "${json_file}.tmp"
+        mv -f "${json_file}.tmp" "${json_file}"
+    fi
+}
+
 # 剔除无效/不需要的 hostPath 卷(+ 引用它们的 volumeMounts):
 # 规则1(两模式通用):三个代码目录变量(CLAW_CODE_PATH/RUNTIME_CODE_PATH/CORE_CODE_PATH)任一为空,
 #   引用该变量的 hostPath 路径会变坏、不能挂载,一并剔除。映射(按 hostPath path 引用):
@@ -105,7 +117,7 @@ inject_data_volume() {
 #   hp-cgroup(sidecar 系统路径)始终保留。
 # 用法: drop_hostpath_volumes <json_file>
 drop_hostpath_volumes() {
-    local json_file="$1"
+    local json_file="${CONFIG["AS_JSON_FILE"]}"
     local drop_names=()
     if [[ -z "${DEPLOY_VARS["CLAW_CODE_PATH"]:-}" ]]; then
         drop_names+=(hp-code)
@@ -144,8 +156,9 @@ render_patch_file() {
         error "AgentServer JSON rendering failed, invalid JSON format: ${json_file}"
     fi
 
-    inject_data_volume "${json_file}"
-    drop_hostpath_volumes "${json_file}"
+    inject_data_volume
+    drop_hostpath_volumes
+    drop_nodename_field
 
     success "AgentServer configuration rendered"
 }
