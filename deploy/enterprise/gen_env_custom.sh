@@ -144,8 +144,19 @@ API_BASE=""
 API_KEY=""
 
 #LOG_MASK_ENABLED=false
-APPLY_PATCH=true
 EOF
+
+if [[ "${TYPE}" == "dev" ]]; then
+cat <<EOF
+APPLY_PATCH=true
+LOGIN_AUTH_SIMULATE=true
+EOF
+else
+cat <<EOF
+APPLY_PATCH=false
+LOGIN_AUTH_SIMULATE=false
+EOF
+fi
 } > "${ENV_FILE}"
 
 echo "Generated: ${ENV_FILE} (ARCH=${ARCH}, VERSION=${VERSION}, TYPE=${TYPE})"
