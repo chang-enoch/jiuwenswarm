@@ -32,11 +32,15 @@ from jiuwenswarm.agents.harness.common.rails.response_prompt_rail import (
 from jiuwenswarm.agents.harness.common.rails.stream_event_rail import (
     JiuSwarmStreamEventRail,
 )
+from jiuwenswarm.agents.harness.common.rails.llm_retry_notify_rail import (
+    TeamMemberNotifyingLLMRetryRail,
+)
 
 # No-parameter swarm-owned rail type names; namespaced under "swarm.".
 RESPONSE_PROMPT = "swarm.response_prompt"
 STREAM_EVENT = "swarm.stream_event"
 AVATAR_PROMPT = "swarm.avatar_prompt"
+TEAM_MEMBER_LLM_RETRY = "swarm.team_member_llm_retry"
 
 
 class ResponsePromptInput(ConstructionInput):
@@ -77,8 +81,37 @@ harness_element(
     builder=AvatarPromptRail,
 )
 
+
+@harness_element(
+    kind=ElementKind.RAIL,
+    name=TEAM_MEMBER_LLM_RETRY,
+    description="Retries transient model-call failures for dispatched team members.",
+)
+def _build_team_member_llm_retry_rail(
+    params: dict[str, Any],
+    context: Any,
+) -> TeamMemberNotifyingLLMRetryRail:
+    del context
+    retry_params = params if isinstance(params, dict) else {}
+    rail_kwargs: dict[str, Any] = {
+        "max_retries": retry_params.get("max_retries", 2),
+        "repeat_min_pattern_chars": retry_params.get("repeat_min_pattern_chars", 2),
+        "repeat_max_pattern_chars": retry_params.get("repeat_max_pattern_chars", 64),
+        "repeat_min_count": retry_params.get("repeat_min_count", 6),
+        "repeat_min_total_chars": retry_params.get("repeat_min_total_chars", 160),
+        "repeat_window_chars": retry_params.get("repeat_window_chars", 1024),
+        "single_char_repeat_count": retry_params.get("single_char_repeat_count", 100),
+        "retry_transient_invoke_errors": retry_params.get("retry_transient_invoke_errors", True),
+        "notify_user_on_retry": retry_params.get("notify_user_on_retry", True),
+        "notify_user_on_exhausted": retry_params.get("notify_user_on_exhausted", True),
+    }
+    if "backoff_seconds" in retry_params:
+        rail_kwargs["backoff_seconds"] = retry_params["backoff_seconds"]
+    return TeamMemberNotifyingLLMRetryRail(**rail_kwargs)
+
 __all__ = [
     "RESPONSE_PROMPT",
     "STREAM_EVENT",
     "AVATAR_PROMPT",
+    "TEAM_MEMBER_LLM_RETRY",
 ]
