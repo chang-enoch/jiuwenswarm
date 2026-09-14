@@ -53,17 +53,10 @@ test('trajectory host relies on native sidebar controls', () => {
 
   assert.doesNotMatch(appSource, /data-testid="trajectory-toggle-sessions"/);
   assert.doesNotMatch(appSource, /data-testid="trajectory-toggle-tasks"/);
-  assert.match(appSource, /chat-workspace--trajectory-floating-tools/);
-  assert.match(appSource, /shouldInsetTrajectoryForFloatingTasks/);
-  assert.doesNotMatch(appStyles, /transition:\s*padding-right/);
-  assert.doesNotMatch(
-    appStyles,
-    /\.chat-workspace--trajectory-floating-tools\s*\{[^}]*padding-right/,
-  );
-  assert.match(
-    appStyles,
-    /\.chat-workspace--trajectory-floating-tools[\s\S]*?single-agent-trajectory-view[\s\S]*?right:\s*364px/,
-  );
+  assert.match(appSource, /const hideTrajectorySessions = false/);
+  assert.match(appSource, /const hideTrajectoryTasks = false/);
+  assert.doesNotMatch(appSource, /chat-workspace--trajectory-floating-tools/);
+  assert.doesNotMatch(appStyles, /chat-workspace--trajectory-floating-tools/);
   assert.match(appSource, /showNavigation=\{sessionId !== NEW_CONVERSATION_ID\}/);
   assert.doesNotMatch(panelSource, /window\.setInterval/);
   assert.doesNotMatch(panelSource, /data-testid="trajectory-refresh"/);
@@ -108,7 +101,7 @@ test('trajectory host relies on native sidebar controls', () => {
   assert.match(teamWorkspaceStyles, /\.lanes[\s\S]*?overflow-y: auto/);
   assert.match(teamWorkspaceStyles, /\.laneRowExpanded[\s\S]*?flex: 0 0 100%/);
   assert.match(teamWorkspaceSource, /lanesElement\.scrollTop \+= rowBounds\.top - lanesBounds\.top/);
-  assert.match(chatPanelSource, /export const ChatPanel = React\.memo/);
+  assert.match(chatPanelSource, /export function ChatPanel\(/);
   assert.match(
     appStyles,
     /\.single-agent-surface--trajectory \.chat-panel-shell > :not\(\.chat-panel-header\) \{[\s\S]*?visibility: hidden;/,
