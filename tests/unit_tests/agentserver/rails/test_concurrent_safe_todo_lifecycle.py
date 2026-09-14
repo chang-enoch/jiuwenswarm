@@ -25,12 +25,13 @@ class LocalFiles:
             content=Path(path).read_text(encoding="utf-8")))
 
 
-def make_agent(tmp_path):
+def make_agent(tmp_path, fs=None):
+    fs = fs if fs is not None else LocalFiles()
     agent = Mock(spec=DeepAgent)
     agent.card = SimpleNamespace(id="todo-regression")
     agent.system_prompt_builder = SimpleNamespace(language="cn")
     agent.deep_config = SimpleNamespace(
-        sys_operation=SimpleNamespace(fs=lambda: LocalFiles()),
+        sys_operation=SimpleNamespace(fs=lambda: fs),
         workspace=SimpleNamespace(get_node_path=lambda node: tmp_path),
     )
     agent.ability_manager = Mock()
@@ -46,10 +47,11 @@ async def test_registered_create_instance_is_reset_and_new_round_replaces_list(t
         add_tool=lambda tool: registry.setdefault(tool.card.id, tool),
     )
     monkeypatch.setattr(module, "Runner", SimpleNamespace(resource_mgr=manager))
+    fs = LocalFiles()
     first = module.ConcurrentSafeTaskPlanningRail()
-    first.init(make_agent(tmp_path))
+    first.init(make_agent(tmp_path, fs))
     second = module.ConcurrentSafeTaskPlanningRail()
-    second.init(make_agent(tmp_path))
+    second.init(make_agent(tmp_path, fs))
     creator = first._find_todo_create_tool()
     assert second._find_todo_create_tool() is creator
     session = SimpleNamespace(get_session_id=lambda: "session")
@@ -135,3 +137,41 @@ async def test_uninitialized_rail_skips_inner_callback():
     ctx = AgentCallbackContext(agent=SimpleNamespace())
     await rail.after_tool_call(ctx)
     assert not hasattr(ctx.agent, "load_state")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("different_workspace,different_fs", [(True, False), (False, True), (True, True)])
+async def test_registry_keeps_workspace_and_filesystem_bindings_isolated(
+    tmp_path, monkeypatch, different_workspace, different_fs,
+):
+    registry = {}
+    monkeypatch.setattr(module, "Runner", SimpleNamespace(resource_mgr=SimpleNamespace(
+        get_tool=lambda tool_id: registry.get(tool_id),
+        add_tool=lambda tool: registry.setdefault(tool.card.id, tool),
+    )))
+    first_fs = LocalFiles()
+    second_fs = LocalFiles() if different_fs else first_fs
+    first = module.ConcurrentSafeTaskPlanningRail()
+    first.init(make_agent(tmp_path / "a", first_fs))
+    second_root = tmp_path / ("b" if different_workspace else "a")
+    second_agent = make_agent(second_root, second_fs)
+    # An inherited ability card must not keep pointing at the old binding.
+    second_agent.ability_manager.list.return_value = [tool.card for tool in first.tools]
+    second = module.ConcurrentSafeTaskPlanningRail()
+    second.init(second_agent)
+    for old, new in zip(first.tools, second.tools):
+        assert old.card.id != new.card.id
+        assert registry[new.card.id] is new
+        assert new.fs is second_fs
+        assert new.workspace == str(second_root)
+    assert second_agent.ability_manager.remove.call_count == 3
+    if different_workspace:
+        await first._find_todo_create_tool()._create_from_list("same-session", [
+            {"id": "a", "content": "Tenant A"},
+        ])
+        await second._find_todo_create_tool()._create_from_list("same-session", [
+            {"id": "b", "content": "Tenant B"},
+        ])
+        for rail, expected in ((first, "a"), (second, "b")):
+            for tool in rail.tools:
+                assert [todo.id for todo in await tool.load_todos("same-session")] == [expected]

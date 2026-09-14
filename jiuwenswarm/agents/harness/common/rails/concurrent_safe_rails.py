@@ -16,6 +16,8 @@ the agent can use them.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from copy import copy
 
 from openjiuwen.core.runner import Runner
@@ -128,6 +130,16 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
         workspace_dir = str(self.workspace.get_node_path(WorkspaceNode.TODO))
         agent_id = getattr(getattr(agent, "card", None), "id", None)
         language = self.system_prompt_builder.language if self.system_prompt_builder else "cn"
+        fs = self.sys_operation.fs()
+        # Tools retain their filesystem client and workspace. Include both
+        # bindings in the process-local registry ID, not only the agent ID.
+        binding = hashlib.sha256(
+            json.dumps([workspace_dir, id(fs)]).encode("utf-8")
+        ).hexdigest()[:24]
+        scoped_agent_id = f"{agent_id or 'todo'}_{binding}"
+
+        def matches_binding(tool):
+            return tool.workspace == workspace_dir and tool.fs is fs
 
         tool_configs = [
             (TodoCreateTool, False),
@@ -142,6 +154,9 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
                 if tool_instance:
                     for i, (tool_class, found) in enumerate(tool_configs):
                         if isinstance(tool_instance, tool_class):
+                            if not matches_binding(tool_instance):
+                                agent.ability_manager.remove(ability.name)
+                                break
                             tool_configs[i] = (tool_class, True)
                             existing_tools.append(tool_instance)
                             break
@@ -150,9 +165,11 @@ class ConcurrentSafeTaskPlanningRail(TaskPlanningRail):
         try:
             for tool_class, found in tool_configs:
                 if not found:
-                    new_tool = tool_class(self.sys_operation, workspace_dir, language, agent_id)
+                    new_tool = tool_class(self.sys_operation, workspace_dir, language, scoped_agent_id)
                     registered_tool = Runner.resource_mgr.get_tool(new_tool.card.id)
                     if registered_tool is not None:
+                        if not isinstance(registered_tool, tool_class) or not matches_binding(registered_tool):
+                            raise RuntimeError(f"Todo tool binding mismatch: {new_tool.card.id}")
                         agent.ability_manager.add(registered_tool.card)
                         tools.append(registered_tool)
                         continue

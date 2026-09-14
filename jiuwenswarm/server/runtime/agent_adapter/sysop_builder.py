@@ -251,9 +251,18 @@ def _resolve_project_dir(override: str | Path | None) -> Path | None:
     return None
 
 
-def _sandbox_isolation_custom_id(project_dir: str | Path | None) -> str:
+def _sandbox_isolation_custom_id(
+    project_dir: str | Path | None, *, shared_dir: str | Path | None = None,
+) -> str:
     """Stable SysOperation isolation key suffix for per-project sandbox sharing."""
     resolved = _resolve_project_dir(project_dir)
+    if is_enterprise():
+        # Match the trusted workspace mounted for this tenant. A default
+        # project must not reuse another tenant's cached sandbox client.
+        root = Path(shared_dir if shared_dir is not None else get_agent_root_dir()).expanduser().resolve()
+        scope = json.dumps([str(root), str(resolved) if resolved is not None else None])
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+        return f"workspace_project_{digest}"
     if resolved is None:
         return "project_default"
     digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
@@ -634,7 +643,7 @@ def create_sandbox_sysop_card(
     try:
         if normalized_type == "yuanrong":
             extra_params = _build_yuanrong_extra_params()
-            isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+            isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
             gateway_config = SandboxGatewayConfig(
                 isolation=SandboxIsolationConfig(
                     container_scope=ContainerScope.CUSTOM,
@@ -692,7 +701,7 @@ def create_sandbox_sysop_card(
         if idle_check_interval is not None:
             extra_params["idle_check_interval"] = idle_check_interval
 
-        isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+        isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
         gateway_config = SandboxGatewayConfig(
             isolation=SandboxIsolationConfig(
                 container_scope=ContainerScope.CUSTOM,
