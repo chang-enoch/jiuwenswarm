@@ -715,7 +715,7 @@ async def _fetch_single_url(
             "content": "",
             "provider": "",
             "from_cache": False,
-            "error": f"URL命中脱敏黑名单({bl_reason})，禁止访问",
+            "error": "URL命中脱敏黑名单，禁止访问",
         }
 
     if cache is not None and use_cache:

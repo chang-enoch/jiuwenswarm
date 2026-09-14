@@ -297,6 +297,7 @@ def _bl_fetch_from_api() -> dict[str, list[str]] | None:
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "X-Office-Claw-User": os.environ.get("OFFICE_CLAW_USER_ID", "system"),
             },
         )
         with urllib.request.urlopen(req, timeout=_BL_HTTP_TIMEOUT_SECONDS, context=_bl_ssl_context) as resp:

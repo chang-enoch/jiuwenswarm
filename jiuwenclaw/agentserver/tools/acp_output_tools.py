@@ -284,7 +284,7 @@ async def read_text_file(
         raise AcpOutputError(
             method="fs/read_text_file",
             code=-32003,
-            message=f"文件命中脱敏黑名单({bl_reason})，禁止读取",
+            message="文件命中脱敏黑名单，禁止读取",
         )
     # Layer 1: KIA classification check via ICPM
     if await _check_kia_file(path):
