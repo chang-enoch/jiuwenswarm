@@ -77,6 +77,7 @@ from jiuwenswarm.agents.harness.code.rails import (
     PlanApprovalInterruptRail,
 )
 from jiuwenswarm.agents.harness.common.rails import (
+    IdentityRail,
     OrderedContextAssembleRail,
     ProjectMemoryRail,
     StructuredAskUserRail,
@@ -395,6 +396,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         self._project_memory_rail: ProjectMemoryRail | None = None
         self._coding_memory_rail: CodingMemoryRail | None = None
         self._worktree_rail: WorktreeRail | None = None
+        self._identity_rail: IdentityRail | None = None
         self._tool_usage_prompt_rail: ToolUsagePromptRail | None = None
         self._tool_visibility_rail: XiaoyiDefaultToolVisibilityRail | None = None
         # 单点 source-of-truth, 让 sysop_builder 的"主写入根"分支
@@ -658,6 +660,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         # 固定 Rails — code 模式特有
         rail_infos = [
             _RailBuildInfo("_runtime_prompt_rail", self._build_runtime_prompt_rail),
+            _RailBuildInfo("_identity_rail", self._build_identity_rail),
             _RailBuildInfo("_response_prompt_rail", self._build_response_prompt_rail),
             _RailBuildInfo("_skill_retrieval_prompt_rail", self._build_skill_retrieval_prompt_rail),
             _RailBuildInfo("_stream_event_rail", self._build_stream_event_rail),
@@ -745,6 +748,16 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         return self._instantiate_rails(rail_infos, config_base)
 
     # ─── Code 专属 Rail 构建 ────────────────
+
+    def _build_identity_rail(self) -> IdentityRail | None:
+        """Build IdentityRail to load IDENTITY.md into the identity section."""
+        try:
+            rail = IdentityRail(language=self._resolve_runtime_language())
+            logger.info("[JiuwenSwarmCodeAdapter] IdentityRail create success")
+        except Exception as exc:
+            logger.warning("[JiuwenSwarmCodeAdapter] IdentityRail create failed: %s", exc)
+            rail = None
+        return rail
 
     def _build_filesystem_rail(self) -> SysOperationRail | None:
         """构建 SysOperationRail（FileSystemRail）."""
@@ -1244,6 +1257,22 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             if runtime_config.trusted_dirs:
                 self._project_memory_rail.set_additional_directories(
                     runtime_config.trusted_dirs,
+                )
+
+        # IdentityRail 语言同步
+        if self._identity_rail:
+            self._identity_rail.set_language(resolved_language)
+            # 显式指定 IDENTITY.md 读取路径为全局 agent workspace（跨会话稳定），
+            # 防止默认路径解析逻辑受 workspace 切换影响。
+            try:
+                from jiuwenswarm.common.utils import get_deepagent_identity_md_path
+                self._identity_rail.set_identity_md_path(
+                    str(get_deepagent_identity_md_path())
+                )
+            except Exception:
+                logger.debug(
+                    "[JiuwenSwarmCodeAdapter] set_identity_md_path failed",
+                    exc_info=True,
                 )
 
         # code 模式始终走 _update_rails_for_mode 的 code 逻辑
