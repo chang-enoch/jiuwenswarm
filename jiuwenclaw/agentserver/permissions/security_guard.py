@@ -1,25 +1,37 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
-"""Security guard: KIA + RMS checks for file reads.
+"""Security guard: KIA + RMS + desensitive blacklist checks for file reads.
 
 Centralised implementation so that every file-read path uses the same logic:
   - PermissionEngine.check_permission  (read_file via FileSystemRail)
   - acp_output_tools.read_text_file     (read_text_file via ACP JSON-RPC)
 
-Order: KIA first (ICPM path-based check), then RMS (local byte detection).
-Degrade strategy: if ICPM is unavailable or errors, the file passes the KIA
-check (degrade-to-allow). RMS detection is pure-local and never degrades.
+Order: blacklist first (fuzzy filename match, no IO), then KIA (ICPM
+path-based check), then RMS (local byte detection).
+
+Degrade strategy:
+  - KIA: fail-closed (ICPM unavailable → block).
+  - Blacklist: pass-through (service unavailable → empty list → allow).
+  - RMS: pure-local, never degrades.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import pathlib
+import ssl
+import threading
+import time
 import http.client
 import ntpath
+import urllib.request
+from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # ── RMS detection (pure local, no network) ──
 
@@ -231,8 +243,189 @@ def extract_file_path_from_tool_args(tool_name: str, tool_args: dict) -> str | N
     return None
 
 
+# ── Desensitive blacklist guard (fuzzy file/URL match) ──
+
+# Fetches from login-activity service (/api/desensitive/black-rule),
+# same env vars as the login-event/token-usage reporter.
+#
+# Config
+_BL_CACHE_TTL_SECONDS = 86400  # 24 hours
+_BL_HTTP_TIMEOUT_SECONDS = 5
+_BL_MAX_RETRIES = 2
+_BL_RETRY_DELAY_SECONDS = 1
+
+# Empty fallback — pass-through when API is unreachable or errors.
+_BL_EMPTY: dict[str, list[str]] = {"url": [], "filename": []}
+
+# SSL context for HTTPS to login-activity (self-signed certs in intranet)
+_bl_ssl_context = ssl.create_default_context()
+_bl_ssl_context.check_hostname = False
+_bl_ssl_context.verify_mode = ssl.CERT_NONE
+
+# Cache
+_bl_cache_lock = threading.Lock()
+_bl_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+
+
+def _bl_is_enabled() -> bool:
+    return os.environ.get("BLACKLIST_GUARD_ENABLED", "").lower() in ("1", "true", "yes")
+
+
+def _bl_get_url() -> str:
+    return os.environ.get("OFFICE_CLAW_LOGIN_STATS_URL", "").strip().rstrip("/")
+
+
+def _bl_get_token() -> str:
+    return os.environ.get("OFFICE_CLAW_LOGIN_STATS_TOKEN", "").strip()
+
+
+def _bl_fetch_from_api() -> dict[str, list[str]] | None:
+    """Fetch blacklist from login-activity service (blocking, sync).
+
+    Returns None on any failure; caller uses empty list (pass-through).
+    """
+    base_url = _bl_get_url()
+    token = _bl_get_token()
+    if not base_url:
+        return None
+
+    url = f"{base_url}/api/desensitive/black-rule"
+    try:
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_BL_HTTP_TIMEOUT_SECONDS, context=_bl_ssl_context) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("[blacklist] fetch failed: %s", exc)
+        return None
+
+    if not isinstance(result, dict) or result.get("status") != 200 or not result.get("success"):
+        logger.warning("[blacklist] API non-success: %s", result)
+        return None
+
+    data = result.get("data")
+    if not isinstance(data, list):
+        return None
+
+    url_list: list[str] = []
+    filename_list: list[str] = []
+    for scene in data:
+        if not isinstance(scene, dict):
+            continue
+        scene_name = scene.get("sceneName", "")
+        blacklist = scene.get("blacklist", [])
+        if not isinstance(blacklist, list):
+            continue
+        for item in blacklist:
+            if not isinstance(item, dict):
+                continue
+            word = item.get("zhWord") or item.get("enWord")
+            if isinstance(word, str) and word.strip():
+                word = word.strip()
+                if "url" in scene_name.lower():
+                    url_list.append(word)
+                elif "文件" in scene_name or "filename" in scene_name.lower():
+                    filename_list.append(word)
+
+    if not url_list and not filename_list:
+        return None
+    return {"url": url_list, "filename": filename_list}
+
+
+def _bl_fetch_with_retry() -> dict[str, list[str]] | None:
+    """Fetch with retry, returns None on all-fail (pass-through)."""
+    for attempt in range(1, _BL_MAX_RETRIES + 1):
+        result = _bl_fetch_from_api()
+        if result is not None:
+            if attempt > 1:
+                logger.info("[blacklist] fetch succeeded on attempt %d", attempt)
+            return result
+        if attempt < _BL_MAX_RETRIES:
+            time.sleep(_BL_RETRY_DELAY_SECONDS)
+    logger.warning(
+        "[blacklist] all %d attempts failed, pass-through", _BL_MAX_RETRIES
+    )
+    return None
+
+
+async def get_blacklist() -> dict[str, list[str]]:
+    """Get current blacklist with 24h cache.
+
+    Cache-miss dispatches blocking HTTP via ``asyncio.to_thread``
+    (same pattern as ``check_kia_file``).
+    """
+    now = time.time()
+    with _bl_cache_lock:
+        if _bl_cache["data"] is not None and now - _bl_cache["ts"] < _BL_CACHE_TTL_SECONDS:
+            return _bl_cache["data"]
+
+    fetched = await asyncio.to_thread(_bl_fetch_with_retry)
+    blacklist = fetched if fetched is not None else _BL_EMPTY
+
+    with _bl_cache_lock:
+        _bl_cache["data"] = blacklist
+        _bl_cache["ts"] = time.time()
+
+    return blacklist
+
+
+def clear_blacklist_cache() -> None:
+    """Clear in-memory cache (for testing)."""
+    with _bl_cache_lock:
+        _bl_cache["data"] = None
+        _bl_cache["ts"] = 0.0
+
+
+async def check_blacklist_file(path: str) -> str | None:
+    """Check if a file path matches the filename blacklist (fuzzy/contains).
+
+    Returns the matched word if blocked, None if clean/disabled/empty.
+    """
+    if not _bl_is_enabled():
+        return None
+    if not isinstance(path, str) or not path.strip():
+        return None
+
+    basename = ntpath.basename(path.strip())
+    if not basename:
+        return None
+
+    basename_lower = basename.lower()
+    blacklist = await get_blacklist()
+    for word in blacklist.get("filename", []):
+        if word.lower() in basename_lower:
+            return word
+    return None
+
+
+async def check_blacklist_url(url: str) -> str | None:
+    """Check if a URL matches the URL blacklist (fuzzy/contains).
+
+    Returns the matched word if blocked, None if clean/disabled/empty.
+    """
+    if not _bl_is_enabled():
+        return None
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    url_lower = url.strip().lower()
+    blacklist = await get_blacklist()
+    for word in blacklist.get("url", []):
+        if word.lower() in url_lower:
+            return word
+    return None
+
+
 __all__ = [
     "detect_rms_file",
     "check_kia_file",
     "extract_file_path_from_tool_args",
+    "check_blacklist_file",
+    "check_blacklist_url",
 ]
