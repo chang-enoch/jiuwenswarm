@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import logging
 from typing import Any, List, Union
 
@@ -30,6 +32,24 @@ _SENT_FILE_PATHS_BY_SESSION: dict[str, set[str]] = {}
 
 def _normalize_sent_file_path(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/").lower()
+
+
+def artifact_id_for_path(path: str) -> str:
+    """产物稳定标识：供桌面端「对话卡片」与「右侧工作台产物」共用同一个键。
+
+    用「归一化绝对路径」而不是文件内容/时间：同一路径重复产出（重写、重新导出、
+    下载 URL 重新签名）都视为同一产物，跨轮、跨历史重放都稳定。WSL 的
+    ``/mnt/c/...`` 先还原成 ``C:/...``，避免沙箱路径与 Windows 路径被当成两个产物。
+    """
+    # 先还原 WSL 盘符再 abspath：Windows 上 os.path.abspath("/mnt/c/x") 会变成
+    # "C:/mnt/c/x"（相对当前盘符），必须在绝对化之前处理。
+    raw = path.replace("\\", "/")
+    match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", raw)
+    if match:
+        raw = f"{match.group(1).upper()}:/{match.group(2)}"
+    normalized = os.path.abspath(raw).replace("\\", "/")
+    digest = hashlib.sha1(normalized.lower().encode("utf-8")).hexdigest()
+    return f"art-{digest[:16]}"
 
 
 def _partition_sent_files(
@@ -259,6 +279,8 @@ class SendFileToolkit:
                     files_payload.append({
                         "path": file_path,
                         "name": base_name,
+                        # 产物稳定标识：桌面端「对话卡片」与「右侧工作台产物」共用同一个键去重
+                        "artifact_id": artifact_id_for_path(file_path),
                         "size": download_info["size"],
                         "mime_type": download_info["mime_type"],
                         "download_url": download_info["download_url"],
@@ -273,6 +295,7 @@ class SendFileToolkit:
                     {
                         "path": file_path,
                         "name": os.path.basename(file_path),
+                        "artifact_id": artifact_id_for_path(file_path),
                     }
                     for file_path in valid_files
                 ]
