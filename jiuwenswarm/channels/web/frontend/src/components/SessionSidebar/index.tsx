@@ -26,6 +26,7 @@ import {
   formatAgentContextLabel,
   useEnterpriseContext,
 } from '../../services/enterpriseContext';
+import { isEnterprise } from '../../edition';
 import { isClickOutside } from './clickOutside';
 import { EditableCombobox } from './EditableCombobox';
 import type { MainNavKey } from '../../features/mainNavigationState';
@@ -107,7 +108,10 @@ function AdvancedConfigPanel({
   }, [isOpen, onClose, buttonRef]);
 
   const handleLanguageChange = (lang: 'zh' | 'en') => {
+    // i18n LanguageDetector 会写入 localStorage，刷新后靠它恢复。
     i18n.changeLanguage(lang);
+    // 企业版 set_conf 只能回写共享只读/全局 config.yaml，既不可靠又会串用户，跳过。
+    if (isEnterprise()) return;
     void webRequest('locale.set_conf', { preferred_language: lang }).catch(() => {});
   };
 

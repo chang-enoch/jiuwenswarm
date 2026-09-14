@@ -15,7 +15,6 @@ import {
   InterruptResultPayload,
   InterruptIntent,
   SubtaskUpdatePayload,
-  AskUserQuestionPayload,
   EvolutionStatusPayload,
   UserAnswer,
   UserAnswerStatus,
@@ -33,6 +32,7 @@ import {
   GoalAction,
   Message,
 } from '../types';
+import { normalizeAskUserQuestionPayload } from '../features/askUserQuestion';
 import {
   ensureSessionRuntimes,
   useChatStore,
@@ -3691,53 +3691,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       webClient.on('chat.ask_user_question', ({ payload }) => {
         const sessionId = resolveEventSessionId(payload);
         if (!sessionId) return;
-        const questionPayload = payload as Record<string, unknown>;
-        const evolutionMeta =
-          questionPayload.evolution_meta && typeof questionPayload.evolution_meta === 'object'
-            ? (questionPayload.evolution_meta as Record<string, unknown>)
-            : questionPayload._evolution_meta && typeof questionPayload._evolution_meta === 'object'
-              ? (questionPayload._evolution_meta as Record<string, unknown>)
-              : undefined;
-        const questions = Array.isArray(questionPayload.questions) ? questionPayload.questions : [];
-        const approvalSchema =
-          typeof questionPayload.approval_schema === 'string'
-            ? questionPayload.approval_schema
-            : undefined;
-        const planApprovalKind =
-          typeof questionPayload.plan_approval_kind === 'string'
-            ? questionPayload.plan_approval_kind
-            : undefined;
-        const planContent =
-          typeof questionPayload.plan_content === 'string'
-            ? questionPayload.plan_content
-            : undefined;
-        const planLanguage =
-          questionPayload.plan_language === 'cn' || questionPayload.plan_language === 'en'
-            ? questionPayload.plan_language
-            : undefined;
-        const agentScopeId =
-          typeof questionPayload.agent_scope_id === 'string'
-            ? questionPayload.agent_scope_id
-            : undefined;
-        // Skill 加载审批卡：透传结构化数据（payload_schema["x-skill-approval-card"]，
-        // 若后端通道已携带）；缺失时由卡片组件回退渲染 message markdown。
-        const rawCard = questionPayload['x-skill-approval-card'] ?? questionPayload['skill_approval_card'];
-        const skillApprovalCard =
-          rawCard && typeof rawCard === 'object'
-            ? (rawCard as AskUserQuestionPayload['skill_approval_card'])
-            : undefined;
-        const normalizedPayload: AskUserQuestionPayload = {
-          request_id: typeof questionPayload.request_id === 'string' ? questionPayload.request_id : '',
-          source: typeof questionPayload.source === 'string' ? questionPayload.source : undefined,
-          questions,
-          ...(approvalSchema ? { approvalSchema } : {}),
-          ...(evolutionMeta ? { evolutionMeta } : {}),
-          ...(planApprovalKind ? { planApprovalKind } : {}),
-          ...(planContent !== undefined ? { planContent } : {}),
-          ...(planLanguage ? { planLanguage } : {}),
-          ...(agentScopeId ? { agent_scope_id: agentScopeId } : {}),
-          ...(skillApprovalCard ? { skill_approval_card: skillApprovalCard } : {}),
-        };
+        const normalizedPayload = normalizeAskUserQuestionPayload(payload);
+        if (!normalizedPayload) return;
         useChatStore.getState().setPendingQuestion(sessionId, normalizedPayload);
       }),
       webClient.on('chat.ask_user_question_expired', ({ payload }) => {
