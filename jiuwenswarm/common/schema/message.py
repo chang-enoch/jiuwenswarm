@@ -86,6 +86,10 @@ class ReqMethod(Enum):
     AGENT_PREWARM_SYNC = "agent.prewarm.sync"
 
     MEMORY_COMPUTE = "memory.compute"
+    MEMORY_PROFILE_SETTINGS_GET = "memory.profile.settings.get"
+    MEMORY_PROFILE_SETTINGS_SET = "memory.profile.settings.set"
+    MEMORY_PROFILE_GET = "memory.profile.get"
+    MEMORY_PROFILE_MODIFY = "memory.profile.modify"
 
     PROACTIVE_TICK = "proactive.tick"  # Trigger proactive recommendation tick (from Cron)
     COMMAND_GOAL = "command.goal"
