@@ -104,7 +104,11 @@ import {
   SingleAgentSurface,
   type ChatSurfaceView,
 } from './features/trajectory/SingleAgentSurface';
-import { resolveTrajectoryHostLayout } from './features/trajectory/trajectoryLayout';
+import {
+  normalizeTrajectoryUiEnabled,
+  setTrajectoryUiEnabled,
+  useTrajectoryUiEnabled,
+} from './features/trajectory/featureConfig';
 import './App.css';
 
 const LazyTrajectoryPanel = lazy(async () => {
@@ -329,8 +333,6 @@ function AppContent() {
   });
   const [chatSurfaceViews, setChatSurfaceViews] = useState<Record<string, ChatSurfaceView>>({});
   const [trajectoryUiRequested, setTrajectoryUiRequested] = useState(false);
-  const [trajectorySessionsCollapsed, setTrajectorySessionsCollapsed] = useState(false);
-  const [trajectoryTasksCollapsed, setTrajectoryTasksCollapsed] = useState(false);
 
   const enterpriseMode = isEnterprise();
   const cronJobPullSyncEnabled = enterpriseMode && getWebTransport() === 'http';
@@ -349,6 +351,7 @@ function AppContent() {
     });
   });
   const [serverConfig, setServerConfig] = useState<Record<string, unknown> | null>(null);
+  const trajectoryUiEnabled = useTrajectoryUiEnabled();
   const [configError, setConfigError] = useState<string | null>(null);
   const [initialDataLoaded, setInitialDataLoaded] = useState(false);
   const [restartModalOpen, setRestartModalOpen] = useState(false);
@@ -559,7 +562,8 @@ function AppContent() {
     )) ?? null;
   }, [currentSession, projects, sessions, sessionId]);
   const mode = useSessionStore((s) => s.runtimes[sessionId]?.mode ?? 'agent');
-  const chatSurfaceView: ChatSurfaceView = mode === 'agent'
+  const chatSurfaceView: ChatSurfaceView = trajectoryUiEnabled
+    && (mode === 'agent' || mode === 'team')
     ? (chatSurfaceViews[sessionId] ?? 'chat')
     : 'chat';
   const selectChatSurfaceView = useCallback((nextView: ChatSurfaceView) => {
@@ -714,16 +718,9 @@ function AppContent() {
   // 避免右侧面板与聊天面板平分空间导致宽度与集群模式不一致；auto_harness 走收起态分支。
   const isTeamAreaExpanded = mode !== 'auto_harness' && teamAreaExpanded && toolPanelHasContent;
   const trajectoryTaskPanelAvailable = toolPanelHasContent || isRestoringTeamHistory;
-  const trajectoryHostLayout = resolveTrajectoryHostLayout(
-    mode,
-    chatSurfaceView,
-    trajectorySessionsCollapsed,
-    trajectoryTasksCollapsed,
-    isTeamAreaExpanded,
-  );
-  const hideTrajectorySessions = trajectoryHostLayout.hideSessions;
-  const hideTrajectoryTasks = trajectoryHostLayout.hideTasks;
-  const effectiveTeamAreaExpanded = trajectoryHostLayout.effectiveTeamAreaExpanded;
+  const effectiveTeamAreaExpanded = isTeamAreaExpanded;
+  const hideTrajectorySessions = false;
+  const hideTrajectoryTasks = false;
 
   // WebSocket 连接 - provider 由后端配置决定 - provider 由后端配置决定，前端默认不在 URL query 传递
   const {
@@ -1003,6 +1000,7 @@ function AppContent() {
     try {
       const config = await request<Record<string, unknown>>('config.get');
       setA2UIFeatureEnabled(normalizeA2UIEnabled(config.a2ui_enabled));
+      setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(config.trajectory_ui_enabled));
       setServerConfig(config);
       setConfigError(null);
       if (!modelSetupGuideEvaluatedRef.current) {
@@ -2495,31 +2493,11 @@ function AppContent() {
                     onViewChange={selectChatSurfaceView}
                     tabListLabel={t('trajectory.tabs.aria')}
                     trajectory={<Suspense fallback={<div className="trajectory-view-loading">{t('trajectory.loading')}</div>}>
-                      <LazyTrajectoryPanel active={chatSurfaceView === 'trajectory'} sessionId={sessionId} />
+                      <LazyTrajectoryPanel active={chatSurfaceView === 'trajectory'} mode={mode} sessionId={sessionId} />
                     </Suspense>}
+                    trajectoryEnabled={trajectoryUiEnabled}
                     trajectoryLabel={t('trajectory.tabs.trajectory')}
-                    trajectoryControls={<>
-                      <button
-                        type="button"
-                        className="chat-surface-layout-control"
-                        aria-pressed={trajectorySessionsCollapsed}
-                        aria-label={trajectorySessionsCollapsed ? t('trajectory.layout.showSessions') : t('trajectory.layout.hideSessions')}
-                        onClick={() => setTrajectorySessionsCollapsed((collapsed) => !collapsed)}
-                        data-testid="trajectory-toggle-sessions"
-                      >
-                        <span aria-hidden="true">{trajectorySessionsCollapsed ? '›' : '‹'}</span>
-                      </button>
-                      {trajectoryTaskPanelAvailable ? <button
-                        type="button"
-                        className="chat-surface-layout-control"
-                        aria-pressed={trajectoryTasksCollapsed}
-                        aria-label={trajectoryTasksCollapsed ? t('trajectory.layout.showTasks') : t('trajectory.layout.hideTasks')}
-                        onClick={() => setTrajectoryTasksCollapsed((collapsed) => !collapsed)}
-                        data-testid="trajectory-toggle-tasks"
-                      >
-                        <span aria-hidden="true">{trajectoryTasksCollapsed ? '‹' : '›'}</span>
-                      </button> : null}
-                    </>}
+                    showNavigation={sessionId !== NEW_CONVERSATION_ID}
                     trajectoryRequested={trajectoryUiRequested}
                   />
                 </div>
