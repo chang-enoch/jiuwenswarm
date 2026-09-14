@@ -33,6 +33,8 @@ from jiuwenswarm.gateway.channel_manager.web.web_ws_transport import (
     _WEB_CONNECTION_USER_ID_ATTR,
 )
 
+_TRAJECTORY_HINT_COALESCE_SECONDS = 0.05
+
 # Backward-compatible re-exports for invoke.py and tests.
 _HANDLER_BEFORE_CALLBACK_METHODS = HANDLER_BEFORE_CALLBACK_METHODS
 _MethodHandlerInvocation = MethodHandlerInvocation
@@ -63,6 +65,8 @@ class WebChannel(BaseChannel):
         self._trajectory_event_loop: asyncio.AbstractEventLoop | None = None
         self._trajectory_listener_registered = False
         self._trajectory_update_listener = self._on_trajectory_updates
+        self._trajectory_pending_updates: dict[tuple[str, str], Any] = {}
+        self._trajectory_send_task: asyncio.Task[None] | None = None
 
     # ── Compatibility shims (invoke / handlers access private attrs) ──
 
@@ -288,15 +292,50 @@ class WebChannel(BaseChannel):
             trajectory_update_broker.unregister(self._trajectory_update_listener)
             self._trajectory_listener_registered = False
         self._trajectory_event_loop = None
+        task = self._trajectory_send_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._trajectory_send_task = None
+        self._trajectory_pending_updates.clear()
 
     def _on_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
         loop = self._trajectory_event_loop
         if loop is None or loop.is_closed():
             return
-        loop.call_soon_threadsafe(self._schedule_trajectory_updates, updates)
+        loop.call_soon_threadsafe(self.schedule_trajectory_updates, updates)
+
+    def schedule_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
+        """Queue committed hints from the local sink or the Gateway push path."""
+        self._schedule_trajectory_updates(updates)
 
     def _schedule_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
-        asyncio.create_task(self._send_trajectory_updates(updates))
+        for update in updates:
+            session_id = str(getattr(update, "session_id", "") or "").strip()
+            trace_id = str(getattr(update, "trace_id", "") or "").strip()
+            if not session_id or not trace_id:
+                continue
+            key = (session_id, trace_id)
+            current = self._trajectory_pending_updates.get(key)
+            revision = int(getattr(update, "revision", 0))
+            if current is not None:
+                current_revision = int(getattr(current, "revision", 0))
+                if revision < current_revision:
+                    continue
+                if revision == current_revision and getattr(current, "lifecycle", "") == "final":
+                    continue
+            self._trajectory_pending_updates[key] = update
+        if self._trajectory_pending_updates and self._trajectory_send_task is None:
+            self._trajectory_send_task = asyncio.create_task(self._flush_trajectory_updates())
+
+    async def _flush_trajectory_updates(self) -> None:
+        try:
+            await asyncio.sleep(_TRAJECTORY_HINT_COALESCE_SECONDS)
+            while self._trajectory_pending_updates:
+                updates = tuple(self._trajectory_pending_updates.values())
+                self._trajectory_pending_updates.clear()
+                await self._send_trajectory_updates(updates)
+        finally:
+            self._trajectory_send_task = None
 
     async def _send_trajectory_updates(self, updates: tuple[Any, ...]) -> None:
         for update in updates:

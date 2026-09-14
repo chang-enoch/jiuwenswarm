@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,11 +14,6 @@ from jiuwenswarm.observability.models import CommittedTraceUpdate
 from jiuwenswarm.observability.updates import TrajectoryUpdateBroker
 
 test_logger = logging.getLogger("tests.trajectory_updates")
-
-
-@dataclass(frozen=True)
-class _RoutingKey:
-    session_id: str
 
 
 class _WebSocket:
@@ -58,10 +53,13 @@ async def test_webchannel_routes_trace_update_to_matching_session_only() -> None
     channel = WebChannel.__new__(WebChannel)
     first_ws = _WebSocket()
     other_ws = _WebSocket()
-    channel._clients_by_key = {
-        _RoutingKey(session_id="session-1"): [first_ws],
-        _RoutingKey(session_id="session-2"): [other_ws],
-    }
+    channel.ws = SimpleNamespace(
+        clients={first_ws, other_ws},
+        peers_for_session_ws=lambda session_id: (
+            {first_ws} if session_id == "session-1" else {other_ws}
+        ),
+    )
+    channel.delivery = SimpleNamespace(peers_for_session=lambda _session_id: set())
     sent: list[tuple[object, str, dict[str, object]]] = []
 
     async def _send_event(ws, event, payload) -> None:
