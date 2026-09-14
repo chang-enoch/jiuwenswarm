@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import grp
 import hashlib
 import json
 import logging
 import os
-import pwd
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +30,7 @@ from jiuwenswarm.common.utils import (
     get_agent_root_dir,
     get_config_file,
 )
+from jiuwenswarm.edition import is_enterprise
 
 logger = logging.getLogger(__name__)
 
@@ -586,9 +585,15 @@ def build_filesystem_policy(
 def build_process_policy() -> dict[str, Any]:
     """获取当前进程的有效用户名与用户组名。
 
-    使用 ``geteuid`` / ``getegid`` 解析有效身份；若 passwd/group 中无对应条目,
-    则回退为 UID/GID 的字符串形式。
+    仅企业版（Linux 容器）调用：使用 ``geteuid`` / ``getegid`` 解析有效身份；
+    若 passwd/group 中无对应条目, 则回退为 UID/GID 的字符串形式。
+    非 POSIX 平台（如 Windows 单机版）返回空 dict，调用方跳过 process 段。
     """
+    if not hasattr(os, "geteuid"):
+        return {}
+    import grp
+    import pwd
+
     uid = os.geteuid()
     gid = os.getegid()
     try:
@@ -671,7 +676,10 @@ def create_sandbox_sysop_card(
             startup_mode=startup_mode,
             shared_dir=shared_dir,
         )
-        policy['process'] = build_process_policy()
+        if is_enterprise():
+            process_policy = build_process_policy()
+            if process_policy:
+                policy['process'] = process_policy
         extra_params = {
             "policy": policy,
             "policy_mode": "append",

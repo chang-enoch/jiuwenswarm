@@ -9293,7 +9293,7 @@ class JiuWenSwarmDeepAdapter:
                     ),
                     sys_operation=sys_operation,
                     language=self._resolve_runtime_language(),
-                    auto_create_workspace=False,
+                    auto_create_workspace=is_enterprise(),
                     trajectory_span_processor=get_trajectory_span_processor(),
                 )
 
