@@ -310,6 +310,19 @@ class HttpSseAgentServerClient(AgentServerClient):
     def _is_stream_cancelled(self, rid: str) -> bool:
         return bool(rid) and rid in self._cancelled_request_ids
 
+    def _stream_scope(self, envelope: E2AEnvelope) -> tuple[str, ...] | None:
+        """Identify a stream by session so shared clients do not cross-cancel."""
+        if not envelope.session_id or not str(envelope.user_id or "").strip():
+            return None
+        return (
+            str(envelope.channel or ""),
+            str(envelope.user_id or ""),
+            str(envelope.agent_id or ""),
+            str(envelope.service_id or ""),
+            str(envelope.workspace_key or ""),
+            str(envelope.session_id or ""),
+        )
+
     def _supersede_other_streams(
         self, rid: str, scope: tuple[str, ...] | None
     ) -> None:
@@ -366,13 +379,7 @@ class HttpSseAgentServerClient(AgentServerClient):
         )
         # This client is shared across users and Runtime-routed Pods. A new
         # request must never cancel another session merely by sharing the client.
-        scope = (
-            tuple(str(value or "") for value in (
-                envelope.channel, envelope.user_id, envelope.agent_id,
-                envelope.service_id, envelope.workspace_key, envelope.session_id,
-            ))
-            if envelope.session_id and str(envelope.user_id or "").strip() else None
-        )
+        scope = self._stream_scope(envelope)
         async with self._stream_lock:
             self._supersede_other_streams(rid, scope)
             if rid:
