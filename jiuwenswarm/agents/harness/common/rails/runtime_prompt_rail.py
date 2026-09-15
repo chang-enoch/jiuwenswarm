@@ -723,13 +723,33 @@ class RuntimePromptRail(DeepAgentRail):
                     if is_cn else
                     f"| `{agent_workspace_dir}/memory` | Agent memory directory | stores persistent memory | treat as part of the Agent's memory |\n"
                 )
+            # Desktop project sessions already receive the actual directory
+            # values in the late runtime-context block below.  Keep the
+            # surrounding guidance static so a workspace change only affects
+            # that tail, and avoid repeating the same path in the policy.
+            optimize_desktop_workspace_prompt = self._channel == "desktop" and has_project
+            project_and_cwd_match = (
+                optimize_desktop_workspace_prompt
+                and self._same_path(project_dir, runtime_cwd)
+            )
 
             if is_cn:
+                working_directory_line = (
+                    "- 项目目录是你当前的工作空间。\n\n"
+                    if optimize_desktop_workspace_prompt
+                    else "- 项目目录是你当前的工作空间，"
+                    f"当前项目目录是：`{prompt_project_dir}`\n\n"
+                )
+                runtime_directory_lines = (
+                    f"- 当前项目目录与当前工作目录（cwd，也是命令工具默认执行目录）：`{project_dir}`\n"
+                    if project_and_cwd_match
+                    else f"- 当前项目目录：{project_label}\n"
+                    f"- 当前工作目录（cwd，也是命令工具默认执行目录）：`{runtime_cwd}`\n"
+                )
                 directory_content = (
                     "# 目录与运行时上下文\n\n"
                     "## 工作目录\n\n"
-                    "- 项目目录是你当前的工作空间，"
-                    f"当前项目目录是：`{prompt_project_dir}`\n\n"
+                    f"{working_directory_line}"
                     f"{important_files}\n\n"
                     "## 项目目录规则\n\n"
                     "- 用户任务中的相对路径必须相对于当前项目目录路径去解析。\n"
@@ -758,17 +778,27 @@ class RuntimePromptRail(DeepAgentRail):
                     "- 小艺 work 启动配置目录不得用于保存普通任务产物。\n"
                     "- 用户任务中的 `config/`、`memory/`、`skills/`、`todo/` 或 `workspace/` 不自动映射到 小艺 work 内部目录。\n\n"
                     "## 运行时目录上下文\n\n"
-                    f"- 当前项目目录：{project_label}\n"
-                    f"- 当前工作目录（cwd，也是命令工具默认执行目录）：`{runtime_cwd}`\n"
+                    f"{runtime_directory_lines}"
                     f"- Agent 内部数据目录：`{agent_workspace_dir}`\n"
                     f"- 小艺 work 启动配置目录：`{config_dir}`"
                 )
             else:
+                working_directory_line = (
+                    "- The project directory is your current workspace.\n\n"
+                    if optimize_desktop_workspace_prompt
+                    else "- The project directory is your current workspace; "
+                    f"the current project directory is: `{prompt_project_dir}`\n\n"
+                )
+                runtime_directory_lines = (
+                    f"- Current project directory and working directory (cwd, also the default command-tool execution directory): `{project_dir}`\n"
+                    if project_and_cwd_match
+                    else f"- Current project directory: {project_label}\n"
+                    f"- Current working directory (cwd, also the default command-tool execution directory): `{runtime_cwd}`\n"
+                )
                 directory_content = (
                     "# Directory and Runtime Context\n\n"
                     "## Working Directory\n\n"
-                    "- The project directory is your current workspace; "
-                    f"the current project directory is: `{prompt_project_dir}`\n\n"
+                    f"{working_directory_line}"
                     f"{important_files}\n\n"
                     "## Project Directory Rules\n\n"
                     "- Resolve relative paths in user tasks against the current project directory.\n"
@@ -808,8 +838,7 @@ class RuntimePromptRail(DeepAgentRail):
                     "- `config/`, `memory/`, `skills/`, `todo/`, or `workspace/` in a user task do not "
                     "automatically refer to 小艺 work internal directories.\n\n"
                     "## Runtime Directory Context\n\n"
-                    f"- Current project directory: {project_label}\n"
-                    f"- Current working directory (cwd, also the default command-tool execution directory): `{runtime_cwd}`\n"
+                    f"{runtime_directory_lines}"
                     f"- Agent internal data directory: `{agent_workspace_dir}`\n"
                     f"- 小艺 work startup configuration directory: `{config_dir}`"
                 )
@@ -849,6 +878,26 @@ class RuntimePromptRail(DeepAgentRail):
                         "\n\n## Other Authorized Directories\n\n"
                         f"- Other readable and writable directories that are not the current project: {trusted_dirs_display}\n"
                         "- Ask the user before operating outside the current project and these authorized directories."
+                    )
+            # Desktop used to append this policy to every user message. Keep the
+            # same user-visible behavior, but place it in the per-request
+            # runtime tail so it is represented once in system context rather
+            # than copied into history and memory wrappers on every turn.
+            if self._channel == "desktop" and has_project:
+                if is_cn:
+                    directory_content += (
+                        "\n\n## 小艺 Work 工作空间约束\n\n"
+                        "- 上述当前项目目录即用户工作空间。\n"
+                        "- 除非用户明确指定其他位置，否则所有新建、修改和写入的用户任务产物必须落在该目录下；"
+                        "用户任务中的相对路径可相对此目录解析。"
+                    )
+                else:
+                    directory_content += (
+                        "\n\n## XiaoYi Work Workspace Policy\n\n"
+                        "- The current project directory above is the user's workspace.\n"
+                        "- Unless the user explicitly specifies another location, all newly created, modified, "
+                        "or written user-task deliverables must be placed in this directory; relative paths in "
+                        "user tasks may be resolved from it."
                     )
             self.system_prompt_builder.add_section(PromptSection(
                 name="directory_boundaries",
