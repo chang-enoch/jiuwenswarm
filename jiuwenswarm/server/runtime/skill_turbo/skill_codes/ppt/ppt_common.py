@@ -196,6 +196,10 @@ _PHASE1_DEFAULTS: dict[str, Any] = {
     "images_extracted": False,
     "parse_degraded": False,
     "page_count_user_specified": False,
+    # pptx-craft §1.2：default 用默认首尾；explicit_sequence 以清单为准
+    "page_structure_mode": "default",
+    # pptx-craft §1.2/1.4：仅明确否定首尾时为 true；沉默不推断
+    "exclude_cover_ending": False,
     "content_branch": "",
     "thinking_strategy": "accelerated",  # P6/P8 DisableThinkingMixin 节点强制 thinking=off
     "presentation_paths": [],
@@ -751,9 +755,11 @@ class PptCommon:
         outline_pages: dict[int, str] | None = None,
         default_structural_pages: int = 2,
     ) -> int:
-        """从 outline 页码、上下文 total_pages 与 page_count 兜底推算总页数。
+        """推算总页数：大纲最大页码 / 已归一 total_pages 为权威。
 
-        含 agenda 等额外结构页时，``page_count + 2`` 会低估总页数；优先取 outline 最大页码。
+        对齐 pptx-craft：主控与 outline 写准的总页不得再被 ``page_count+2`` 抬高
+        （exclude_cover_ending 时 total==page_count，旧 max(+2) 会把 2 页抬成 4）。
+        仅当二者皆缺时，才用 ``page_count + default_structural_pages`` 作缺省壳页兜底。
         """
         candidates: list[int] = []
         if total_pages is not None:
@@ -772,9 +778,11 @@ class PptCommon:
             ]
             if page_nums:
                 candidates.append(max(page_nums))
+        if candidates:
+            return max(candidates)
         if page_count > 0:
-            candidates.append(page_count + default_structural_pages)
-        return max(candidates) if candidates else 0
+            return page_count + default_structural_pages
+        return 0
 
     @staticmethod
     def default_mid_structural_pages(page_count: int) -> int:
