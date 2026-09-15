@@ -143,7 +143,7 @@ class HttpSseAgentServerClient(AgentServerClient):
         self._push_handlers: set[asyncio.Task[None]] = set()
         self._stream_lock = asyncio.Lock()
         self._cancelled_request_ids: set[str] = set()
-        self._inflight_stream_ids: set[str] = set()
+        self._inflight_stream_ids: dict[str, tuple[str, ...] | None] = {}
         self._link_mtls = link_mtls_config
 
     def _link_config(self) -> LinkMTLSConfig:
@@ -310,10 +310,14 @@ class HttpSseAgentServerClient(AgentServerClient):
     def _is_stream_cancelled(self, rid: str) -> bool:
         return bool(rid) and rid in self._cancelled_request_ids
 
-    def _supersede_other_streams(self, rid: str) -> None:
-        """新流开始时标记其它 in-flight rid，旧 SSE 残余不再 yield。"""
-        for other in list(self._inflight_stream_ids):
-            if other and other != rid:
+    def _supersede_other_streams(
+        self, rid: str, scope: tuple[str, ...] | None
+    ) -> None:
+        """Only supersede streams belonging to the same identified session."""
+        if scope is None:
+            return
+        for other, other_scope in list(self._inflight_stream_ids.items()):
+            if other and other != rid and other_scope == scope:
                 self._cancelled_request_ids.add(other)
                 asyncio.create_task(self._delayed_cleanup_cancelled_request_id(other))
 
@@ -323,7 +327,7 @@ class HttpSseAgentServerClient(AgentServerClient):
         async with self._stream_lock:
             already = rid in self._cancelled_request_ids
             self._cancelled_request_ids.add(rid)
-            self._inflight_stream_ids.discard(rid)
+            self._inflight_stream_ids.pop(rid, None)
         if not already:
             asyncio.create_task(self._delayed_cleanup_cancelled_request_id(rid))
 
@@ -360,10 +364,19 @@ class HttpSseAgentServerClient(AgentServerClient):
             assembled.url,
             assembled.used_rpc_fallback,
         )
+        # This client is shared across users and Runtime-routed Pods. A new
+        # request must never cancel another session merely by sharing the client.
+        scope = (
+            tuple(str(value or "") for value in (
+                envelope.channel, envelope.user_id, envelope.agent_id,
+                envelope.service_id, envelope.workspace_key, envelope.session_id,
+            ))
+            if envelope.session_id and str(envelope.user_id or "").strip() else None
+        )
         async with self._stream_lock:
-            self._supersede_other_streams(rid)
+            self._supersede_other_streams(rid, scope)
             if rid:
-                self._inflight_stream_ids.add(rid)
+                self._inflight_stream_ids[rid] = scope
         timeout = httpx.Timeout(None, connect=_CONNECT_TIMEOUT_SECONDS)
         try:
             async with http.stream(
