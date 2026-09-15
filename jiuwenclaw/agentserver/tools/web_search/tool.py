@@ -15,6 +15,7 @@ from jiuwenclaw.agentserver.tools.web_search.orchestrator import (
     run_web_search,
 )
 from jiuwenclaw.agentserver.tools.web_search.constants import KNOWN_PAID_PROVIDERS
+from jiuwenclaw.agentserver.permissions.security_guard import check_blacklist_url
 logger = logging.getLogger(__name__)
 
 _WEB_SEARCH_HARNESS_METADATA_REGISTERED = False
@@ -93,6 +94,12 @@ async def web_search_impl(
     if not query:
         logger.warning("[web_search] invoke rejected: empty query")
         return "[ERROR]: query cannot be empty."
+
+    # ── Blacklist guard: block searches containing blacklisted URLs ──
+    bl_reason = await check_blacklist_url(query)
+    if bl_reason:
+        logger.info("[web_search] query blocked by blacklist guard")
+        return "[ERROR]: 搜索内容命中脱敏黑名单，禁止搜索。"
 
     mode, extracted_source = normalize_search_mode(search_mode)
     if not is_valid_search_mode(mode):

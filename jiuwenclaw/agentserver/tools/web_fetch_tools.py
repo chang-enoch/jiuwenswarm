@@ -18,6 +18,7 @@ from openjiuwen.core.foundation.tool import ToolCard, tool
 from jiuwenclaw.http_proxy_config import requests_get
 from jiuwenclaw.agentserver.tools.ssl_config import get_requests_verify
 from jiuwenclaw.local_env_config import get_local_config
+from jiuwenclaw.agentserver.permissions.security_guard import check_blacklist_url
 
 logger = logging.getLogger(__name__)
 
@@ -702,6 +703,19 @@ async def _fetch_single_url(
             "provider": "",
             "from_cache": False,
             "error": "url cannot be empty.",
+        }
+
+    # ── Blacklist guard (fuzzy URL match) ──
+    bl_reason = await check_blacklist_url(url)
+    if bl_reason:
+        return {
+            "url": url,
+            "status_code": 403,
+            "title": "",
+            "content": "",
+            "provider": "",
+            "from_cache": False,
+            "error": "URL命中脱敏黑名单，禁止访问",
         }
 
     if cache is not None and use_cache:

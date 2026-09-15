@@ -45,6 +45,7 @@ from jiuwenclaw.agentserver.permissions.security_guard import (
     check_kia_file,
     detect_rms_file,
     extract_file_path_from_tool_args,
+    check_blacklist_file,
 )
 from jiuwenclaw.agentserver.permissions.shell_tools import is_shell_permission_tool
 from jiuwenclaw.agentserver.permissions.tiered_policy import (
@@ -425,8 +426,15 @@ class PermissionEngine:
                             if isinstance(p, str) and p.strip():
                                 file_paths_to_check.append(p.strip())
 
-            # Check each path: KIA first, then RMS
+            # Check each path: blacklist first (fast string match), then KIA, then RMS
             for file_path in file_paths_to_check:
+                # ── Blacklist guard (fuzzy filename match) ──
+                bl_reason = await check_blacklist_file(file_path)
+                if bl_reason:
+                    permission = PermissionLevel.DENY
+                    matched_rule = "security_guard:blacklist"
+                    break  # Stop checking on first DENY
+
                 # KIA: ICPM path-based check (degrade-to-allow on error)
                 try:
                     if await check_kia_file(file_path):
@@ -511,6 +519,8 @@ class PermissionEngine:
                 return "文件包含涉密内容(KIA)，禁止读取"
             if matched_rule == "security_guard:rms":
                 return "文件为RMS加密文档，禁止读取"
+            if matched_rule == "security_guard:blacklist":
+                return "文件命中脱敏黑名单，禁止读取"
             builtin_reason = PermissionEngine._format_builtin_deny_reason(matched_rule)
             if builtin_reason is not None:
                 return builtin_reason

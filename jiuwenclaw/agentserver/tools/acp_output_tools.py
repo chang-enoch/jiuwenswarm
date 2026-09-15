@@ -265,6 +265,7 @@ class AcpOutputError(Exception):
 from jiuwenclaw.agentserver.permissions.security_guard import (
     detect_rms_file as _detect_rms_file,
     check_kia_file as _check_kia_file,
+    check_blacklist_file as _check_blacklist_file,
 )
 
 
@@ -276,7 +277,15 @@ async def read_text_file(
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """读取文件内容。"""
-    # ── Security gate: KIA + RMS check before file content reaches LLM ──
+    # ── Security gate: blacklist + KIA + RMS before file content reaches LLM ──
+    # Layer 0: Desensitive blacklist (fuzzy filename match)
+    bl_reason = await _check_blacklist_file(path)
+    if bl_reason:
+        raise AcpOutputError(
+            method="fs/read_text_file",
+            code=-32003,
+            message="文件命中脱敏黑名单，禁止读取",
+        )
     # Layer 1: KIA classification check via ICPM
     if await _check_kia_file(path):
         raise AcpOutputError(
