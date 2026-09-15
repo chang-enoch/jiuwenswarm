@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -36,6 +37,18 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _PUSH_RETRY_SECONDS = 3.0
 # 与 WebSocketAgentServerClient._delayed_cleanup_cancelled_request_id 对齐。
 _CANCELLED_RID_TTL_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class _StreamScope:
+    """Session identity used to decide whether a new stream may supersede another."""
+
+    channel: str
+    user_id: str
+    agent_id: str
+    service_id: str
+    workspace_key: str
+    session_id: str
 
 
 def http_unary_to_agent_response(
@@ -143,7 +156,7 @@ class HttpSseAgentServerClient(AgentServerClient):
         self._push_handlers: set[asyncio.Task[None]] = set()
         self._stream_lock = asyncio.Lock()
         self._cancelled_request_ids: set[str] = set()
-        self._inflight_stream_ids: dict[str, tuple[str, ...] | None] = {}
+        self._inflight_stream_ids: dict[str, _StreamScope | None] = {}
         self._link_mtls = link_mtls_config
 
     def _link_config(self) -> LinkMTLSConfig:
@@ -310,21 +323,21 @@ class HttpSseAgentServerClient(AgentServerClient):
     def _is_stream_cancelled(self, rid: str) -> bool:
         return bool(rid) and rid in self._cancelled_request_ids
 
-    def _stream_scope(self, envelope: E2AEnvelope) -> tuple[str, ...] | None:
+    def _stream_scope(self, envelope: E2AEnvelope) -> _StreamScope | None:
         """Identify a stream by session so shared clients do not cross-cancel."""
         if not envelope.session_id or not str(envelope.user_id or "").strip():
             return None
-        return (
-            str(envelope.channel or ""),
-            str(envelope.user_id or ""),
-            str(envelope.agent_id or ""),
-            str(envelope.service_id or ""),
-            str(envelope.workspace_key or ""),
-            str(envelope.session_id or ""),
+        return _StreamScope(
+            channel=str(envelope.channel or ""),
+            user_id=str(envelope.user_id or ""),
+            agent_id=str(envelope.agent_id or ""),
+            service_id=str(envelope.service_id or ""),
+            workspace_key=str(envelope.workspace_key or ""),
+            session_id=str(envelope.session_id or ""),
         )
 
     def _supersede_other_streams(
-        self, rid: str, scope: tuple[str, ...] | None
+        self, rid: str, scope: _StreamScope | None
     ) -> None:
         """Only supersede streams belonging to the same identified session."""
         if scope is None:
