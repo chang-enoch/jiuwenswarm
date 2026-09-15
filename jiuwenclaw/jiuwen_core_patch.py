@@ -1033,12 +1033,20 @@ class PatchOpenAIModelClient(RetryMixin, OpenAIModelClient):
             )
             parsed_default_headers = None
         # Main MaaS chat uses placeholder api_key + relay-claw Basic headers in default_headers.
-        # Image/other clients use real api_key and Bearer from the SDK only.
-        client_default_headers = (
-            parsed_default_headers
-            if self.model_client_config.api_key == _HUAWEI_MAAS_SESSION_API_KEY
-            else None
-        )
+        # User-supplied models: inject custom headers but strip Authorization so the
+        # SDK's Bearer (from api_key) wins — matches /api/maas-test-connection behavior
+        # where managed Authorization is applied last to prevent override.
+        if self.model_client_config.api_key == _HUAWEI_MAAS_SESSION_API_KEY:
+            client_default_headers = parsed_default_headers
+        else:
+            client_default_headers = dict(parsed_default_headers or {})
+            for key in list(client_default_headers.keys()):
+                if key.lower() == "authorization":
+                    llm_logger.info(
+                        "Stripping Authorization from default_headers for "
+                        "user-supplied model (api_key-based Bearer will be used instead)"
+                    )
+                    client_default_headers.pop(key, None)
         return AsyncOpenAI(
             api_key=self.model_client_config.api_key,
             base_url=self.model_client_config.api_base,

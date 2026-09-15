@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from openjiuwen.core.session.stream import OutputSchema
 
 from jiuwenclaw.jiuwen_core_patch import (
     APIG_MODE_DEBUG_VALUE,
@@ -61,7 +60,72 @@ def test_invalid_default_headers_non_maas_still_creates_client(
 
     client = _make_client(api_key="sk-real")
     getattr(client, "_create_async_openai_client")()
-    assert patched_openai_client.get("default_headers") is None
+    # Broken headers degrade to empty dict (no custom headers injected);
+    # SDK generates Bearer from api_key as usual.
+    assert patched_openai_client.get("default_headers") == {}
+
+
+def test_non_maas_injects_custom_headers(monkeypatch, patched_openai_client):
+    """User-supplied model: custom headers (e.g. X-HW-ID) are injected."""
+    monkeypatch.setattr(
+        "jiuwenclaw.jiuwen_core_patch.read_default_headers",
+        lambda: {"X-HW-ID": "test-user", "X-My-Custom": "hello"},
+    )
+
+    client = _make_client(api_key="sk-real")
+    getattr(client, "_create_async_openai_client")()
+    assert patched_openai_client.get("default_headers") == {
+        "X-HW-ID": "test-user",
+        "X-My-Custom": "hello",
+    }
+
+
+def test_non_maas_strips_authorization_from_custom_headers(
+    monkeypatch, patched_openai_client
+):
+    """User-supplied model: Authorization in custom headers is stripped so
+    SDK's Bearer (from api_key) wins — matches /api/maas-test-connection behavior."""
+    monkeypatch.setattr(
+        "jiuwenclaw.jiuwen_core_patch.read_default_headers",
+        lambda: {"Authorization": "Basic dXNlcjpwYXNz", "X-HW-ID": "test-user"},
+    )
+
+    client = _make_client(api_key="sk-real")
+    getattr(client, "_create_async_openai_client")()
+    assert "Authorization" not in patched_openai_client.get("default_headers", {})
+    assert patched_openai_client.get("default_headers") == {"X-HW-ID": "test-user"}
+
+
+def test_non_maas_no_default_headers_yields_empty_dict(
+    monkeypatch, patched_openai_client
+):
+    """User-supplied model: no default_headers configured → empty dict (not None)."""
+    monkeypatch.setattr(
+        "jiuwenclaw.jiuwen_core_patch.read_default_headers",
+        lambda: None,
+    )
+
+    client = _make_client(api_key="sk-real")
+    getattr(client, "_create_async_openai_client")()
+    assert patched_openai_client.get("default_headers") == {}
+
+
+def test_maas_session_key_preserves_authorization_in_default_headers(
+    monkeypatch, patched_openai_client
+):
+    """Huawei MaaS preset model: default_headers passed through verbatim,
+    including Authorization (relay-claw Basic auth)."""
+    monkeypatch.setattr(
+        "jiuwenclaw.jiuwen_core_patch.read_default_headers",
+        lambda: {"Authorization": "Basic dXNlcjpwYXNz", "X-HW-ID": "maas"},
+    )
+
+    client = _make_client(api_key=HUAWEI_MAAS_SESSION_API_KEY)
+    getattr(client, "_create_async_openai_client")()
+    assert patched_openai_client.get("default_headers") == {
+        "Authorization": "Basic dXNlcjpwYXNz",
+        "X-HW-ID": "maas",
+    }
 
 
 def test_invalid_default_headers_maas_degrades_to_none(
@@ -117,6 +181,8 @@ def test_extract_maas_apig_headers_returns_raw_values_and_empty_defaults():
 
 
 def test_llm_usage_stream_payload_injects_maas_apig_metadata():
+    from openjiuwen.core.session.stream import OutputSchema
+
     token = set_maas_apig_headers_for_call({
         APIG_RATELIMIT_APP_HEADER: "remain:9,limit:10,time:10 second",
         RETRY_AFTER_HEADER: "",
