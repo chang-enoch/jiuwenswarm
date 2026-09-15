@@ -6848,6 +6848,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         workspace: str | None = None
         project_dir: str | None = None
         supports_user_interaction: bool = True
+        user_message_context: dict[str, Any] | None = None
 
     async def configure_session_runtime(
         self,
@@ -6978,6 +6979,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             self._runtime_prompt_rail.set_model_name(self._resolve_model_name())
             self._runtime_prompt_rail.set_mode(runtime_config.mode)
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
+            # user_message_context 仅在 bind_request 时透传；session-stable 配置
+            # 不应携带每请求的 source/timestamp/skills_to_use 等字段。
+            self._runtime_prompt_rail.set_user_message_context(
+                runtime_config.user_message_context if bind_request else None
+            )
         if self._identity_rail:
             self._identity_rail.set_language(resolved_language)
             # 显式指定 IDENTITY.md 读取路径为全局 agent workspace（跨会话稳定），
@@ -9463,6 +9469,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
             inputs = dict(inputs)
@@ -9821,6 +9828,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
 
@@ -10072,6 +10080,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
             if self._stream_event_rail is not None:

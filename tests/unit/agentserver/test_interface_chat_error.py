@@ -78,7 +78,12 @@ def _patch_facade(
     monkeypatch.setattr(interface_module, "get_memory_mode", lambda _cfg: "off")
     # Bypass the user prompt builder; the test only cares about the error
     # aggregator after the inner stream raises.
-    monkeypatch.setattr(interface_module, "build_user_prompt", lambda q, **_kw: q)
+    monkeypatch.setattr(interface_module, "build_user_prompt", lambda q, **_kw: interface_module.BuiltUserPrompt(
+        user_query=q if isinstance(q, str) else str(q),
+        context={},
+        interaction_prefix="",
+        statusline_directive="",
+    ))
 
 
 @pytest.mark.asyncio
@@ -161,7 +166,12 @@ async def test_chat_error_history_record_persists_error_type_at_top_level(
     monkeypatch.setattr(session_metadata, "get_agent_sessions_dir", lambda: sessions_root)
     monkeypatch.setattr(interface_module, "get_config", lambda: {"preferred_language": "zh"})
     monkeypatch.setattr(interface_module, "get_memory_mode", lambda _cfg: "off")
-    monkeypatch.setattr(interface_module, "build_user_prompt", lambda q, **_kw: q)
+    monkeypatch.setattr(interface_module, "build_user_prompt", lambda q, **_kw: interface_module.BuiltUserPrompt(
+        user_query=q if isinstance(q, str) else str(q),
+        context={},
+        interaction_prefix="",
+        statusline_directive="",
+    ))
 
     sid = "tempsess1"
     request = AgentRequest(

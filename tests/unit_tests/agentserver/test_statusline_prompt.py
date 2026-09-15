@@ -18,8 +18,6 @@ involved.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from jiuwenswarm.server.runtime.agent_adapter.interface import (
@@ -29,27 +27,6 @@ from jiuwenswarm.server.runtime.agent_adapter.interface import (
     _handle_statusline_prompt_command,
     build_user_prompt,
 )
-
-
-def _extract_json_from_prompt(prompt: str) -> dict:
-    """Extract the first JSON object from a build_user_prompt result.
-
-    The prompt format is:
-      prefix_text + JSON_string + [optional statusline-setup
-      prompt suffix] The JSON ends at the closing brace before
-      the suffix.
-    """
-    json_start = prompt.index("{")
-    brace_depth = 0
-    for i in range(json_start, len(prompt)):
-        if prompt[i] == "{":
-            brace_depth += 1
-        elif prompt[i] == "}":
-            brace_depth -= 1
-            if brace_depth == 0:
-                json_str = prompt[json_start:i + 1]
-                return json.loads(json_str)
-    raise ValueError("No complete JSON object found in prompt")
 
 
 # ── _STATUSLINE_PROMPT_REGEX ────────────────────────────────────
@@ -292,142 +269,142 @@ class TestBuildUserPromptStatusline:
     @staticmethod
     def test_statusline_prompt_injects_setup_instructions_zh():
         """Chinese /statusline prompt should have instructions injected."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline 展示模型名称和token数量",
             files={},
             channel="tui",
             language="zh",
         )
-        # statusline-setup instructions should be present
-        assert "status line setup agent" in prompt
-        assert "jq" in prompt
-        assert "config.json" in prompt
+        # statusline-setup instructions should be present in statusline_directive
+        assert "status line setup agent" in built.statusline_directive
+        assert "jq" in built.statusline_directive
+        assert "config.json" in built.statusline_directive
         # The instruction suffix in Chinese
-        assert "你必须按照以下指令配置状态栏" in prompt
-        # The user's description should be in the prompt content
-        prompt_data = _extract_json_from_prompt(prompt)
-        assert "展示模型名称和token数量" in prompt_data.get(
-            "content", ""
-        )
-        # The /statusline prefix should be stripped from content
-        assert "/statusline" not in prompt_data.get("content", "")
+        assert "你必须按照以下指令配置状态栏" in built.statusline_directive
+        # The user's description should be in user_query (statusline prefix stripped)
+        assert "展示模型名称和token数量" in built.user_query
+        assert "/statusline" not in built.user_query
 
     @staticmethod
     def test_statusline_prompt_injects_setup_instructions_en():
         """English /statusline prompt should have instructions injected."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline show model and tokens",
             files={},
             channel="tui",
             language="en",
         )
-        assert "status line setup agent" in prompt
-        assert "jq" in prompt
+        assert "status line setup agent" in built.statusline_directive
+        assert "jq" in built.statusline_directive
         assert (
             "You must follow these instructions "
-            "to configure the status line" in prompt
+            "to configure the status line" in built.statusline_directive
         )
-        prompt_data = _extract_json_from_prompt(prompt)
-        assert "show model and tokens" in prompt_data.get(
-            "content", ""
-        )
+        assert "show model and tokens" in built.user_query
 
     @staticmethod
     def test_normal_message_no_injection():
         """Normal messages (not /statusline) should NOT have any injection."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "你好，帮我写个脚本",
             files={},
             channel="tui",
             language="zh",
         )
-        assert "status line setup agent" not in prompt
-        assert "状态栏" not in prompt
-        assert "你必须按照" not in prompt
+        assert "status line setup agent" not in built.statusline_directive
+        assert "状态栏" not in built.statusline_directive
+        assert "你必须按照" not in built.statusline_directive
+        assert built.user_query == "你好，帮我写个脚本"
+        assert built.statusline_directive == ""
 
     @staticmethod
     def test_skills_use_command_no_statusline_conflict():
         """'/skills use' should be handled by its own handler."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/skills use script-creator, show tokens",
             files={},
             channel="tui",
             language="zh",
         )
         # Should NOT inject statusline-setup prompt
-        assert "status line setup agent" not in prompt
+        assert "status line setup agent" not in built.statusline_directive
         # Content should contain the query part
-        assert "show tokens" in prompt
+        assert "show tokens" in built.user_query
 
     @staticmethod
     def test_statusline_set_subcommand_not_injected():
         """'/statusline set' is a known subcommand → no injection."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline set 'echo $mode'",
             files={},
             channel="tui",
             language="zh",
         )
-        assert "你必须按照以下指令配置状态栏" not in prompt
-        assert "status line setup agent" not in prompt
-        prompt_data = _extract_json_from_prompt(prompt)
-        assert prompt_data.get("content") == "/statusline set 'echo $mode'"
+        assert "你必须按照以下指令配置状态栏" not in built.statusline_directive
+        assert "status line setup agent" not in built.statusline_directive
+        # /statusline set is a known subcommand → user_query keeps the raw text
+        assert built.user_query == "/statusline set 'echo $mode'"
 
     @staticmethod
     def test_statusline_preserves_other_prompt_features():
-        """build_user_prompt should still include timestamp, channel, etc."""
-        prompt = build_user_prompt(
+        """build_user_prompt should still include channel, timezone, etc."""
+        built = build_user_prompt(
             "/statusline show git branch",
             files={},
             channel="tui",
             language="en",
         )
-        prompt_data = _extract_json_from_prompt(prompt)
-        assert prompt_data.get("source") == "tui"
-        assert prompt_data.get("timezone") == "Asia/Shanghai"
-        assert prompt_data.get("type") == "user input"
-        assert "timestamp" in prompt_data
+        ctx = built.context
+        assert ctx.get("source") == "tui"
+        assert ctx.get("timezone") == "Asia/Shanghai"
+        assert ctx.get("type") == "user input"
+        # timestamp 已移除——runtime.setting section 渲染时间
+        assert "timestamp" not in ctx
 
     @staticmethod
     def test_statusline_with_files_and_trusted_dirs():
         """/statusline prompt with files and trusted_dirs should work."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline show model",
             files={"test.py": "content"},
             channel="tui",
             language="zh",
             trusted_dirs=["/home/user/project"],
         )
-        assert "status line setup agent" in prompt
-        prompt_data = _extract_json_from_prompt(prompt)
-        assert prompt_data.get("trusted_dirs") is not None
+        assert "status line setup agent" in built.statusline_directive
+        assert built.context.get("trusted_dirs") is not None
 
     @staticmethod
     def test_cron_channel_prompt_injected():
         """/statusline should work even in cron channel."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline show something",
             files={},
             channel="cron",
             language="zh",
         )
-        assert "status line setup agent" in prompt
+        assert "status line setup agent" in built.statusline_directive
+        # cron 渠道：source/type 改为 system/cron，并带 cron_output_hint 标记
+        assert built.context.get("source") == "system"
+        assert built.context.get("type") == "cron"
+        assert built.context.get("cron_output_hint") is True
 
     @staticmethod
     def test_no_skill_file_dependency():
         """Injection from hardcoded string, not SKILL.md — aligned with Claude Code."""
-        prompt = build_user_prompt(
+        built = build_user_prompt(
             "/statusline show model",
             files={},
             channel="tui",
             language="en",
         )
         # Should NOT reference skill files or skill-loading mechanisms
-        assert "[Skill:" not in prompt
-        assert "SkillUseRail" not in prompt
-        assert "SKILL.md" not in prompt
+        combined = built.user_query + built.statusline_directive
+        assert "[Skill:" not in combined
+        assert "SkillUseRail" not in combined
+        assert "SKILL.md" not in combined
         # Should use the hardcoded prompt text
-        assert _STATUSLINE_SETUP_PROMPT in prompt
+        assert _STATUSLINE_SETUP_PROMPT in built.statusline_directive
 
 
 # ── Known subcommands constant ──────────────────────────────────
