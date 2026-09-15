@@ -7372,22 +7372,17 @@ class JiuWenSwarmDeepAdapter:
         trajectory_export_path = str(ttse_cfg.get("trajectory_export_path") or "").strip()
         apply_config = getattr(rail, "apply_runtime_config", None)
         if callable(apply_config):
+            # Older agent-core apply_runtime_config only accepts store/evolve/inject.
+            # Trajectory export flags are synced via _ttse_config below.
             apply_config(
                 store_path=store_path,
                 evolve_enabled=evolve_enabled,
                 inject_enabled=inject_enabled,
-                trajectory_export_enabled=trajectory_export_enabled,
-                trajectory_export_path=trajectory_export_path,
             )
         cfg_obj = getattr(rail, "_ttse_config", None)
         if cfg_obj is not None:
             cfg_obj.trajectory_export_enabled = trajectory_export_enabled
             cfg_obj.trajectory_export_path = trajectory_export_path
-            if not callable(apply_config):
-                logger.debug(
-                    "[JiuWenSwarmDeepAdapter] TTSERail.apply_runtime_config unavailable; "
-                    "synced trajectory export via private _ttse_config"
-                )
         else:
             logger.debug(
                 "[JiuWenSwarmDeepAdapter] TTSERail._ttse_config missing; "
