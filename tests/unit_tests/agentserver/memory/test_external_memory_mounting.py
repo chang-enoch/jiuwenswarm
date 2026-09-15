@@ -56,12 +56,12 @@ def celia(request, monkeypatch):
     if not request.param:
         return None
     server = build_mcp_server_config({
-        "name": "celiamcp", "server_id": "test-celia",
+        "name": "celia-memory", "server_id": "test-celia",
         "transport": "stdio", "command": "test-celia-mcp",
     })
     assert server is not None
     schema = {"type": "object", "properties": {"query": {"type": "string"}, "backendOption": {"type": "string"}}, "required": ["query"]}
-    card = McpToolCard(id="test-celia.celiamcp.memory_record_search", name="memory_record_search", server_name=server.server_name, server_id=server.server_id, input_params=schema)
+    card = McpToolCard(id="test-celia.celia-memory.celia.memory_record_search", name="celia.memory_record_search", server_name=server.server_name, server_id=server.server_id, input_params=schema)
     call = AsyncMock(return_value="memory result")
     tool = MCPTool(SimpleNamespace(call_tool=call), card)
     monkeypatch.setattr(Runner.resource_mgr, "get_mcp_tool_infos", AsyncMock(side_effect=lambda **kwargs: [card.tool_info()]))
@@ -110,9 +110,9 @@ def _assert_model_received_celia_prompt(request, celia):
     tools = {tool.name: tool for tool in request["tools"] or []}
     assert not any(name.startswith("memory_") for name in tools)
     if celia is None:
-        assert not any(name.startswith("mcp_celiamcp_") for name in tools)
+        assert not any(name.startswith("mcp_celia-memory_celia.memory_") for name in tools)
     else:
-        assert tools["mcp_celiamcp_memory_record_search"].parameters == celia.schema
+        assert tools["mcp_celia-memory_celia.memory_record_search"].parameters == celia.schema
 
 
 @pytest.mark.asyncio
@@ -169,10 +169,10 @@ async def test_code_and_design_mode_switches_preserve_one_memory_rail_and_can_di
     adapter._parent_session_id = "conversation-code"
     adapter._external_memory_rail = None
     adapter._external_memory_rail_registered = False
-    # Unrelated code rails are already mounted; use the real memory lifecycle.
+    # Unrelated code rails are already mounted; legacy memory is disabled.
     adapter._subagent_rail = object()
-    adapter._project_memory_rail = object()
-    adapter._coding_memory_rail = object()
+    adapter._project_memory_rail = None
+    adapter._coding_memory_rail = None
     mounted = None
     try:
         for mode in ("code.normal", "code.plan", "design", "design.normal", "design.plan", "code.normal"):
@@ -232,15 +232,15 @@ async def test_celia_call_uses_existing_executor_and_survives_prompt_unmount(cel
     agent = _agent("celia-call", celia)
     rail = CeliaMcpPromptRail()
     responses = iter([
-        AssistantMessage(content="", tool_calls=[ToolCall(id="call-1", type="function", name="mcp_celiamcp_memory_record_search", arguments='{"query":"travel","backendOption":"new"}')]),
+        AssistantMessage(content="", tool_calls=[ToolCall(id="call-1", type="function", name="mcp_celia-memory_celia.memory_record_search", arguments='{"query":"travel","backendOption":"new"}')]),
         AssistantMessage(content="OK"),
     ])
     agent._react_agent.set_llm(SimpleNamespace(invoke=AsyncMock(side_effect=lambda **kwargs: next(responses))))
     await agent.register_rail(rail)
     try:
         await agent.invoke({"query": "Recall my preference", "conversation_id": "celia-call"})
-        celia.call.assert_awaited_once_with(tool_name="memory_record_search", arguments={"query": "travel", "backendOption": "new"})
+        celia.call.assert_awaited_once_with(tool_name="celia.memory_record_search", arguments={"query": "travel", "backendOption": "new"})
     finally:
         await agent.unregister_rail(rail)
-    assert agent.ability_manager.get("celiamcp") is celia.server
+    assert agent.ability_manager.get("celia-memory") is celia.server
     assert "memory result" in str(await celia.tool.invoke({"query": "again"}))

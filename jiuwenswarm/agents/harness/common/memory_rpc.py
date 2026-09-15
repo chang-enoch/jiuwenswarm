@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from jiuwenswarm.agents.harness.common.memory import (
@@ -18,8 +18,11 @@ from jiuwenswarm.agents.harness.common.memory.config import (
 )
 from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
     get_memory_engine,
-    is_external_memory_allowed,
     get_external_memory_config,
+    get_celia_database_path,
+    is_builtin_memory_enabled,
+    is_external_memory_enabled,
+    is_legacy_workspace_memory_enabled,
 )
 from jiuwenswarm.agents.harness.common.rails.project_memory import (
     clear_project_memory_cache,
@@ -243,6 +246,9 @@ async def handle_memory_list(
     mode: str,
     params: dict[str, Any],
 ) -> dict[str, Any]:
+    config = get_config()
+    if not (is_legacy_workspace_memory_enabled(config) or is_builtin_memory_enabled("code", config)):
+        return {"files": [], "mode": mode}
     include_project = params.get("include_project", True)
     additional_dirs = params.get("additional_directories")
     project_dir = params.get("project_dir")
@@ -273,7 +279,9 @@ async def handle_memory_list(
     # Auto-memory: unified with coding memory directory
     # Scan coding memory directory (auto-memory files are also stored there)
     coding_dir = _get_coding_memory_dir(workspace, project_dir)
-    for item in _scan_md_files(coding_dir, "coding", workspace, project_dir):
+    coding_files = (_scan_md_files(coding_dir, "coding", workspace, project_dir)
+                    if is_builtin_memory_enabled("code", config) else [])
+    for item in coding_files:
         if item["path"] not in seen_paths:
             files.append(item)
             seen_paths.add(item["path"])
@@ -286,6 +294,10 @@ async def handle_memory_edit(
     params: dict[str, Any],
 ) -> dict[str, Any]:
     raw_path = params.get("path", "")
+    config = get_config()
+    if not (is_legacy_workspace_memory_enabled(config) or is_builtin_memory_enabled("code", config)):
+        return {"path": raw_path, "exists": False, "content_preview": "",
+                "kind": "unknown", "editable": False, "reason": "Legacy file memory is disabled"}
     project_dir = params.get("project_dir")
     is_valid, resolved = _validate_edit_path(raw_path, workspace, project_dir)
 
@@ -340,8 +352,8 @@ async def handle_memory_status(
     config = get_config()
 
     # code 模式现在也有 memory.enabled 配置项，直接读取
-    enabled = is_memory_enabled(mode, config)
-    proactive = is_proactive_memory(mode, config)
+    enabled = is_builtin_memory_enabled(mode, config)
+    proactive = enabled and is_proactive_memory(mode, config)
 
     result: dict[str, Any] = {
         "current_mode": mode,
@@ -351,10 +363,18 @@ async def handle_memory_status(
         "proactive": proactive,
         "forbidden_enabled": _is_forbidden_enabled(config),
         # auto_memory_enabled: agent mode 读全局（保留兼容）；code mode 读 auto_coding_memory
-        "auto_memory_enabled": is_auto_memory_enabled(mode, config),
+        "auto_memory_enabled": enabled and is_auto_memory_enabled(mode, config),
         # auto_coding_memory: 仅 code mode 有意义；agent mode 返回 None（UI 不展示）
-        "auto_coding_memory": is_auto_memory_enabled(mode, config) if _is_code_mode(mode) else None,
+        "auto_coding_memory": (enabled and is_auto_memory_enabled(mode, config)) if _is_code_mode(mode) else None,
     }
+
+    if is_external_memory_enabled(config):
+        provider = get_external_memory_config(config)["provider"]
+        result["external_memory"] = {"provider": provider, "enabled": True}
+        if provider == "celia":
+            result["external_memory"]["database_path"] = get_celia_database_path()
+    if not enabled:
+        return result
 
     if detailed:
         manager = await get_memory_manager(agent_id="default", workspace_dir=workspace)
@@ -425,14 +445,6 @@ async def handle_memory_status(
                 "files_count": 0,
                 "total_chars": 0,
                 "dir": "",
-            }
-
-        engine = get_memory_engine(config)
-        if engine in ("external", "both"):
-            ext_cfg = get_external_memory_config(config)
-            result["external_memory"] = {
-                "provider": ext_cfg.get("provider", "unknown") if ext_cfg else "unknown",
-                "enabled": is_external_memory_allowed(config),
             }
 
     return result
@@ -587,13 +599,24 @@ async def handle_memory_open(
     workspace: str,
     params: dict[str, Any],
 ) -> dict[str, Any]:
+    config = get_config()
     project_dir = params.get("project_dir")
     result: dict[str, Any] = {
-        "memory_dir": os.path.join(workspace, "memory"),
+        "memory_dir": (os.path.join(workspace, "memory")
+                       if is_legacy_workspace_memory_enabled(config) else ""),
         "project_memory_dir": workspace,
     }
+    if (is_external_memory_enabled(config)
+            and get_external_memory_config(config)["provider"] == "celia"):
+        database_path = get_celia_database_path()
+        result["provider"] = "celia"
+        result["database_path"] = database_path
+        if database_path:
+            path = PureWindowsPath(database_path) if PureWindowsPath(database_path).is_absolute() else Path(database_path)
+            result["memory_dir"] = str(path.parent)
     if project_dir:
         result["project_dir"] = project_dir
+    if project_dir and is_builtin_memory_enabled("code", config):
         # Unified: Auto-memory now uses coding memory directory
         coding_dir = _get_coding_memory_dir(workspace, project_dir)
         result["auto_memory_dir"] = coding_dir  # Backward compatibility

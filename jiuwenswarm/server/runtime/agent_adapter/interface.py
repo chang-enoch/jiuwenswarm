@@ -28,7 +28,8 @@ from jiuwenswarm.server.runtime.agent_adapter.agent_adapters import (
     create_adapter,
     resolve_sdk_choice,
 )
-from jiuwenswarm.agents.harness.common.memory.config import get_memory_mode, is_auto_memory_enabled, is_memory_enabled
+from jiuwenswarm.agents.harness.common.memory.config import get_memory_mode, is_auto_memory_enabled
+from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_enabled
 from jiuwenswarm.server.runtime.session.session_history import (
     append_compact_history_records,
     append_history_record,
@@ -2266,7 +2267,7 @@ class JiuWenSwarm:
             # 需要 auto_memory_enabled 和 memory.enabled 都为 true 才触发
             mode = request.params.get("mode", "code") if isinstance(request.params, dict) else "code"
             config = get_config()
-            if is_auto_memory_enabled(mode, config) and is_memory_enabled(mode, config):
+            if is_auto_memory_enabled(mode, config) and is_builtin_memory_enabled(mode, config):
                 _trigger_auto_memory_extraction(adapter, request, session_id, is_stream=False)
 
         _schedule_symphony_session_feedback(session_id, request.request_id)
@@ -3170,7 +3171,7 @@ class JiuWenSwarm:
         # 需要 auto_memory_enabled 和 memory.enabled 都为 true 才触发
         mode = request.params.get("mode", "code") if isinstance(request.params, dict) else "code"
         config = get_config()
-        if is_auto_memory_enabled(mode, config) and is_memory_enabled(mode, config):
+        if is_auto_memory_enabled(mode, config) and is_builtin_memory_enabled(mode, config):
             _trigger_auto_memory_extraction(adapter, request, session_id, is_stream=True)
 
         _schedule_symphony_session_feedback(session_id, rid)

@@ -47,7 +47,11 @@ class DreamingConfig:
         """Load configuration from the config.yaml memory.dreaming.{mode} or return enabled=False."""
         try:
             from jiuwenswarm.common.config import get_config
-            raw = get_config().get("memory", {}).get("dreaming", {}).get(mode, {})
+            from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_enabled
+            config = get_config()
+            if not is_builtin_memory_enabled(mode, config):
+                return cls()
+            raw = config.get("memory", {}).get("dreaming", {}).get(mode, {})
             if not isinstance(raw, dict):
                 raw = {}
             env_key = f"DREAMING_{mode.upper()}_ENABLED"

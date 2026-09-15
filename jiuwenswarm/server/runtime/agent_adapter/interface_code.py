@@ -84,7 +84,7 @@ from jiuwenswarm.agents.harness.common.rails import (
     ToolUsagePromptRail,
     XiaoyiDefaultToolVisibilityRail,
 )
-from jiuwenswarm.agents.harness.common.memory.config import is_memory_enabled
+from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_enabled
 from jiuwenswarm.agents.harness.common.tools import (
     SkillToolkit,
 )
@@ -306,8 +306,10 @@ def create_coding_memory_rail(
     project_dir: str | None,
     agent_workspace_dir: str,
     config: dict[str, Any] | None,
-) -> CodingMemoryRail:
+) -> CodingMemoryRail | None:
     """Create CodingMemoryRail, falling back when embedding config is incomplete."""
+    if not is_builtin_memory_enabled("code", config):
+        return None
     embed_config = config.get("embed") if isinstance(config, dict) else None
     embed_config = embed_config if isinstance(embed_config, dict) else {}
 
@@ -867,8 +869,8 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         受 modes.code.memory.enabled 开关控制，关闭时返回 None。
         """
         # 检查 memory 开关
-        if not is_memory_enabled("code", get_config()):
-            logger.info("[JiuwenSwarmCodeAdapter] CodingMemoryRail disabled by modes.code.memory.enabled")
+        if not is_builtin_memory_enabled("code", get_config()):
+            logger.info("[JiuwenSwarmCodeAdapter] CodingMemoryRail disabled by legacy memory configuration")
             return None
 
         # 单例保护：如果已构建，直接返回缓存实例
@@ -898,8 +900,8 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         确保能检索到 /init 命令创建 JIUWENSWARM.md 的目录（当前工作目录）。
         """
         # 检查 memory 开关
-        if not is_memory_enabled("code", get_config()):
-            logger.info("[JiuwenSwarmCodeAdapter] ProjectMemoryRail disabled by modes.code.memory.enabled")
+        if not is_builtin_memory_enabled("code", get_config()):
+            logger.info("[JiuwenSwarmCodeAdapter] ProjectMemoryRail disabled by legacy memory configuration")
             return None
 
         try:
@@ -1126,6 +1128,8 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                     mode,
                 )
 
+        await self._remove_disabled_code_memory_rails()
+
         # code 模式保留 ProjectMemoryRail；若缺失则补充注册
         if self._project_memory_rail is None:
             self._project_memory_rail = self._build_project_memory_rail()
@@ -1148,6 +1152,19 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                 )
 
         await self._handle_external_memory_rail_by_config()
+
+    async def _remove_disabled_code_memory_rails(self) -> None:
+        if is_builtin_memory_enabled("code", get_config()):
+            return
+        for attr in ("_project_memory_rail", "_coding_memory_rail"):
+            rail = getattr(self, attr, None)
+            if rail is not None:
+                await self._instance.unregister_rail(rail)
+                setattr(self, attr, None)
+
+    async def _handle_memory_rail_by_config(self, mode: str):
+        await super()._handle_memory_rail_by_config(mode)
+        await self._remove_disabled_code_memory_rails()
 
     def _build_code_agent_rail(self) -> CodeAgentRail | None:
         """构建 CodeAgentRail，管理 /agents 创建的自定义 agent。"""

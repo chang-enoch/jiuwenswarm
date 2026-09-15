@@ -189,10 +189,11 @@ from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
 from jiuwenswarm.agents.harness.common.memory.config import (
     clear_config_cache,
     get_memory_mode,
-    is_memory_enabled,
     is_proactive_memory,
 )
-from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_allowed
+from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
+    get_external_memory_config, is_builtin_memory_enabled,
+)
 from jiuwenswarm.agents.harness.common.memory.workspace import configure_workspace_memory  # noqa: E402
 from jiuwenswarm.common.model_config_validation import is_placeholder_api_base
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import TOOL_PERMISSION_CHANNEL_ID
@@ -1213,6 +1214,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._memory_rail: MemoryRail | None = None
         self._external_memory_rail: Any = None
         self._external_memory_rail_registered: bool = False
+        self._external_memory_provider: str = ""
         # 记忆 embedding 配置指纹：用于检测 embed 段变化并据此重建 MemoryRail。
         # 重建 rail 才能让 _embedding_config 刷新；否则换 endpoint 时 rail 复用旧配置。
         self._memory_embedding_fingerprint: str = ""
@@ -6224,6 +6226,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 )
             self._filesystem_rail = None
 
+        # Remove disabled legacy rails before rebuilding subagents/configuration.
+        await self._handle_memory_rail_by_config(self._last_mode or "agent")
         rails_list = self._get_current_agent_rails(config, config_base)
 
         # 加载用户自定义的 Rail 扩展
@@ -6253,12 +6257,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
         await self._fan_out_reload_to_session_adapters(config_base, env_overrides, target_sid)
 
-        # 主动刷新 memory rail（不等下次请求的 _update_rails_for_mode）：
-        # 让 embedding 配置变更立即走指纹检测 + 重建 rail + 延时重索引。
-        # 若从未处理过请求（_last_mode 为 None，如冷启动后首次 reload），退化为默认 agent。
+        # External providers must also follow hot-reloaded configuration.
         try:
-            mode = self._last_mode or "agent"
-            await self._handle_memory_rail_by_config(mode)
+            await self._handle_external_memory_rail_by_config()
         except Exception as e:
             logger.warning(
                 "[JiuWenSwarmDeepAdapter] memory rail refresh on reload failed: %s", e
@@ -7102,9 +7103,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                         pass
             # 仅在旧本地记忆启用时恢复写入工具，避免绕过配置开关。
             elif (
-                get_memory_mode(get_config()) == "local"
-                and is_builtin_memory_allowed(get_config())
-                and is_memory_enabled(runtime_config.mode, get_config())
+                is_builtin_memory_enabled(runtime_config.mode, get_config())
             ):
                 try:
                     from openjiuwen.core.memory.lite.memory_tools import (
@@ -11468,9 +11467,15 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
     async def _handle_memory_rail_by_config(self, mode: str):
         config = get_config()
+        if get_memory_mode(config) != "local":
+            if self._memory_rail is not None:
+                await self._instance.unregister_rail(self._memory_rail)
+                self._memory_rail = None
+                self._memory_embedding_fingerprint = ""
+            return
         if get_memory_mode(config) == "local":
             # 引擎门禁：memory.engine 未放行内置时，等同于禁用
-            builtin_on = is_builtin_memory_allowed(config) and is_memory_enabled(mode, config)
+            builtin_on = is_builtin_memory_enabled(mode, config)
             if builtin_on:
                 # 开启记忆
                 new_embed_fp = self._embedding_config_fingerprint(config)
@@ -11531,52 +11536,45 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         )
 
     async def _handle_external_memory_rail_by_config(self):
-        """Register / unregister ExternalMemoryRail based on config.
-
-        External memory is mode-independent — configured once and active in
-        the merged agent mode. `_external_memory_rail_registered` dedups
-        repeated calls from `_update_agent_rails()`.
-        Not part of `_get_current_agent_rails()`, so it is not torn down on
-        config hot-reload (preserves prefetch cache + circuit breaker state).
-        """
+        """Keep the mounted external rail aligned with the selected provider."""
         from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
             is_external_memory_enabled,
         )
 
         config = get_config()
-        if is_external_memory_enabled(config):
-            if self._external_memory_rail_registered:
-                return
-            if self._external_memory_rail is None:
-                self._external_memory_rail = self._build_external_memory_rail()
-            if self._external_memory_rail is None:
-                return
-            try:
-                await self._instance.register_rail(self._external_memory_rail)
-                self._external_memory_rail_registered = True
-                logger.info("[JiuWenSwarmDeepAdapter] ExternalMemoryRail registered")
-            except Exception as exc:
-                logger.error("[JiuWenSwarmDeepAdapter] ExternalMemoryRail register failed: %s", exc)
-                self._external_memory_rail = None
-        elif self._external_memory_rail is not None and self._external_memory_rail_registered:
-            # Call on_session_end BEFORE unregister_rail: unregister -> uninit()
-            # is sync, and run_coroutine_threadsafe from the same event loop
-            # thread would deadlock.
+        provider_name = (get_external_memory_config(config)["provider"]
+                         if is_external_memory_enabled(config) else "")
+        if (self._external_memory_rail_registered and provider_name
+                and getattr(self, "_external_memory_provider", "") == provider_name):
+            return
+
+        if self._external_memory_rail is not None:
+            # Flush the old provider before uninit, including old-celia -> celia.
             provider = getattr(self._external_memory_rail, "_provider", None)
             if provider is not None and hasattr(provider, "on_session_end"):
                 try:
                     await provider.on_session_end()
                 except Exception as exc:
                     logger.debug("[JiuWenSwarmDeepAdapter] on_session_end failed: %s", exc)
-            try:
+            if self._external_memory_rail_registered:
                 await self._instance.unregister_rail(self._external_memory_rail)
-                logger.info("[JiuWenSwarmDeepAdapter] ExternalMemoryRail unregistered")
-            except Exception as exc:
-                logger.warning(
-                    "[JiuWenSwarmDeepAdapter] ExternalMemoryRail unregister failed: %s", exc
-                )
             self._external_memory_rail = None
             self._external_memory_rail_registered = False
+            self._external_memory_provider = ""
+
+        if not provider_name:
+            return
+        rail = self._build_external_memory_rail()
+        if rail is None:
+            return
+        try:
+            await self._instance.register_rail(rail)
+        except Exception as exc:
+            logger.error("[JiuWenSwarmDeepAdapter] ExternalMemoryRail register failed: %s", exc)
+            return
+        self._external_memory_rail = rail
+        self._external_memory_rail_registered = True
+        self._external_memory_provider = provider_name
 
     async def compress_context(
             self,
