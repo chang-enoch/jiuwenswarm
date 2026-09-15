@@ -7,8 +7,8 @@
 进程同时服务 flash 与 agent 两套 agent，互不串味、不重启。
 
 flash 是一个**固定语义的 mode**——它的定义（行为开关 + rail 白名单）和它的实现
-（三个 override）都内聚在本文件，不依赖 config.yaml 也不侵入父类
-``JiuWenSwarmDeepAdapter``（对 flash 一无所知，零 profile 代码）。这与 code 模式
+都内聚在本文件；工具权限沿用全局 config，其余 profile 行为不依赖 config.yaml。
+父类只提供通用工具工厂与生命周期扩展点，不感知具体 flash 工具。这与 code 模式
 一致：CodeAdapter 把 ``_FIXED_RAIL_NAMES`` / ``_is_code_agent`` 等定义硬编码为
 类常量，flash 同样把行为开关与 keep 白名单作为类常量。
 
@@ -20,7 +20,10 @@ flash 行为由类常量定义：
 - :data:`_PROFILE_PROTECTED_RAILS` — 白名单下也必留的 rail（丢掉会留下半成品
   依赖或破坏安全不变量，如 ``_disabled_tools_rail``）。
 
-覆盖五个宿主方法注入 flash 行为：
+覆盖宿主方法注入 flash 行为，主要分为三组：
+- 工具工厂与生命周期 — ``_build_web_tools`` / ``_build_cron_tools`` /
+  ``_cron_tool_names`` / ``_build_progressive_tool_rail``，仅为 flash 注册
+  ``web_flash`` 与 ``cron_flash``。
 - :meth:`create_instance` — 先合并 flash react 覆盖进 config_base，再
   ``await super().create_instance(...)``。super 内部四步（``_resolve_instance_config_base``
   补缺 / ``coalesce_config_skill_envs`` / ``merge_memory_config_into_config`` /
@@ -44,12 +47,55 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from typing import Any
 
+from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools import (
+    add_collection,
+    call_phone,
+    convert_timestamp_to_utc8_time,
+    create_alarm,
+    create_calendar_event,
+    create_note,
+    delete_alarm,
+    delete_collection,
+    get_user_location,
+    image_reading,
+    modify_alarm,
+    modify_note,
+    query_collection,
+    save_file_to_file_manager,
+    save_media_to_gallery,
+    search_alarms,
+    search_calendar_event,
+    search_contact,
+    search_file,
+    search_message,
+    search_notes,
+    search_photo_gallery,
+    send_message,
+    upload_file,
+    upload_photo,
+    view_push_result,
+    xiaoyi_gui_agent,
+)
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     JiuWenSwarmDeepAdapter,
+    _CRON_TOOL_NAMES,
+    _DEFAULT_PROGRESSIVE_EAGER_TOOLS,
     _RailBuildInfo,
     _resolve_instance_config_base,
+    acp_chat,
+    create_vision_tools,
+    generate_image,
+    get_config,
+    is_skill_retrieval_enabled,
+    SkillToolkit,
+    SymphonyToolkit,
+    video_understanding,
+    wiki_ingest,
+    wiki_lint,
+    wiki_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,11 +104,9 @@ logger = logging.getLogger(__name__)
 class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
     """Flash 模式适配器 — 极简单 agent profile（单轮、无 task loop、无自演进）。
 
-    继承 :class:`JiuWenSwarmDeepAdapter`，只覆盖五个宿主方法
-    （``create_instance`` / ``_apply_reload_config_snapshot`` / ``_instantiate_rails``
-    / ``_update_rails_for_mode`` / ``try_start_dreaming``）
-    注入 flash 的行为覆盖与 rail 裁剪，不重写 ``_build_agent_rails`` 本体——复用父类
-    按 mode 构建的 rail 表，只在其实例化前用白名单裁剪。
+    继承 :class:`JiuWenSwarmDeepAdapter`，通过工具工厂、配置合并和 rail 生命周期
+    扩展点注入 flash 行为，不重写 ``_build_agent_rails`` 本体——复用父类按 mode
+    构建的 rail 表，只在其实例化前用白名单裁剪。
     """
 
     # ── flash 行为定义（类常量，仿 CodeAdapter._FIXED_RAIL_NAMES） ─────────
@@ -141,6 +185,349 @@ class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
         service_id: str | None = None,
     ) -> None:
         super().__init__(workspace_dir=workspace_dir, agent_id=agent_id, service_id=service_id)
+
+    def _build_web_tools(self, agent_id: str, cache: Any | None = None) -> list[Any]:
+        """Expose the single ``web_flash`` card only for the Flash profile."""
+        from jiuwenswarm.agents.harness.flash.tools.web_flash import (
+            build_web_flash_tool,
+        )
+
+        return [
+            build_web_flash_tool(
+                agent_id=agent_id,
+                language=self._resolve_runtime_language(),
+                cache=cache,
+            )
+        ]
+
+    def _build_cron_tools(self) -> list[Any]:
+        """Expose the single ``cron_flash`` card only for the Flash profile."""
+        from jiuwenswarm.agents.harness.flash.tools.cron_flash import (
+            build_cron_flash_tool,
+        )
+
+        service_id = getattr(self, "_env_service_id", None)
+        tenant_agent_id = getattr(self, "_env_agent_id", None)
+        backend = self._cron_runtime.get_backend(
+            service_id=service_id,
+            agent_id=tenant_agent_id,
+        )
+        if backend is None:
+            logger.warning(
+                "[JiuwenSwarmFlashAdapter] cron backend is not ready, skip cron_flash"
+            )
+            return []
+        self._cron_runtime.ensure_scheduler_started(
+            service_id=service_id,
+            agent_id=tenant_agent_id,
+        )
+        return [
+            build_cron_flash_tool(
+                backend,
+                context=self._runtime_cron_tool_context,
+                agent_id=self._tool_owner_id(),
+                language=self._resolve_runtime_language(),
+            )
+        ]
+
+    @staticmethod
+    def _cron_tool_names() -> frozenset[str]:
+        """Use the Flash profile's merged cron card for lifecycle checks."""
+        return frozenset({"cron_flash"})
+
+    async def _get_tool_cards(self, agent_id: str):
+        """Build flash tool cards.
+
+        这是 :meth:`JiuWenSwarmDeepAdapter._get_tool_cards` 的逐字副本，唯一差异：
+        web 工具段由父类的 ``build_jiuwen_harness_named_web_tools``（web_search +
+        fetch_webpage 多卡）换成 flash 的 ``self._build_web_tools``（单张 web_flash
+        卡）。整方法复制而非 super(). 后处理，是为避免父类把 Deep web 卡注册进
+        ability_manager 后再移除的 add+remove 噪声，也避免动 interface_deep.py。
+        其余工具段（wiki/vision/audio/video/image_gen/xiaoyi/skill/symphony/acp/
+        deepresearch/extra）与父类逐字一致——flash 的能力裁剪在 rail 白名单层做，
+        不在 tool_cards 注册层做。
+        """
+        tool_cards = []
+
+        for wtool in [wiki_ingest, wiki_query, wiki_lint]:
+            registered = self._register_shared_tool(wtool)
+            tool_cards.append(registered.card)
+
+        from jiuwenswarm.agents.harness.common.tools.web_search.content_cache import (
+            get_agent_cache_registry,
+        )
+
+        content_cache = await get_agent_cache_registry().get_cache(agent_id)
+        for tool_instance in self._build_web_tools(agent_id=agent_id, cache=content_cache):
+            registered = self._register_agent_owned_tool(tool_instance, agent_id)
+            tool_cards.append(registered.card)
+
+        self._vision_tools = []
+        self._vision_tools_registered = False
+        if self._vision_model_config is not None:
+            try:
+                for tool in create_vision_tools(
+                    language=self._resolve_runtime_language(),
+                    vision_model_config=self._vision_model_config,
+                    agent_id=agent_id,
+                ):
+                    registered = self._register_agent_owned_tool(tool, agent_id)
+                    tool_cards.append(registered.card)
+                    self._vision_tools.append(registered)
+                self._vision_tools_registered = bool(self._vision_tools)
+            except Exception as exc:
+                self._vision_tools = []
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] vision tools registration failed: %s",
+                    exc,
+                )
+
+        self._audio_tools = []
+        self._audio_tools_registered = False
+        try:
+            self._audio_tools = []
+            for tool in self._iter_runtime_audio_tools(agent_id):
+                registered = self._register_agent_owned_tool(tool, agent_id)
+                tool_cards.append(registered.card)
+                self._audio_tools.append(registered)
+            self._audio_tools_registered = bool(self._audio_tools)
+        except Exception as exc:
+            self._audio_tools = []
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] audio tools registration failed: %s",
+                exc,
+            )
+
+        self._video_tool_registered = False
+        if self._video_model_config:
+            try:
+                registered = self._register_shared_tool(video_understanding)
+                tool_cards.append(registered.card)
+                self._video_tool_registered = True
+            except Exception as exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] video tool registration failed: %s",
+                    exc,
+                )
+
+        # generate_image tool: use dedicated image_gen model config
+        self._image_gen_tool_registered = False
+        if self._image_gen_model_config:
+            try:
+                registered = self._register_shared_tool(generate_image)
+                tool_cards.append(registered.card)
+                self._image_gen_tool_registered = True
+            except Exception as exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] generate_image tool registration failed: %s",
+                    exc,
+                )
+
+        # 小艺手机端工具：由 channels.xiaoyi.phone_tools_enabled 控制
+        config_base = get_config()
+        xiaoyi_phone_tools_enabled = (
+            config_base.get("channels", {}).get("xiaoyi", {}).get("phone_tools_enabled", False)
+        )
+        if xiaoyi_phone_tools_enabled and not self._xiaoyi_phone_tools_registered:
+            _xiaoyi_tools = [
+                get_user_location,
+                create_note,
+                search_notes,
+                modify_note,
+                create_calendar_event,
+                search_calendar_event,
+                search_contact,
+                search_photo_gallery,
+                upload_photo,
+                search_file,
+                upload_file,
+                call_phone,
+                send_message,
+                search_message,
+                create_alarm,
+                search_alarms,
+                modify_alarm,
+                delete_alarm,
+                query_collection,
+                add_collection,
+                delete_collection,
+                save_media_to_gallery,
+                save_file_to_file_manager,
+                convert_timestamp_to_utc8_time,
+                view_push_result,
+                image_reading,
+                xiaoyi_gui_agent,
+            ]
+            try:
+                for xt in _xiaoyi_tools:
+                    registered = self._register_shared_tool(xt)
+                    tool_cards.append(registered.card)
+                self._xiaoyi_phone_tools_registered = True
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] %d xiaoyi phone tools registered", len(_xiaoyi_tools)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] xiaoyi phone tools registration failed: %s", exc
+                )
+
+        try:
+            skill_toolkit = SkillToolkit(
+                manager=self._skill_manager,
+                service_id=self._service_id,
+                agent_id=self._agent_id,
+                on_installed_skills_changed=self.refresh_enabled_skills_from_db,
+            )
+            skill_tool_names: list[str] = []
+            for tool in skill_toolkit.get_tools():
+                registered = self._register_shared_tool(tool)
+                tool_cards.append(registered.card)
+                skill_tool_names.append(registered.card.name)
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] SkillToolkit registered: tools=%s",
+                skill_tool_names,
+            )
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] skill tools registration failed: %s", exc)
+
+        if is_skill_retrieval_enabled():
+            try:
+                self._skill_retrieval_tools = self._create_skill_retrieval_tools()
+                skill_retrieval_tool_names: list[str] = []
+                for tool in self._skill_retrieval_tools:
+                    registered = self._register_shared_tool(tool)
+                    tool_cards.append(registered.card)
+                    skill_retrieval_tool_names.append(registered.card.name)
+                self._skill_retrieval_tools_registered = bool(self._skill_retrieval_tools)
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] SkillRetrievalToolkit registered: tools=%s",
+                    skill_retrieval_tool_names,
+                )
+            except Exception as exc:
+                self._skill_retrieval_tools = []
+                self._skill_retrieval_tools_registered = False
+                logger.warning("[JiuWenSwarmDeepAdapter] skill retrieval tools registration failed: %s", exc)
+        else:
+            self._skill_retrieval_tools = []
+            self._skill_retrieval_tools_registered = False
+            logger.info("[JiuWenSwarmDeepAdapter] SkillRetrievalToolkit skipped: disabled")
+
+        try:
+            symphony_toolkit = SymphonyToolkit()
+            symphony_tool_names: list[str] = []
+            symphony_tools = symphony_toolkit.get_tools(config_base)
+            for tool in symphony_tools:
+                registered = self._register_shared_tool(tool)
+                tool_cards.append(registered.card)
+                symphony_tool_names.append(registered.card.name)
+            self._symphony_tools = list(symphony_tools)
+            self._symphony_tools_registered = bool(symphony_tools)
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] SymphonyToolkit registered: tools=%s",
+                symphony_tool_names,
+            )
+        except Exception as exc:
+            self._symphony_tools = []
+            self._symphony_tools_registered = False
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] orchestration tools registration failed: %s",
+                exc,
+            )
+
+        # acp_chat: forward prompts to external stdio ACP agents (see acp_agents in config.yaml)
+        try:
+            acp_cfg = get_config().get("acp_agents")
+            if isinstance(acp_cfg, dict) and acp_cfg:
+                registered = self._register_shared_tool(acp_chat)
+                tool_cards.append(registered.card)
+                logger.info("[JiuWenSwarmDeepAdapter] acp_chat tool registered")
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] acp_chat registration failed: %s", exc)
+
+        self._register_deepresearch_tool_cards(tool_cards)
+
+        # 动态加载环境变量配置的非侵入式工具扩展（AGENT_EXTRA_TOOLS，仅企业版）
+        self._append_extra_tool_cards(tool_cards)
+
+        return tool_cards
+
+    def _ensure_cron_tools_registered(self, session_id: str | None) -> None:
+        """Register this agent's cron tools once, rebuilding only when they change.
+
+        这是 :meth:`JiuWenSwarmDeepAdapter._ensure_cron_tools_registered` 的逐字
+        副本，唯一差异：cron 卡名集合由父类的 ``_CRON_TOOL_NAMES`` 换成 flash 的
+        ``self._cron_tool_names()``（返回 ``{"cron_flash"}``），与 flash 的
+        ``cron_flash`` 单卡生命周期对齐。整方法复制而非 super(). 后处理，是因为
+        父类方法用 ``_CRON_TOOL_NAMES`` 操作 Deep 的 cron 卡，flash 必须用
+        ``cron_flash`` 名集合才能正确注册/移除/指纹缓存自己的 cron_flash 卡——
+        super(). 走的是 Deep 名集合，后处理无法干净纠正。
+        """
+        if session_id is not None and session_id.startswith(("heartbeat", "cron")):
+            return
+        if os.getenv("JIUWENCLAW_DISABLE_CRON_TOOLS") == "1":
+            for existing in list(self._instance.ability_manager.list() or []):
+                if getattr(existing, "name", "") in self._cron_tool_names():
+                    self._instance.ability_manager.remove(existing.name)
+            self._cron_tools_registered_language = None
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] skip cron tool registration: disabled by env"
+            )
+            return
+        language = self._resolve_runtime_language()
+        registered_names = {
+            getattr(existing, "name", "")
+            for existing in (self._instance.ability_manager.list() or [])
+        }
+        # The language fingerprint alone is not enough: rebuilding the agent (a
+        # skill or plugin install re-runs ``create_instance``) hands this adapter
+        # a fresh, empty AbilityManager while the fingerprint still reads as
+        # registered, which would silently drop the cron tools for good.
+        if self._cron_tools_registered_language == language and (registered_names & self._cron_tool_names()):
+            return
+        try:
+            cron_tools = self._build_cron_tools()
+            if not cron_tools:
+                return
+            for existing in list(self._instance.ability_manager.list() or []):
+                if getattr(existing, "name", "") in self._cron_tool_names():
+                    self._instance.ability_manager.remove(existing.name)
+            for cron_tool in cron_tools:
+                self._register_agent_owned_tool(cron_tool, self._tool_owner_id())
+                self._instance.ability_manager.add(cron_tool.card)
+            self._cron_tools_registered_language = language
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] %d cron tools registered: language=%s",
+                len(cron_tools),
+                language,
+            )
+        except Exception as exc:
+            logger.error("[JiuWenSwarmDeepAdapter] 定时工具注册失败: %s", exc)
+
+    def _build_progressive_tool_rail(self, config: dict[str, Any]) -> Any:
+        """Keep the two merged Flash tools visible to the model."""
+        flash_config = copy.deepcopy(config) if isinstance(config, dict) else {}
+        lazy_config = flash_config.setdefault("tool_lazy_load", {})
+        if not isinstance(lazy_config, dict):
+            lazy_config = {}
+            flash_config["tool_lazy_load"] = lazy_config
+        configured = lazy_config.get("eager_tools", _DEFAULT_PROGRESSIVE_EAGER_TOOLS)
+        eager_tools = list(configured) if isinstance(configured, list) else list(
+            _DEFAULT_PROGRESSIVE_EAGER_TOOLS
+        )
+        replaced_tool_names = {"web_search", "fetch_webpage"} | set(
+            _CRON_TOOL_NAMES
+        )
+        retained_tools = []
+        for name in eager_tools:
+            if name in replaced_tool_names:
+                continue
+            retained_tools.append(name)
+        eager_tools = retained_tools
+        for name in ("web_flash", "cron_flash"):
+            if name not in eager_tools:
+                eager_tools.append(name)
+        lazy_config["eager_tools"] = eager_tools
+        return super()._build_progressive_tool_rail(flash_config)
 
     # ── 宿主方法覆盖 ──────────────────────────────────────────────
 
