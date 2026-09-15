@@ -10130,11 +10130,12 @@ class JiuWenSwarmDeepAdapter:
     def _personal_context_rail_enabled(self, mode: str) -> bool:
         """Return whether this request mode uses the embedded Core Rail."""
 
-        return (
-            not self._is_code_agent
-            and mode in {"agent", "agent.fast", "agent.plan"}
-            and self._personal_context_runtime_enabled
+        supported_modes = (
+            {"code", "code.normal", "code.plan"}
+            if self._is_code_agent
+            else {"agent", "agent.fast", "agent.plan"}
         )
+        return mode in supported_modes and self._personal_context_runtime_enabled
 
     def set_personal_context_runtime_enabled(self, enabled: bool) -> None:
         """Store the Host switch snapshot for this adapter and future sessions."""
@@ -10167,7 +10168,7 @@ class JiuWenSwarmDeepAdapter:
                     raise cancelled
 
     async def _sync_personal_context_rail(self, mode: str) -> None:
-        """Register or detach the fixed-path Core Rail for normal agent modes."""
+        """Register or detach the shared fixed-path Core Rail for work and code modes."""
 
         async with self._personal_context_rail_lock:
             enabled = self._personal_context_rail_enabled(mode)

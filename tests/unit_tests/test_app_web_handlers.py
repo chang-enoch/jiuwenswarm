@@ -1165,8 +1165,10 @@ def test_web_does_not_expose_symphony_evolution_rpc_methods():
 def test_web_forwards_only_canonical_personal_context_rpc_methods():
     methods = {
         "personal_context.runtime.status",
-        "personal_context.runtime.start",
-        "personal_context.runtime.stop",
+        "personal_context.runtime.start_collection",
+        "personal_context.runtime.stop_collection",
+        "personal_context.runtime.start_agent_use",
+        "personal_context.runtime.stop_agent_use",
         "personal_context.runtime.get_config",
         "personal_context.runtime.patch_config",
         "personal_context.runtime.select_model",
@@ -1176,16 +1178,17 @@ def test_web_forwards_only_canonical_personal_context_rpc_methods():
         "personal_context.fetch.patch_service",
         "personal_context.fetch.start_service",
         "personal_context.fetch.stop_service",
-        "personal_context.fetch.start_scheduler",
-        "personal_context.fetch.stop_scheduler",
+        "personal_context.fetch.stop_run",
         "personal_context.fetch.run_all",
         "personal_context.fetch.run_one",
         "personal_context.fetch.get_run_status",
         "personal_context.fetch.get_authorization_status",
         "personal_context.fetch.authorize_provider",
         "personal_context.context.stream_graph",
+        "personal_context.context.stream_tree",
         "personal_context.context.search_pages",
         "personal_context.context.get_node",
+        "personal_context.context.get_source",
     }
     forwarded = {
         method
@@ -1200,7 +1203,7 @@ def test_web_forwards_only_canonical_personal_context_rpc_methods():
 
     assert forwarded == methods
     assert no_local == methods
-    assert len(methods) == 22
+    assert len(methods) == 25
 
 
 # =====================================================================
