@@ -1491,8 +1491,9 @@ class JiuWenSwarm:
                         answer_value = custom_input
                     else:
                         answer_value = ""
-                    if question_text and answer_value:
-                        answers_dict[question_text] = answer_value
+                    if question_text:
+                        # 空答案表示用户点击了“跳过”；保留题目并显式传递语义。
+                        answers_dict[question_text] = answer_value or "跳过"
                     elif answer_value:
                         free_text_answer = (
                             answer_value
