@@ -1570,3 +1570,15 @@ modes:
         # 控制记忆内容如何注入到每个成员的 system prompt 中：
         #   "proactive" — 每轮对话开始时主动注入最新记忆摘要
         member_memory_prompt_mode: "proactive"
+
+# ── flash 轻量模式开关 ──────────────────────────────────────────
+# flash 是独立 mode（单轮 ReAct、裁剪 rail 白名单、关闭 task loop 与技能自
+# 演进）。行为定义（rail 白名单 / react 覆盖）硬编码在 JiuwenSwarmFlashAdapter
+# 类常量，不在此配置——这里只控制「是否对普通 agent 对话注入 flash」。
+# 触发点在 mode 解析层（resolve_agent_request_mode）：置 true 时，所有归一到
+# agent 的对话请求被改写为 flash mode（无需前端发 mode=flash，配置即触发）；
+# code / team 路径不受影响。置 false（默认）时维持原 agent 行为。
+#   enabled: false（默认）— 普通对话走 DeepAdapter（全量 rail + task loop）。
+#   enabled: true        — 普通对话注入 flash，走 FlashAdapter facade。
+flash:
+  enabled: false
