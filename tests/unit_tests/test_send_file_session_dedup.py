@@ -29,6 +29,39 @@ def test_partition_and_mark_sent_files():
     assert skipped == []
 
 
+def test_artifact_id_stable_and_path_normalized():
+    """产物标识：同一路径稳定；WSL /mnt/c 与 Windows 盘符视为同一产物；大小写无关。"""
+    assert sfu.artifact_id_for_path(r"C:\tmp\a.md") == sfu.artifact_id_for_path(r"c:\TMP\a.md")
+    assert sfu.artifact_id_for_path("/mnt/c/tmp/a.md") == sfu.artifact_id_for_path(r"C:\tmp\a.md")
+    assert sfu.artifact_id_for_path(r"C:\tmp\a.md") != sfu.artifact_id_for_path(r"C:\tmp\b.md")
+    assert sfu.artifact_id_for_path(r"C:\tmp\a.md").startswith("art-")
+
+
+def test_send_file_payload_carries_artifact_id(tmp_path):
+    """推送帧（与历史记录同一份 payload）必须带 artifact_id，供桌面端两处产物展示共用。"""
+    file_path = tmp_path / "handoff.md"
+    file_path.write_text("hello", encoding="utf-8")
+
+    toolkit = sfu.SendFileToolkit(request_id="r1", session_id="sess-art", channel_id="desktop")
+    mock_server = MagicMock()
+    mock_server.send_push = AsyncMock()
+
+    with patch(
+        "jiuwenswarm.server.agent_ws_server.AgentWebSocketServer.get_instance",
+        return_value=mock_server,
+    ), patch(
+        "jiuwenswarm.server.runtime.session.session_history.append_history_record",
+    ):
+        result = asyncio.run(toolkit.send_file(str(file_path)))
+
+    assert "Sent" in result
+    payload = mock_server.send_push.await_args.args[0]["payload"]
+    assert payload["event_type"] == "chat.file"
+    entry = payload["files"][0]
+    assert entry["artifact_id"] == sfu.artifact_id_for_path(str(file_path))
+    assert entry["name"] == "handoff.md"
+
+
 def test_send_file_skips_duplicate_after_success(tmp_path):
     file_path = tmp_path / "handoff.md"
     file_path.write_text("hello", encoding="utf-8")
