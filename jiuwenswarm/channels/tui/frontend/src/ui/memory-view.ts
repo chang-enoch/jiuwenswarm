@@ -49,10 +49,12 @@ export interface MVStatus {
   project_memory?: { files_count: number; total_chars: number; max_chars: number; project_dir?: string };
   coding_memory?: { files_count: number; total_chars: number; dir: string };
   auto_memory?: { files_count: number; total_chars: number; dir: string };
-  external_memory?: { provider: string; enabled: boolean };
+  external_memory?: { provider: string; enabled: boolean; database_path?: string | null };
 }
 
 export interface MVOpen {
+  provider?: string;
+  database_path?: string | null;
   memory_dir: string;
   project_memory_dir: string;
   project_dir?: string;
@@ -438,6 +440,8 @@ export class MemoryViewController {
       items.push({ value: "__display__", label: "Project Memory", description: `${status.project_memory.files_count} files · ${status.project_memory.total_chars} chars` });
     if (status.external_memory)
       items.push({ value: "__display__", label: "External Memory", description: `${status.external_memory.provider} ${status.external_memory.enabled ? "✓" : "✗"}` });
+    if (status.external_memory?.provider === "celia")
+      items.push({ value: "__display__", label: "Celia Database", description: status.external_memory.database_path || "Path unavailable" });
     return items;
   }
 
@@ -461,7 +465,8 @@ export class MemoryViewController {
       this.showFullPath ? formatMemoryPathForDisplay(p) : getDisplayPath(p, projectDir, gitRoot)
     );
     const items: SelectItem[] = [];
-    if (cat === "agent") items.push({ value: openP.memory_dir, label: "Memory Dir", description: fmt(openP.memory_dir) });
+    if (openP.memory_dir && (cat === "agent" || openP.provider === "celia"))
+      items.push({ value: openP.memory_dir, label: openP.provider === "celia" ? "Celia Memory Dir" : "Memory Dir", description: fmt(openP.memory_dir) });
     if (cat === "code" && openP.coding_memory_dir) items.push({ value: openP.coding_memory_dir, label: "Coding Memory Dir", description: fmt(openP.coding_memory_dir) });
     items.push({ value: openP.project_memory_dir, label: "Project Dir", description: fmt(openP.project_memory_dir) });
     if (openP.project_dir) items.push({ value: openP.project_dir, label: "User Project Dir", description: fmt(openP.project_dir) });
@@ -603,9 +608,9 @@ export class MemoryViewController {
   private togglesForMode(mode: string): { key: string; label: string; desc: string; read: (s: MVStatus) => boolean }[] {
     const cat = this.modeCategory(mode);
     const all = [
-      { key: "memory_enabled", label: "Memory", cats: ["agent", "code"], desc: "记忆功能总开关", read: (s: MVStatus) => s.enabled },
+      { key: "memory_enabled", label: "Legacy file memory", cats: ["agent", "code"], desc: "旧文件记忆开关", read: (s: MVStatus) => s.enabled },
       // { key: "memory_proactive", label: "Proactive memory", cats: ["agent"], desc: "对话中自动搜索和记录", read: (s: MVStatus) => s.proactive },
-      { key: "auto_coding_memory", label: "Auto coding memory", cats: ["code"], desc: "每轮对话后自动提取记忆（需总开关开启）", read: (s: MVStatus) => s.auto_coding_memory ?? false },
+      { key: "auto_coding_memory", label: "Legacy auto coding memory", cats: ["code"], desc: "旧文件记忆自动提取（需旧记忆开关开启）", read: (s: MVStatus) => s.auto_coding_memory ?? false },
       { key: "memory_forbidden_enabled", label: "Forbidden filter", cats: ["agent", "code"], desc: "过滤敏感信息", read: (s: MVStatus) => s.forbidden_enabled },
     ];
     return all.filter((t) => t.cats.includes(cat)).map((t) => ({ key: t.key, label: t.label, desc: t.desc, read: t.read }));

@@ -3,7 +3,7 @@ name: advanced-daily-report
 version: 2.0.0
 description: 进阶版日报生成器，支持多数据源采集、工作分析、趋势对比、周报月报聚合
 tags: [report, automation, productivity, daily, weekly, monthly, advanced]
-allowed_tools: [read_memory, write_memory, bash, read_file, write_file]
+allowed_tools: [mcp_celia-memory_celia.memory_record_search, bash, read_file, write_file]
 ---
 
 # 进阶版日报生成器
@@ -76,7 +76,7 @@ daily-report/
 **脚本会自动采集以下数据**：
 - **Git 提交记录**：通过 `git log` 命令读取 `D:/Download/jiuwenswarm` 仓库的提交历史
 - **邮箱邮件统计**：通过 IMAP 协议连接 `.env` 中配置的邮箱账户读取邮件统计（需要邮箱授权码）
-- **记忆系统**：读取 `~/.jiuwenswarm/agent/workspace/memory/` 目录下的每日记忆文件
+- **记忆系统**：脚本仅在旧文件记忆开启时采集本地记录。Celia 模式下，用 `mcp_celia-memory_celia.memory_record_search` 检索所需工作记录，结合返回结果补充报告。
 - **待办事项**：读取 `~/.jiuwenswarm/agent/sessions/` 下各会话的 `todo.md` 文件
 
 ### 手动触发
@@ -107,7 +107,7 @@ python ~/.jiuwenswarm/agent/workspace/skills/daily-report/run_report.py monthly 
 3. 脚本自动采集数据：
    - Git: 执行 `git log` 获取提交记录、代码变更统计
    - 邮箱: 通过 IMAP 连接获取邮件统计（如果配置了邮箱）
-   - 记忆: 读取记忆文件获取工作记录
+   - 记忆: 旧文件采集受配置开关控制；Celia 记录通过记忆检索工具获取
    - 待办: 解析 todo.md 获取任务状态
 4. 脚本执行完成后，输出格式为 `REPORT_FILE:/path/to/report.md`
 5. **⚠️ 重要：使用 read_file 工具读取报告文件，然后将完整内容发送给用户**
@@ -127,7 +127,7 @@ python ~/.jiuwenswarm/agent/workspace/skills/daily-report/run_report.py monthly 
 |--------|----------|----------|
 | **Git 仓库** | `git log` 命令 | 仓库路径: `D:/Download/jiuwenswarm` |
 | **网易邮箱** | IMAP 协议 | `.env`: `EMAIL_ADDRESS`, `EMAIL_TOKEN` |
-| **记忆系统** | 读取 MD 文件 | `~/.jiuwenswarm/agent/workspace/memory/YYYY-MM-DD.md` |
+| **记忆系统** | Celia 检索工具；旧文件采集仅在对应开关开启时执行 | 当前记忆服务配置 |
 | **待办事项** | 解析 todo.md | `~/.jiuwenswarm/agent/sessions/*/todo.md` |
 
 ### 定时触发

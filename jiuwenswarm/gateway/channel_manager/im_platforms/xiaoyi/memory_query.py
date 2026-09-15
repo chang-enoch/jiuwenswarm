@@ -125,6 +125,14 @@ def handle_memory_query(
         return {"code": 0}
     if action == "MemoryStateGet":
         return {"memoryState": read_memory_state(runtime_state_path)}
+    if action in {"UserMdQuery", "MemoryMdQuery", "MemoryHistory"}:
+        from jiuwenswarm.common.config import get_config
+        from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_legacy_workspace_memory_enabled
+
+        if not is_legacy_workspace_memory_enabled(get_config()):
+            if action == "MemoryHistory":
+                return []
+            return {"fileDetail": "", "enabled": False, "message": "旧文件记忆已关闭，请使用当前记忆服务。"}
     if action == "UserMdQuery":
         return _read_md(workspace_dir / "USER.md")
     if action == "MemoryMdQuery":

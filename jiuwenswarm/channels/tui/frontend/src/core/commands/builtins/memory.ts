@@ -70,6 +70,7 @@ interface MemoryStatusResult {
   external_memory?: {
     provider: string;
     enabled: boolean;
+    database_path?: string | null;
   };
 }
 
@@ -82,6 +83,8 @@ interface MemoryToggleResult {
 }
 
 interface MemoryOpenResult {
+  provider?: string;
+  database_path?: string | null;
   memory_dir: string;
   project_memory_dir: string;
   project_dir?: string;
@@ -661,6 +664,9 @@ async function showMemoryStatus(
         label: "External Memory",
         value: `${payload.external_memory.provider} ${payload.external_memory.enabled ? "✓" : "✗"}`,
       });
+      if (payload.external_memory.provider === "celia") {
+        items.push({ label: "Celia Database", value: payload.external_memory.database_path || "Path unavailable" });
+      }
     }
 
     ctx.addItem(
@@ -695,7 +701,7 @@ interface ToggleDef {
 const TOGGLE_DEFS: ToggleDef[] = [
   {
     key: "memory_enabled",
-    label: "Memory",
+    label: "Legacy file memory",
     modes: ["agent", "code"],
     getConfigPath: (mode) =>
       mode === "code" ? "modes.code.memory.enabled" : `modes.agent.${mode}.memory.enabled`,
@@ -710,7 +716,7 @@ const TOGGLE_DEFS: ToggleDef[] = [
       // },
   {
     key: "auto_coding_memory",
-    label: "Auto coding memory",
+    label: "Legacy auto coding memory",
     modes: ["code"],
     getConfigPath: () => "modes.code.memory.auto_coding_memory",
     readValue: (p) => p.auto_coding_memory ?? false,
@@ -834,8 +840,8 @@ async function openMemoryDir(
 
     // 按 mode 过滤目录：agent 显 Memory Dir（auto memory）；code 显 Coding Memory Dir
     const options: { label: string; description?: string; value: string }[] = [];
-    if (cat === "agent") {
-      options.push({ label: "Memory Dir", value: payload.memory_dir });
+    if (payload.memory_dir && (cat === "agent" || payload.provider === "celia")) {
+      options.push({ label: payload.provider === "celia" ? "Celia Memory Dir" : "Memory Dir", value: payload.memory_dir });
     }
     if (cat === "code" && payload.coding_memory_dir) {
       options.push({ label: "Coding Memory Dir", value: payload.coding_memory_dir });

@@ -7,8 +7,7 @@ from typing import Any
 
 import yaml
 
-from .config import get_memory_mode, is_memory_enabled
-from .external_memory_config import is_builtin_memory_allowed, is_legacy_workspace_memory_enabled
+from .external_memory_config import is_builtin_memory_enabled, is_legacy_workspace_memory_enabled
 
 
 def load_workspace_memory_config(config_file: Path) -> dict[str, Any]:
@@ -32,8 +31,7 @@ def configure_workspace_memory(workspace: Any, config: dict[str, Any]) -> Any:
     excluded = set()
     if not is_legacy_workspace_memory_enabled(config):
         excluded.update(("USER.md", "MEMORY.md", "memory"))
-    if not (get_memory_mode(config) == "local"
-            and is_builtin_memory_allowed(config) and is_memory_enabled("code", config)):
+    if not is_builtin_memory_enabled("code", config):
         excluded.add("coding_memory")
     workspace.directories = [node for node in workspace.directories if node.get("name") not in excluded]
     return workspace

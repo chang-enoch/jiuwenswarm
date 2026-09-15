@@ -10,9 +10,11 @@ extract and retrieve memories. Concrete Store / Embedding instances are
 built inside the provider — not here.
 """
 
+import json
 import logging
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional, Tuple
 
 from jiuwenswarm.common.utils import get_user_workspace_dir
@@ -43,6 +45,13 @@ def get_memory_engine(config: Optional[Dict[str, Any]] = None) -> str:
 def is_builtin_memory_allowed(config: Optional[Dict[str, Any]] = None) -> bool:
     """Engine-level gate for the built-in MemoryRail."""
     return get_memory_engine(config) in {"builtin", "both"}
+
+
+def is_builtin_memory_enabled(mode: str, config: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether this mode may run the legacy local memory implementation."""
+    cfg = config if config is not None else _load_config()
+    return (get_memory_mode(cfg) == "local"
+            and is_builtin_memory_allowed(cfg) and is_memory_enabled(mode, cfg))
 
 
 def is_external_memory_allowed(config: Optional[Dict[str, Any]] = None) -> bool:
@@ -88,11 +97,46 @@ def is_old_celia_enabled(config: Dict[str, Any]) -> bool:
 
 def is_legacy_workspace_memory_enabled(config: Dict[str, Any]) -> bool:
     """Gate USER.md, MEMORY.md and daily_memory with their legacy consumers."""
-    return is_old_celia_enabled(config) or (
-        get_memory_mode(config) == "local"
-        and is_builtin_memory_allowed(config)
-        and is_memory_enabled("agent", config)
-    )
+    return is_old_celia_enabled(config) or is_builtin_memory_enabled("agent", config)
+
+
+def get_celia_database_path() -> Optional[str]:
+    """Read the MCP service's database location without creating files.
+
+    The desktop passes these GSPD_* environment variables to the Celia service.
+    Its JSON config is authoritative; memory.external.celia.db_path belongs to
+    the preserved old-celia client and must not be used for this provider.
+    """
+    config_path = os.getenv("GSPD_CELIAWORK_CONFIG", "").strip()
+    if config_path:
+        try:
+            config = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
+            value = config["storage"]["memoryStore"]["path"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    else:
+        # Default filename used by the packaged Celia MCP service.
+        data_dir = os.getenv("GSPD_CELIAWORK_DATA_DIR", "").strip()
+        value = data_dir.rstrip("/\\") + "/celia_memory.db" if data_dir else ""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                   lambda match: os.environ.get(match[1], match[0]), value)
+    if "${" in value:
+        return None
+    if PureWindowsPath(value).is_absolute():
+        return str(PureWindowsPath(value))
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    # Relative storage paths belong to the service's cwd, not the Agent's cwd.
+    service_cwd = os.getenv("GSPD_SERVICE_CWD", "").strip()
+    if PureWindowsPath(service_cwd).is_absolute():
+        return str(PureWindowsPath(service_cwd) / value)
+    if Path(service_cwd).is_absolute():
+        return str(Path(service_cwd) / value)
+    return None
 
 
 def _resolve_ltm_dir() -> Path:

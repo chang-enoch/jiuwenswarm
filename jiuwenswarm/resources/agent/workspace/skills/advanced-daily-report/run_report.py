@@ -18,6 +18,7 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from collectors.memory_collector import legacy_memory_enabled
 
 # 尝试从 jiuwenswarm.utils 导入，如果失败则使用环境变量或硬编码路径
 try:
@@ -409,7 +410,7 @@ def generate_daily_report(date: str = None, enable_ai: bool = True) -> str:
     memory_content = ""
     work_items = []
 
-    if memory_file.exists():
+    if legacy_memory_enabled(AGENT_ROOT) and memory_file.exists():
         memory_content = memory_file.read_text(encoding="utf-8")
         for line in memory_content.split("\n"):
             stripped = line.strip()

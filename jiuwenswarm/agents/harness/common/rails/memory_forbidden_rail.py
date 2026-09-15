@@ -28,6 +28,8 @@ _MEMORY_WRITE_TOOLS = frozenset(
         "coding_memory_write",
         "coding_memory_edit",
         "experience_learn",
+        "memory_store",
+        "mcp_celia-memory_celia.memory_store",
     }
 )
 

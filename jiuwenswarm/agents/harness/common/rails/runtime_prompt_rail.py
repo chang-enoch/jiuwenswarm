@@ -35,6 +35,9 @@ from jiuwenswarm.agents.harness.common.prompt.prompt_builder import (
 
 from jiuwenswarm.common.config import get_config, get_sandbox_runtime
 from jiuwenswarm.agents.harness.common.memory.external_memory_config import (
+    get_celia_database_path,
+    get_external_memory_config,
+    is_external_memory_enabled,
     is_legacy_workspace_memory_enabled,
 )
 from jiuwenswarm.common.utils import (
@@ -676,8 +679,10 @@ class RuntimePromptRail(DeepAgentRail):
 
             is_cn = not self._force_english and self._language == "cn"
             lang_key = "cn" if is_cn else "en"
+            memory_config = get_config()
+            legacy_memory_enabled = is_legacy_workspace_memory_enabled(memory_config)
             important_files = IMPORTANT_FILES.get(lang_key, IMPORTANT_FILES["cn"])
-            if not is_legacy_workspace_memory_enabled(get_config()):
+            if not legacy_memory_enabled:
                 important_files = "\n".join(
                     line for line in important_files.splitlines()
                     if not any(path in line for path in (
@@ -688,6 +693,21 @@ class RuntimePromptRail(DeepAgentRail):
                 f"`{project_dir}`" if has_project
                 else ("未设置" if is_cn else "not set")
             )
+            internal_data_cn = (
+                "身份、记忆、技能、待办和运行状态" if legacy_memory_enabled
+                else "身份、技能、待办和运行状态"
+            )
+            internal_data_en = (
+                "identity, memory, skills, todos, and runtime state" if legacy_memory_enabled
+                else "identity, skills, todos, and runtime state"
+            )
+            memory_directory_row = ""
+            if legacy_memory_enabled:
+                memory_directory_row = (
+                    f"| `{agent_workspace_dir}/memory` | Agent 记忆目录 | 保存持久化记忆 | 将其视为 Agent 记忆的一部分 |\n"
+                    if is_cn else
+                    f"| `{agent_workspace_dir}/memory` | Agent memory directory | stores persistent memory | treat as part of the Agent's memory |\n"
+                )
 
             if is_cn:
                 directory_content = (
@@ -703,13 +723,13 @@ class RuntimePromptRail(DeepAgentRail):
                     "- 只有任务确实需要操作某个项目、且现有上下文无法确定项目位置时，才询问项目路径。\n"
                     "- 用户明确指定保存位置时，优先使用用户指定位置；否则，项目代码、测试、配置、构建文件、项目文档、报告、导出文件、图片和数据文件等放在当前工作目录的合理位置。\n\n"
                     "## 小艺 work 内部数据目录\n\n"
-                    "小艺 work 使用独立的内部数据目录保存启动配置、Agent 身份、记忆、技能、待办和运行状态。"
+                    f"小艺 work 使用独立的内部数据目录保存启动配置、Agent {internal_data_cn}。"
                     "这些内部数据目录不等于用户当前处理的项目目录，也不是用户任务中相对路径的默认含义。\n\n"
                     "| 路径 | 类型 | 用途 | 操作建议 |\n"
                     "|------|------|------|----------|\n"
                     f"| `{config_dir}` | 小艺 work 启动配置目录 | 保存 `config.yaml` 和 `.env` | 只有用户明确要求修改 小艺 work 自身配置时才访问 |\n"
-                    f"| `{agent_workspace_dir}` | Agent 内部数据目录 | 保存身份、记忆、技能、待办和运行状态 | 不要在其中搜索或运行用户项目文件 |\n"
-                    f"| `{agent_workspace_dir}/memory` | Agent 记忆目录 | 保存持久化记忆 | 将其视为 Agent 记忆的一部分 |\n"
+                    f"| `{agent_workspace_dir}` | Agent 内部数据目录 | 保存{internal_data_cn} | 不要在其中搜索或运行用户项目文件 |\n"
+                    f"{memory_directory_row}"
                     f"| `{agent_workspace_dir}/skills` | Agent 技能目录 | 保存和读取技能 | 可以读取和调用，不要作为项目目录使用 |\n"
                     f"| `{agent_workspace_dir}/todo` | Agent 待办目录 | 保存任务和待办状态 | 用于任务状态管理 |\n\n"
                     "以下资源由 小艺 work 提供，路径相对于运行时给出的智能体内部数据目录：\n\n"
@@ -718,7 +738,7 @@ class RuntimePromptRail(DeepAgentRail):
                     "- `todo/`：任务和待办状态。\n\n"
                     "目录规则：\n\n"
                     "- 智能体内部数据目录只保存智能体自身数据，不是用户项目目录。\n"
-                    "- 智能体身份、记忆、技能、待办和运行状态只能保存在对应的内部数据目录。\n"
+                    f"- 智能体{internal_data_cn}只能保存在对应的内部数据目录。\n"
                     f"- 技能执行产生的内部技能资产放在 `{agent_workspace_dir}/skills/{{skill_name}}/`。\n"
                     "- 小艺 work 启动配置目录不得用于保存普通任务产物。\n"
                     "- 用户任务中的 `config/`、`memory/`、`skills/`、`todo/` 或 `workspace/` 不自动映射到 小艺 work 内部目录。\n\n"
@@ -746,15 +766,15 @@ class RuntimePromptRail(DeepAgentRail):
                     "configuration, build files, project documentation, reports, exports, images, and data "
                     "files in an appropriate location under the current working directory.\n\n"
                     "## 小艺 work Internal Data Directories\n\n"
-                    "小艺 work keeps its startup configuration, Agent identity, memory, skills, "
-                    "todos, and runtime state in dedicated internal data directories. These are not the "
+                    f"小艺 work keeps its startup configuration, Agent {internal_data_en} "
+                    "in dedicated internal data directories. These are not the "
                     "same as the project directory the user is currently working on, nor are they the "
                     "default meaning of relative paths in user tasks.\n\n"
                     "| Path | Type | Purpose | Suggested use |\n"
                     "|------|------|---------|---------------|\n"
                     f"| `{config_dir}` | 小艺 work startup config directory | stores `config.yaml` and `.env` | access only when the user explicitly asks to change 小艺 work's own config |\n"
-                    f"| `{agent_workspace_dir}` | Agent internal data directory | stores identity, memory, skills, todos, runtime state | do not search or run user project files inside it |\n"
-                    f"| `{agent_workspace_dir}/memory` | Agent memory directory | stores persistent memory | treat as part of the Agent's memory |\n"
+                    f"| `{agent_workspace_dir}` | Agent internal data directory | stores {internal_data_en} | do not search or run user project files inside it |\n"
+                    f"{memory_directory_row}"
                     f"| `{agent_workspace_dir}/skills` | Agent skills directory | stores and reads skills | may read and invoke; do not use as a project directory |\n"
                     f"| `{agent_workspace_dir}/todo` | Agent todo directory | stores task and todo state | used for task state management |\n\n"
                     "The following resources are provided by 小艺 work. Their paths are relative to the "
@@ -765,7 +785,7 @@ class RuntimePromptRail(DeepAgentRail):
                     "Directory rules:\n\n"
                     "- The Agent internal data directory stores only the Agent's own data; it is not a user "
                     "project directory.\n"
-                    "- Agent identity, memory, skills, to-dos, and runtime state must be stored only in their "
+                    f"- Agent {internal_data_en} must be stored only in their "
                     "corresponding internal data directories.\n"
                     f"- Internal skill assets produced by skill execution belong in "
                     f"`{agent_workspace_dir}/skills/{{skill_name}}/`.\n"
@@ -778,6 +798,24 @@ class RuntimePromptRail(DeepAgentRail):
                     f"- Agent internal data directory: `{agent_workspace_dir}`\n"
                     f"- 小艺 work startup configuration directory: `{config_dir}`"
                 )
+            if (is_external_memory_enabled(memory_config)
+                    and get_external_memory_config(memory_config)["provider"] == "celia"):
+                database_path = get_celia_database_path()
+                if is_cn:
+                    directory_content += (
+                        "\n\n## Celia 记忆存储\n\n"
+                        "长期记忆由 Celia 记忆服务持久化，通过 Celia 记忆工具检索和更新。\n"
+                        + (f"- 当前配置的记忆数据库：`{database_path}`。\n" if database_path else
+                           "- 当前运行环境未提供可确认的 Celia 数据库路径。\n")
+                    )
+                else:
+                    directory_content += (
+                        "\n\n## Celia Memory Storage\n\n"
+                        "Long-term memory is persisted by the Celia memory service. "
+                        "Retrieve and update it through the Celia memory tools.\n"
+                        + (f"- Configured memory database: `{database_path}`.\n" if database_path else
+                           "- The current runtime has not provided a confirmed Celia database path.\n")
+                    )
             trusted_dirs = [
                 path for path in self._existing_dirs(self._trusted_dirs)
                 if not self._same_path(path, prompt_project_dir)

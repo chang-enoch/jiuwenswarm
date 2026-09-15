@@ -19,6 +19,7 @@ from jiuwenswarm.gateway.routing.interaction_context import PendingInteraction
 from jiuwenswarm.common.schema.message import Message, ReqMethod
 from jiuwenswarm.gateway.message_handler.command_parser.slash_command import CONTROL_MESSAGE_TEXTS
 from jiuwenswarm.common.utils import get_deepagent_user_md_path, logger
+from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_legacy_workspace_memory_enabled
 SYSTEM_PROMPT_TEMPLATE = """
 你是{principal_name}的数字分身，活跃在即时通讯群聊中。当群里有其他用户发送与{principal_name}相关的消息时，你的任务是改写这条消息，使其更清晰、更完整，以便后续帮助{principal_name}生成恰当的回复。
 
@@ -353,10 +354,9 @@ class IMConversationProcessor:
         else:
             prompt_parts.append("暂无历史消息\n")
 
-        prompt_parts.append("=== 用户画像 ===")
         user_profile = self._load_user_profile()
-        prompt_parts.append(user_profile if user_profile else "暂无用户画像信息")
-        prompt_parts.append("")
+        if user_profile:
+            prompt_parts.extend(("=== 用户画像 ===", user_profile, ""))
 
         if pending_context:
             prompt_parts.append("=== 待回答的追问 ===")
@@ -374,6 +374,9 @@ class IMConversationProcessor:
         return "\n".join(prompt_parts)
 
     def _load_user_profile(self) -> str:
+        from jiuwenswarm.common.config import get_config
+        if not is_legacy_workspace_memory_enabled(get_config()):
+            return ""
         try:
             if not self._user_profile_path.exists():
                 return ""
