@@ -115,10 +115,17 @@ def _append_late_span(database_path: Path, *, session_id: str = "session-1") -> 
         store.close()
 
 
-def _metadata_loader(mode: str = "agent.work.normal"):
+def _metadata_loader(
+    mode: str = "agent.work.normal",
+    *,
+    work_mode: str | None = None,
+):
     def _load(session_id: str) -> dict[str, str]:
         if session_id in {"session-1", "session-2"}:
-            return {"session_id": session_id, "mode": mode, "team_name": ""}
+            metadata = {"session_id": session_id, "mode": mode, "team_name": ""}
+            if work_mode is not None:
+                metadata["work_mode"] = work_mode
+            return metadata
         return {}
 
     return _load
@@ -749,6 +756,27 @@ async def test_http_rejects_legacy_single_agent_mode_names(
     assert response.status_code == 403
     assert _response_json(response)["code"] == "UNSUPPORTED_SESSION_MODE"
     test_logger.info("legacy single-Agent mode rejected: %s", mode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("work_mode", ["work", "code"])
+async def test_http_accepts_web_session_mode_composition(
+    tmp_path: Path,
+    work_mode: str,
+) -> None:
+    database_path = tmp_path / "trajectory.sqlite3"
+    _seed(database_path)
+    service = TrajectoryHttpService(
+        _settings(database_path),
+        reader=AsyncTrajectoryReader(database_path),
+        metadata_loader=_metadata_loader("agent", work_mode=work_mode),
+    )
+
+    response = await service.list_traces("session-1", limit=30, cursor=None)
+
+    assert response.status_code == 200
+    assert len(_response_json(response)["items"]) == 1
+    test_logger.info("Web session composition accepted: agent + %s", work_mode)
 
 
 @pytest.mark.asyncio

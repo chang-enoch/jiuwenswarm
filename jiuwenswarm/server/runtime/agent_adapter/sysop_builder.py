@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-import grp
+import getpass
 import hashlib
 import json
 import logging
 import os
-import pwd
+try:
+    import grp
+    import pwd
+except ImportError:  # Windows does not provide the Unix account databases.
+    grp = None
+    pwd = None
 from pathlib import Path
 from typing import Any, Literal
 
@@ -589,6 +594,10 @@ def build_process_policy() -> dict[str, Any]:
     使用 ``geteuid`` / ``getegid`` 解析有效身份；若 passwd/group 中无对应条目,
     则回退为 UID/GID 的字符串形式。
     """
+    if grp is None or pwd is None or not hasattr(os, "geteuid"):
+        username = getpass.getuser()
+        return {"run_as_user": username, "run_as_group": username}
+
     uid = os.geteuid()
     gid = os.getegid()
     try:

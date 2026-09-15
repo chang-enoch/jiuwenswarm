@@ -290,6 +290,12 @@ from jiuwenswarm.agents.harness.common.rails.concurrent_safe_rails import (
 from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.common.hooks_config import load_hooks_config
 from jiuwenswarm.common.log_preview import preview_text
+from jiuwenswarm.common.mode_matrix import (
+    canonicalize_mode_text,
+    compose_web_mode,
+    deprecate_mode,
+    normalize_work_mode,
+)
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
 from jiuwenswarm.server.hooks.user_hook_rail import UserHookRail
@@ -726,6 +732,18 @@ def get_runtime_tool_a2a_policy_id() -> str:
     return _RUNTIME_TOOL_A2A_POLICY_ID.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_observability_mode(params: dict[str, Any]) -> str:
+    """Return the canonical mode written into trajectory span attributes."""
+    raw_mode = params.get("mode", "agent")
+    normalized_mode = canonicalize_mode_text(raw_mode)
+    work_mode = normalize_work_mode(params.get("work_mode"))
+    if work_mode is not None:
+        composed_mode = compose_web_mode(normalized_mode, work_mode)
+        if composed_mode is not None:
+            return str(deprecate_mode(composed_mode[2]))
+    return str(deprecate_mode(raw_mode))
 
 _PERSISTENT_CHECKPOINTER_LOCK: asyncio.Lock | None = None
 _PERSISTENT_CHECKPOINTER_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
@@ -16847,8 +16865,7 @@ class JiuWenSwarmDeepAdapter:
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=request.request_id,
-                channel_id=request.channel_id,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             attach_goal = self._wants_attach_goal(request.params)
             dispatch_mode = self._resolve_input_dispatch_mode(request.params)
@@ -17932,8 +17949,7 @@ class JiuWenSwarmDeepAdapter:
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=rid,
-                channel_id=cid,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             _otel_trace_id = ""
             _otel_span_id = ""

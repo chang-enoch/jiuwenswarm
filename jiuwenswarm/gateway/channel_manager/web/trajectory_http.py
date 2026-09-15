@@ -18,8 +18,11 @@ from fastapi.responses import JSONResponse, Response
 
 from jiuwenswarm.common.mode_matrix import (
     canonicalize_mode_text,
+    compose_web_mode,
+    deprecate_mode,
     is_single_agent_mode,
     is_team_mode,
+    normalize_work_mode,
 )
 from jiuwenswarm.common.security.ws_origin import (
     get_allowed_origin_hosts,
@@ -429,6 +432,11 @@ class TrajectoryHttpService:
                 403,
             )
         normalized_mode = canonicalize_mode_text(raw_mode)
+        work_mode = normalize_work_mode(metadata.get("work_mode"))
+        if work_mode is not None:
+            composed_mode = compose_web_mode(normalized_mode, work_mode)
+            if composed_mode is not None:
+                normalized_mode = deprecate_mode(composed_mode[2])
         team_name = str(metadata.get("team_name") or "").strip()
         single_agent_session = is_single_agent_mode(normalized_mode) and not team_name
         team_session = is_team_mode(normalized_mode) and bool(team_name)
