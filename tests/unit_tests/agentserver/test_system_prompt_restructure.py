@@ -887,9 +887,49 @@ async def test_desktop_workspace_policy_is_one_dynamic_system_tail(tmp_path):
     prompt = builder.build()
 
     assert prompt.count("## 小艺 Work 工作空间约束") == 1
-    assert f"当前用户工作空间：`{tmp_path}`" in prompt
+    assert (
+        f"当前项目目录与当前工作目录（cwd，也是命令工具默认执行目录）：`{tmp_path}`"
+        in prompt
+    )
+    assert prompt.count(f"`{tmp_path}`") == 1
+    assert "当前用户工作空间" not in prompt
+    assert "上述当前项目目录即用户工作空间" in prompt
     assert "所有新建、修改和写入的用户任务产物必须落在该目录下" in prompt
     assert prompt.rfind("## 小艺 Work 工作空间约束") > prompt.rfind("# 目录与运行时上下文")
+
+
+@pytest.mark.asyncio
+async def test_desktop_workspace_prompt_keeps_distinct_project_and_cwd(tmp_path):
+    builder = SystemPromptBuilder(language="en")
+    agent = _FakeAgent(builder)
+    project_dir = tmp_path / "project"
+    runtime_cwd = tmp_path / "runtime-cwd"
+    project_dir.mkdir()
+    runtime_cwd.mkdir()
+    runtime_rail = RuntimePromptRail(language="en", channel="desktop")
+    runtime_rail.init(agent)
+    runtime_rail.set_runtime_paths(
+        cwd=str(runtime_cwd),
+        project_dir=str(project_dir),
+    )
+
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=None,
+        session=_FakeSession(),
+        extra={},
+    )
+    await runtime_rail.before_model_call(ctx)
+    prompt = builder.build()
+
+    assert f"Current project directory: `{project_dir}`" in prompt
+    assert (
+        "Current working directory (cwd, also the default command-tool execution directory): "
+        f"`{runtime_cwd}`"
+    ) in prompt
+    assert "Current project directory and working directory" not in prompt
+    assert "Current user workspace" not in prompt
+    assert "The current project directory above is the user's workspace" in prompt
 
 
 @pytest.mark.asyncio
