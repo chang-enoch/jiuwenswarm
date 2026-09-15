@@ -315,8 +315,8 @@ def _bl_fetch_from_api() -> dict[str, list[str]] | None:
     if not isinstance(data, list):
         return None
 
-    url_list: list[str] = []
-    filename_list: list[str] = []
+    url_set: set[str] = set()
+    filename_set: set[str] = set()
     for scene in data:
         if not isinstance(scene, dict):
             continue
@@ -324,17 +324,22 @@ def _bl_fetch_from_api() -> dict[str, list[str]] | None:
         blacklist = scene.get("blacklist") or []
         if not isinstance(blacklist, list):
             continue
+        is_url_scene = "url" in scene_name.lower()
+        is_filename_scene = "文件" in scene_name or "filename" in scene_name.lower()
+        if not is_url_scene and not is_filename_scene:
+            continue
         for item in blacklist:
             if not isinstance(item, dict):
                 continue
-            word = item.get("zhWord") or item.get("enWord")
-            if isinstance(word, str) and word.strip():
-                word = word.strip()
-                if "url" in scene_name.lower():
-                    url_list.append(word)
-                elif "文件" in scene_name or "filename" in scene_name.lower():
-                    filename_list.append(word)
+            # zhWord and enWord are different surface forms (e.g. /info/cn vs /info/en,
+            # or "AT会议纪要" vs "AT meeting minutes") — both must be checked.
+            target = url_set if is_url_scene else filename_set
+            for word in (item.get("zhWord"), item.get("enWord")):
+                if isinstance(word, str) and word.strip():
+                    target.add(word.strip())
 
+    url_list = sorted(url_set)
+    filename_list = sorted(filename_set)
     if not url_list and not filename_list:
         return None
     return {"url": url_list, "filename": filename_list}
