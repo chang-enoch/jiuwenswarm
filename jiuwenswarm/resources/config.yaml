@@ -1059,39 +1059,39 @@ permissions:
       severity: LOW
     - id: shell_ask_rm
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "rm *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rm(?:\s|$)'
       severity: HIGH
     - id: shell_ask_del
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "del *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)del(?:\s|$)'
       severity: HIGH
     - id: shell_ask_rd
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "rd *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rd(?:\s|$)'
       severity: HIGH
     - id: shell_ask_chmod
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "chmod *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)chmod(?:\s|$)'
       severity: HIGH
     - id: shell_ask_chown
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "chown *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)chown(?:\s|$)'
       severity: HIGH
     - id: shell_ask_remove_item
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "Remove-Item *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)Remove-Item(?:\s|$)'
       severity: HIGH
     - id: shell_ask_ri
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "ri *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)ri(?:\s|$)'
       severity: HIGH
     - id: shell_ask_rmdir
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "rmdir *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rmdir(?:\s|$)'
       severity: HIGH
     - id: shell_ask_erase
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "erase *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)erase(?:\s|$)'
       severity: HIGH
     - id: shell_ask_sensitive_file_reads
       tools: [bash, mcp_exec_command, create_terminal]
