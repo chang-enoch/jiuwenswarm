@@ -5271,7 +5271,7 @@ class QAFixNode(PlanNode):
                 pages_dir=pages_dir,
                 pptx_root=pptx_root,
                 style_file_path=style_file_path,
-                page_count=len(page_files) or total_pages,
+                page_files=page_files,
             )
             if fix_ok:
                 logger.info("[P8.2] cli.js fix 完成 (目录级 --fix --style)")
@@ -5356,22 +5356,30 @@ class QAFixNode(PlanNode):
         pages_dir: str,
         pptx_root: str,
         style_file_path: str,
-        page_count: int = 0,
+        page_files: list[str],
     ) -> tuple[bool, str]:
         """目录级 fix（build-standard §6）：tags/fonts/charts 安全网，不用于 layout 修复。
 
         BashExecError（缺 CLI / 超时抛错 / bash 不可用）与非零退出统一为
         ``(False, detail)``，由调用方降 partial，避免环境故障整书拒导。
+        fix 后逐页复查导出 DOM，破坏页回退 _backup 快照（与 _fix_pages 同口径）。
         """
         if not self.has_tool("bash") or not pptx_root or not pages_dir:
             return False, "bash_or_paths_unavailable"
+        page_nums: list[int] = []
+        for name in page_files:
+            if not name.startswith("page-") or not name.endswith(".pptx.html"):
+                continue
+            stem = name.removeprefix("page-").removesuffix(".pptx.html")
+            if stem.isdigit():
+                page_nums.append(int(stem))
         style_arg = (
             f" --style {quote_path(style_file_path)}"
             if style_file_path
             else ""
         )
         # 小 deck 不低于 600s（不劣化）；大 deck 按页放大，降低整目录超时误杀。
-        timeout_seconds = max(600, int(page_count or 0) * 30)
+        timeout_seconds = max(600, len(page_nums) * 30)
         try:
             cmd = (
                 f"{cli_path('fix', pptx_root)} {quote_path(pages_dir + '/')} "
@@ -5388,7 +5396,48 @@ class QAFixNode(PlanNode):
             logger.error("[P8.2] cli.js fix 异常: %s", exc)
             return False, f"bash_error: {exc}"
         output = combined_output(result)[:2000]
+        restored = await self._restore_pages_broken_by_fix(
+            pages_dir=pages_dir,
+            page_nums=page_nums,
+        )
+        if restored:
+            output = f"{output} dom_restored_from_backup={sorted(restored)}"
         return result.exit_code == 0, output
+
+    async def _restore_pages_broken_by_fix(
+        self,
+        *,
+        pages_dir: str,
+        page_nums: list[int],
+    ) -> list[int]:
+        """fix 后不可导出的页回退 _backup 最新快照；读失败页跳过交 reconcile 兜底。"""
+        restored: list[int] = []
+        for page_num in page_nums:
+            page_path = f"{pages_dir}/page-{page_num}.pptx.html"
+            async with PptCommon.page_path_lock(page_path):
+                after_html = await self._read_page_file(page_path)
+                if not after_html:
+                    continue
+                if _is_slide_exportable(after_html):
+                    continue
+                backup_path = await self._find_latest_backup_path(pages_dir, page_num)
+                if not backup_path:
+                    continue
+                backup_html = await self._read_page_file(backup_path)
+                if backup_html and _is_slide_exportable(backup_html):
+                    if await PptCommon.safe_overwrite_file(
+                        self,
+                        page_path,
+                        backup_html,
+                        already_locked=True,
+                        log_prefix="[P8.2]",
+                    ):
+                        logger.warning(
+                            "[P8.2] page-%d fix 破坏 DOM，已回退 backup",
+                            page_num,
+                        )
+                        restored.append(page_num)
+        return restored
 
     async def _fix_pages(
         self,
