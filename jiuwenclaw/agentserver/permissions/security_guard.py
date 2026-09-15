@@ -249,7 +249,8 @@ def extract_file_path_from_tool_args(tool_name: str, tool_args: dict) -> str | N
 # same env vars as the login-event/token-usage reporter.
 #
 # Config
-_BL_CACHE_TTL_SECONDS = 86400  # 24 hours
+_BL_CACHE_TTL_SECONDS = 86400  # 24 hours (success)
+_BL_FAILURE_CACHE_TTL_SECONDS = 3 * 60 * 60  # 3 hours (failed fetch — balances recovery vs per-call latency)
 _BL_HTTP_TIMEOUT_SECONDS = 5
 _BL_MAX_RETRIES = 2
 _BL_RETRY_DELAY_SECONDS = 1
@@ -356,24 +357,36 @@ def _bl_fetch_with_retry() -> dict[str, list[str]] | None:
 
 
 async def get_blacklist() -> dict[str, list[str]]:
-    """Get current blacklist with 24h cache.
+    """Get current blacklist with cache.
+
+    Success → 24h TTL; failure → 3h TTL (avoids per-call retry latency
+    while the service is down, but recovers within 3h).
 
     Cache-miss dispatches blocking HTTP via ``asyncio.to_thread``
     (same pattern as ``check_kia_file``).
     """
     now = time.time()
     with _bl_cache_lock:
-        if _bl_cache["data"] is not None and now - _bl_cache["ts"] < _BL_CACHE_TTL_SECONDS:
-            return _bl_cache["data"]
+        cached = _bl_cache["data"]
+        if cached is not None:
+            # Success (non-empty) → 24h; failure (empty) → 3h
+            is_success = bool(cached.get("url") or cached.get("filename"))
+            ttl = _BL_CACHE_TTL_SECONDS if is_success else _BL_FAILURE_CACHE_TTL_SECONDS
+            if now - _bl_cache["ts"] < ttl:
+                return cached
 
     fetched = await asyncio.to_thread(_bl_fetch_with_retry)
-    blacklist = fetched if fetched is not None else _BL_EMPTY
+
+    if fetched is not None:
+        with _bl_cache_lock:
+            _bl_cache["data"] = fetched
+            _bl_cache["ts"] = time.time()
+        return fetched
 
     with _bl_cache_lock:
-        _bl_cache["data"] = blacklist
+        _bl_cache["data"] = _BL_EMPTY
         _bl_cache["ts"] = time.time()
-
-    return blacklist
+    return _BL_EMPTY
 
 
 def clear_blacklist_cache() -> None:
