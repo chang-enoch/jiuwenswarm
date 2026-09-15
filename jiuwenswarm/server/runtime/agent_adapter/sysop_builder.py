@@ -2,17 +2,10 @@
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import logging
 import os
-try:
-    import grp
-    import pwd
-except ImportError:  # Windows does not provide the Unix account databases.
-    grp = None
-    pwd = None
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,6 +30,7 @@ from jiuwenswarm.common.utils import (
     get_agent_root_dir,
     get_config_file,
 )
+from jiuwenswarm.edition import is_enterprise
 
 logger = logging.getLogger(__name__)
 
@@ -257,9 +251,18 @@ def _resolve_project_dir(override: str | Path | None) -> Path | None:
     return None
 
 
-def _sandbox_isolation_custom_id(project_dir: str | Path | None) -> str:
+def _sandbox_isolation_custom_id(
+    project_dir: str | Path | None, *, shared_dir: str | Path | None = None,
+) -> str:
     """Stable SysOperation isolation key suffix for per-project sandbox sharing."""
     resolved = _resolve_project_dir(project_dir)
+    if is_enterprise():
+        # Match the trusted workspace mounted for this tenant. A default
+        # project must not reuse another tenant's cached sandbox client.
+        root = Path(shared_dir if shared_dir is not None else get_agent_root_dir()).expanduser().resolve()
+        scope = json.dumps([str(root), str(resolved) if resolved is not None else None])
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+        return f"workspace_project_{digest}"
     if resolved is None:
         return "project_default"
     digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
@@ -591,12 +594,14 @@ def build_filesystem_policy(
 def build_process_policy() -> dict[str, Any]:
     """获取当前进程的有效用户名与用户组名。
 
-    使用 ``geteuid`` / ``getegid`` 解析有效身份；若 passwd/group 中无对应条目,
-    则回退为 UID/GID 的字符串形式。
+    仅企业版（Linux 容器）调用：使用 ``geteuid`` / ``getegid`` 解析有效身份；
+    若 passwd/group 中无对应条目, 则回退为 UID/GID 的字符串形式。
+    非 POSIX 平台（如 Windows 单机版）返回空 dict，调用方跳过 process 段。
     """
-    if grp is None or pwd is None or not hasattr(os, "geteuid"):
-        username = getpass.getuser()
-        return {"run_as_user": username, "run_as_group": username}
+    if not hasattr(os, "geteuid"):
+        return {}
+    import grp
+    import pwd
 
     uid = os.geteuid()
     gid = os.getegid()
@@ -638,7 +643,7 @@ def create_sandbox_sysop_card(
     try:
         if normalized_type == "yuanrong":
             extra_params = _build_yuanrong_extra_params()
-            isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+            isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
             gateway_config = SandboxGatewayConfig(
                 isolation=SandboxIsolationConfig(
                     container_scope=ContainerScope.CUSTOM,
@@ -680,7 +685,10 @@ def create_sandbox_sysop_card(
             startup_mode=startup_mode,
             shared_dir=shared_dir,
         )
-        policy['process'] = build_process_policy()
+        if is_enterprise():
+            process_policy = build_process_policy()
+            if process_policy:
+                policy['process'] = process_policy
         extra_params = {
             "policy": policy,
             "policy_mode": "append",
@@ -693,7 +701,7 @@ def create_sandbox_sysop_card(
         if idle_check_interval is not None:
             extra_params["idle_check_interval"] = idle_check_interval
 
-        isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+        isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
         gateway_config = SandboxGatewayConfig(
             isolation=SandboxIsolationConfig(
                 container_scope=ContainerScope.CUSTOM,

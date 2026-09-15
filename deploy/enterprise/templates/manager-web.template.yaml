@@ -34,12 +34,9 @@ spec:
               value: "http://<<MANAGER_SERVER_NAME>>:<<MANAGER_REST_PORT>>"
             - name: MANAGER_WEB_IDP_TARGET
               value: "http://<<IDENTITY_NAME>>:<<IDENTITY_REST_PORT>>"
-            - name: MANAGER_WEB_USER_WEB_TARGET
-              value: "http://<<WEB_NAME>>:<<WEB_HTTP_PORT>>"
-            - name: MANAGER_WEB_GATEWAY_HTTP_TARGET
-              value: "http://<<GATEWAY_NAME>>:<<GATEWAY_WEB_HTTP_PORT>>"
-            - name: MANAGER_WEB_GATEWAY_WS_TARGET
-              value: "http://<<GATEWAY_NAME>>:<<WEB_PORT>>"
+            # nginx 变量 proxy_pass 需要 resolver
+            - name: MANAGER_WEB_RESOLVER
+              value: "<<MANAGER_WEB_RESOLVER>>"
             - name: TZ
               value: "<<TIMEZONE>>"
 

@@ -5,14 +5,9 @@ from __future__ import annotations
 from jiuwenswarm.server.runtime.agent_adapter import sysop_builder
 
 
-def test_build_process_policy_uses_current_user_without_unix_account_db(
+def test_build_process_policy_skips_process_policy_without_posix_identity(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(sysop_builder, "grp", None)
-    monkeypatch.setattr(sysop_builder, "pwd", None)
-    monkeypatch.setattr(sysop_builder.getpass, "getuser", lambda: "windows-user")
+    monkeypatch.delattr(sysop_builder.os, "geteuid", raising=False)
 
-    assert sysop_builder.build_process_policy() == {
-        "run_as_user": "windows-user",
-        "run_as_group": "windows-user",
-    }
+    assert sysop_builder.build_process_policy() == {}

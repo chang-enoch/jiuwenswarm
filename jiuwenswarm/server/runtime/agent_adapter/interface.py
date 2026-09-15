@@ -193,6 +193,15 @@ def _should_record_user_history(params: Any) -> bool:
     return str(params.get("source") or "") != "proactive_recommendation"
 
 
+def _ask_user_answer_request_id(params: dict[str, Any], fallback: str) -> str:
+    rid = str(params.get("request_id") or "").strip()
+    if isinstance(rid, str):
+        matched = re.search(r"^(?P<base>.+)#\d+$", rid)
+        if matched and matched.group("base").strip():
+            rid = matched.group("base").strip()
+    return rid or str(fallback or "").strip()
+
+
 def _history_media_string(item: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
         value = item.get(key)
@@ -1109,6 +1118,40 @@ class JiuWenSwarm:
     def _append_history_record(self, **kwargs: Any) -> None:
         kwargs.update(self._history_kwargs())
         append_history_record(**kwargs)
+
+    def _append_ask_user_answered_history(
+        self,
+        *,
+        request: AgentRequest,
+        session_id: str,
+    ) -> None:
+        """Record HITL resume so refresh does not revive an already-answered card."""
+        params = request.params if isinstance(request.params, dict) else {}
+        answers = params.get("answers")
+        status = params.get("status")
+        has_answers = isinstance(answers, list) and bool(answers)
+        has_status = isinstance(status, str) and bool(status.strip())
+        if not has_answers and not has_status:
+            return
+        rid = _ask_user_answer_request_id(params, request.request_id)
+        if not rid:
+            return
+        extra: dict[str, Any] = {"request_id": rid}
+        source = str(params.get("source") or "").strip()
+        if source:
+            extra["source"] = source
+        extra["status"] = str(status).strip() if has_status else "answered"
+        self._append_history_record(
+            session_id=session_id,
+            request_id=rid,
+            channel_id=request.channel_id,
+            role="assistant",
+            event_type="chat.ask_user_answered",
+            content="",
+            timestamp=time.time(),
+            extra=extra,
+            mode=params.get("mode", "unknown"),
+        )
 
     def _get_skilldev_service(self):
         """懒初始化并返回 SkillDevService 实例.
@@ -2587,6 +2630,8 @@ class JiuWenSwarm:
                 channel_metadata=request.metadata,
                 mode=request.params.get("mode", "unknown"),
             )
+        else:
+            self._append_ask_user_answered_history(request=request, session_id=session_id)
 
         logger.info(
             "[JiuWenSwarm] 处理请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
@@ -2924,6 +2969,8 @@ class JiuWenSwarm:
                 channel_metadata=request.metadata,
                 mode=params_for_history.get("mode", "unknown"),
             )
+        elif request.req_method != ReqMethod.COMMAND_GOAL:
+            self._append_ask_user_answered_history(request=request, session_id=session_id)
 
         logger.info(
             "[JiuWenSwarm] 处理流式请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
