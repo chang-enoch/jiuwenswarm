@@ -29,22 +29,31 @@ from pathlib import Path
 from types import FrameType
 from typing import TextIO
 
-from jiuwenswarm.common.utils import get_logs_dir
+from jiuwenswarm.common.utils import get_dated_logs_dir
 
 logger = logging.getLogger(__name__)
 
-_SYNC_PRIMITIVE_TYPES = (asyncio.Lock, asyncio.Event, asyncio.Condition, asyncio.Semaphore)
+_SYNC_PRIMITIVE_TYPES = (
+    asyncio.Lock,
+    asyncio.Event,
+    asyncio.Condition,
+    asyncio.Semaphore,
+)
 
 
 def _write_thread_stacks(out: TextIO) -> None:
     out.write("\n########## THREAD STACKS ##########\n")
     thread_names = {t.ident: t.name for t in threading.enumerate()}
     for thread_id, frame in sys._current_frames().items():
-        out.write(f"\n--- Thread {thread_id} ({thread_names.get(thread_id, '?')}) ---\n")
+        out.write(
+            f"\n--- Thread {thread_id} ({thread_names.get(thread_id, '?')}) ---\n"
+        )
         out.write("".join(traceback.format_stack(frame)))
 
 
-def _collect_async_objects() -> tuple[list[asyncio.Task], list[object], list[asyncio.Queue]]:
+def _collect_async_objects() -> tuple[
+    list[asyncio.Task], list[object], list[asyncio.Queue]
+]:
     """Scan the gc heap once for tasks, sync primitives and queues.
 
     ``asyncio.all_tasks()`` needs a running loop in the calling thread and
@@ -82,7 +91,9 @@ def _write_tasks(out: TextIO, tasks: list[asyncio.Task]) -> None:
             out.write(f"<error dumping task: {exc!r}>\n")
 
 
-def _write_waiting_primitives(out: TextIO, primitives: list[object], queues: list[asyncio.Queue]) -> None:
+def _write_waiting_primitives(
+    out: TextIO, primitives: list[object], queues: list[asyncio.Queue]
+) -> None:
     out.write("\n########## SYNC PRIMITIVES WITH WAITERS ##########\n")
     waiting_count = 0
     for primitive in primitives:
@@ -119,14 +130,19 @@ def dump_async_state(service_name: str) -> Path | None:
         Path of the written dump file, or None if the dump failed.
     """
     try:
-        dump_dir = get_logs_dir() / "async_dump"
+        # 按天切分：转储文件落当日目录（触发即写，天然按当天归档）。
+        dump_dir = get_dated_logs_dir() / "async_dump"
         dump_dir.mkdir(parents=True, exist_ok=True)
         now = time.time()
         millis = int(now * 1000) % 1000
-        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now)) + f"_{millis:03d}"
+        timestamp = (
+            time.strftime("%Y%m%d_%H%M%S", time.localtime(now)) + f"_{millis:03d}"
+        )
         dump_path = dump_dir / f"{service_name}_{os.getpid()}_{timestamp}.txt"
         with open(dump_path, "w", encoding="utf-8") as out:
-            out.write(f"===== ASYNC STATE DUMP service={service_name} pid={os.getpid()} time={timestamp} =====\n")
+            out.write(
+                f"===== ASYNC STATE DUMP service={service_name} pid={os.getpid()} time={timestamp} =====\n"
+            )
             out.write(f"argv: {sys.argv!r}\n")
             _write_thread_stacks(out)
             tasks, primitives, queues = _collect_async_objects()
@@ -150,7 +166,9 @@ def install_async_dump_handler(service_name: str) -> None:
         service_name: Short service identifier used in dump file names.
     """
     if not hasattr(signal, "SIGUSR1"):
-        logger.debug("[debug_dump] SIGUSR1 unavailable; async dump handler not installed")
+        logger.debug(
+            "[debug_dump] SIGUSR1 unavailable; async dump handler not installed"
+        )
         return
 
     def _handler(_signum: int, _frame: FrameType | None) -> None:

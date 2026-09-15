@@ -17,11 +17,17 @@ import threading
 import time
 from pathlib import Path
 
-from logging.handlers import RotatingFileHandler
-
 import webview
 
-from jiuwenswarm.common.utils import get_user_workspace_dir, get_logs_dir, wait_for_pid_exit, wait_for_tcp_port
+from jiuwenswarm.common.utils import (
+    get_dated_logs_dir,
+    get_logs_dir,
+    get_user_workspace_dir,
+    make_dated_file_handler,
+    should_precreate_logs_root,
+    wait_for_pid_exit,
+    wait_for_tcp_port,
+)
 from jiuwenswarm.instance_manager.config import (
     BASE_PORTS,
     PORT_TYPES,
@@ -56,7 +62,11 @@ UPDATE_CLEANUP_PATTERNS = (
 
 def _setup_logger() -> logging.Logger:
     logs_dir = get_logs_dir()
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    # 外层日期布局激活时 desktop.log 经 make_dated_file_handler 落日期目录
+    # （handler 自建），锚点根不写入，不预建以免遗留空目录；旧布局锚点
+    # 根即写入根，维持预建。
+    if should_precreate_logs_root():
+        logs_dir.mkdir(parents=True, exist_ok=True)
 
     desktop_logger = logging.getLogger("jiuwenswarm.channels.desktop")
     desktop_logger.setLevel(logging.INFO)
@@ -67,19 +77,16 @@ def _setup_logger() -> logging.Logger:
         desktop_logger.removeHandler(handler)
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
 
-    file_handler = RotatingFileHandler(
-        filename=logs_dir / "desktop.log",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=10,
-        encoding="utf-8",
-    )
+    # 按天切分：<logs_dir>/<YYYY-MM-DD>/desktop.log（日内 2MB 轮转；
+    # 外层日期布局激活时 <DATE_ROOT>/<日期>/jiuwenswarm/<uidKey>/desktop.log）
+    file_handler = make_dated_file_handler("desktop.log")
     file_handler.setFormatter(formatter)
 
     desktop_logger.addHandler(stream_handler)
@@ -153,10 +160,16 @@ def _cleanup_stale_update_artifacts() -> None:
                     path.unlink(missing_ok=True)
                 removed += 1
             except OSError as exc:
-                logger.warning("[desktop] failed to remove stale update artifact %s: %s", path, exc)
+                logger.warning(
+                    "[desktop] failed to remove stale update artifact %s: %s", path, exc
+                )
 
     if removed:
-        logger.info("[desktop] cleaned %d stale update artifact(s) from %s", removed, updates_dir)
+        logger.info(
+            "[desktop] cleaned %d stale update artifact(s) from %s",
+            removed,
+            updates_dir,
+        )
 
 
 def _desktop_save_result(ok: bool, cancelled: bool = False) -> DesktopSaveResult:
@@ -183,7 +196,12 @@ def _build_child_command(name: str, extra_args: list[str] | None = None) -> list
     elif name == "web":
         base = [sys.executable, "-m", "jiuwenswarm.channels.web.app_web"]
     else:
-        base = [sys.executable, "-m", "jiuwenswarm.channels.desktop.desktop_app", UPDATE_HELPER_FLAG]
+        base = [
+            sys.executable,
+            "-m",
+            "jiuwenswarm.channels.desktop.desktop_app",
+            UPDATE_HELPER_FLAG,
+        ]
     if extra_args:
         base.extend(extra_args)
     return base
@@ -243,8 +261,15 @@ def _start_process(
 # cache, 子进程 import 时命中内存而非闪存/磁盘, 显著降低冷启动 import 耗时.
 # 只读首页 (4096B) 触发预读, 零执行零副作用; 非冻结模式 (dev) 无 _MEIPASS 直接跳过.
 _WARMUP_PACKAGES = (
-    "openjiuwen", "faiss", "pymilvus", "google", "a2ui",
-    "sqlite_vec", "tree_sitter", "tiktoken", "tiktoken_ext",
+    "openjiuwen",
+    "faiss",
+    "pymilvus",
+    "google",
+    "a2ui",
+    "sqlite_vec",
+    "tree_sitter",
+    "tiktoken",
+    "tiktoken_ext",
 )
 
 
@@ -351,7 +376,9 @@ def _launch_windows_installer_helper(
 ) -> None:
     target = Path(installer_path).expanduser().resolve()
 
-    logger.info("[update-helper] starting, target=%s, parent_pid=%d", target, parent_pid)
+    logger.info(
+        "[update-helper] starting, target=%s, parent_pid=%d", target, parent_pid
+    )
 
     wait_pid = parent_pid if parent_pid else os.getppid()
     logger.info("[update-helper] waiting for process %d to exit", wait_pid)
@@ -402,7 +429,9 @@ class _WindowApi:
             full_url = f"http://{self._runtime.frontend_host}:{self._runtime.frontend_port}{url}"
         else:
             full_url = url
-        logger.info("[desktop] download_file called: url=%s, filename=%s", full_url, filename)
+        logger.info(
+            "[desktop] download_file called: url=%s, filename=%s", full_url, filename
+        )
         return self._runtime.download_file(full_url, filename)
 
     def save_data_url(self, data_url: str, filename: str) -> DesktopSaveResult:
@@ -415,9 +444,7 @@ class _WindowApi:
 
 
 class DesktopRuntime:
-    def __init__(
-        self, frontend_host: str, ports: dict[str, int]
-    ) -> None:
+    def __init__(self, frontend_host: str, ports: dict[str, int]) -> None:
         self.frontend_host = frontend_host
         self.ports = dict(ports)
         self.frontend_port = int(ports["frontend"])
@@ -587,7 +614,9 @@ class DesktopRuntime:
             raise ValueError("empty_filename")
         return safe_name
 
-    def _select_save_path(self, filename: str, file_types: tuple[str, ...]) -> Path | None:
+    def _select_save_path(
+        self, filename: str, file_types: tuple[str, ...]
+    ) -> Path | None:
         if self.window is None or not hasattr(self.window, "create_file_dialog"):
             raise RuntimeError("desktop_window_unavailable")
 
@@ -622,7 +651,9 @@ class DesktopRuntime:
 
         if not selected_paths:
             return None
-        selected_path = selected_paths if isinstance(selected_paths, str) else selected_paths[0]
+        selected_path = (
+            selected_paths if isinstance(selected_paths, str) else selected_paths[0]
+        )
         try:
             return str(Path(selected_path).expanduser().resolve())
         except Exception:  # noqa: BLE001
@@ -630,12 +661,16 @@ class DesktopRuntime:
 
     def save_data_url(self, data_url: str, filename: str) -> DesktopSaveResult:
         """选择保存位置并保存 PNG data URL。"""
-        if not isinstance(data_url, str) or not data_url.startswith(PNG_DATA_URL_PREFIX):
+        if not isinstance(data_url, str) or not data_url.startswith(
+            PNG_DATA_URL_PREFIX
+        ):
             logger.error("[desktop] invalid data url for share export")
             return _desktop_save_result(False)
 
         try:
-            image_bytes = base64.b64decode(data_url[len(PNG_DATA_URL_PREFIX):], validate=True)
+            image_bytes = base64.b64decode(
+                data_url[len(PNG_DATA_URL_PREFIX) :], validate=True
+            )
         except binascii.Error as exc:
             logger.error("[desktop] failed to decode share export data url: %s", exc)
             return _desktop_save_result(False)
@@ -663,16 +698,19 @@ class DesktopRuntime:
         try:
             if os.name == "nt":
                 import ctypes
+
                 # Windows: 弹窗询问是否打开文件夹
                 result = ctypes.windll.user32.MessageBoxW(
                     0,
                     f"文件已下载到:\n{file_path}\n\n是否打开所在文件夹？",
                     "下载完成",
-                    0x44  # MB_YESNO + MB_ICONINFORMATION
+                    0x44,  # MB_YESNO + MB_ICONINFORMATION
                 )
                 if result == 6:  # IDYES
                     # 打开文件夹并选中文件
-                    explorer_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe")
+                    explorer_path = os.path.join(
+                        os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe"
+                    )
                     subprocess.Popen(
                         [explorer_path, "/select,", file_path],
                         stdout=subprocess.DEVNULL,
@@ -682,9 +720,13 @@ class DesktopRuntime:
             elif sys.platform == "darwin":
                 # macOS: 弹窗询问
                 result = subprocess.run(
-                    ["/usr/bin/osascript", "-e", f'''
+                    [
+                        "/usr/bin/osascript",
+                        "-e",
+                        f"""
                     display alert "下载完成" message "文件已下载到:\\n{file_path}\\n\\n是否打开所在文件夹？" buttons {"取消", "打开文件夹"} default button "打开文件夹" as informational
-                    '''],
+                    """,
+                    ],
                     capture_output=True,
                     text=True,
                 )
@@ -714,10 +756,16 @@ class DesktopRuntime:
             ok = self._launch_linux_install_helper(target, app_executable)
 
         if not ok:
-            logger.error("[desktop] failed to launch update helper for %s", sys.platform)
+            logger.error(
+                "[desktop] failed to launch update helper for %s", sys.platform
+            )
             return False
 
-        logger.info("[desktop] launched update helper for %s, parent pid=%d", sys.platform, os.getpid())
+        logger.info(
+            "[desktop] launched update helper for %s, parent pid=%d",
+            sys.platform,
+            os.getpid(),
+        )
         self.close_window()
         return True
 
@@ -727,7 +775,9 @@ class DesktopRuntime:
         updates_dir.mkdir(parents=True, exist_ok=True)
 
         if not os.access(updates_dir, os.W_OK):
-            logger.error("[desktop] no write permission for updates directory: %s", updates_dir)
+            logger.error(
+                "[desktop] no write permission for updates directory: %s", updates_dir
+            )
             return False
 
         # Derive the .app bundle path from the frozen executable.
@@ -744,7 +794,9 @@ class DesktopRuntime:
         else:
             install_target = "/Applications/JiuwenSwarm.app"
 
-        log_file = get_logs_dir() / "update_helper.log"
+        # 按天切分布局：helper 日志同样落当日目录（shell 重定向目标，
+        # 由 helper 脚本负责 mkdir -p）。
+        log_file = get_dated_logs_dir() / "update_helper.log"
         backend_port = self.backend_port
         frontend_port = self.frontend_port
 
@@ -760,6 +812,7 @@ class DesktopRuntime:
 set -e
 
 LOG_FILE={q_log_file}
+mkdir -p "$(dirname "$LOG_FILE")"
 exec >>"$LOG_FILE" 2>&1
 
 echo "=== JiuwenSwarm macOS install helper: $(date) ==="
@@ -878,7 +931,8 @@ echo "=== install helper finished: $(date) ==="
         )
         logger.info(
             "[desktop] macOS install helper launched, target=%s, install_target=%s",
-            target, install_target,
+            target,
+            install_target,
         )
         return True
 
@@ -889,7 +943,9 @@ echo "=== install helper finished: $(date) ==="
         updates_dir.mkdir(parents=True, exist_ok=True)
 
         if not os.access(updates_dir, os.W_OK):
-            logger.error("[desktop] no write permission for updates directory: %s", updates_dir)
+            logger.error(
+                "[desktop] no write permission for updates directory: %s", updates_dir
+            )
             return False
 
         install_dir = str(app_executable.parent.resolve())
@@ -931,7 +987,9 @@ nohup {q_executable} >/dev/null 2>&1 &
         logger.info("[desktop] Linux install helper launched, target=%s", target)
         return True
 
-    def _launch_windows_install_helper(self, target: Path, app_executable: Path) -> bool:
+    def _launch_windows_install_helper(
+        self, target: Path, app_executable: Path
+    ) -> bool:
         detached_flags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
