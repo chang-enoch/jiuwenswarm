@@ -139,10 +139,12 @@ def test_normal_text_prompt_builder_keeps_string_flow(monkeypatch):
 
     monkeypatch.setenv("JIUWENSWARM_A2UI_ENABLED", "true")
 
-    prompt = build_user_prompt("你好", files={}, channel="web", language="zh")
+    built = build_user_prompt("你好", files={}, channel="web", language="zh")
 
-    assert '"content": "你好"' in prompt
-    assert '"type": "user input"' in prompt
+    # user_query 承载纯用户原文；context 不再含 content 字段
+    assert built.user_query == "你好"
+    assert built.context.get("type") == "user input"
+    assert "content" not in built.context
 
 
 def test_a2ui_stream_probe_detects_split_protocol_marker():
@@ -312,7 +314,7 @@ def test_agent_prompt_builder_accepts_a2ui_client_event_dict(monkeypatch):
 
     monkeypatch.setenv("JIUWENSWARM_A2UI_ENABLED", "true")
 
-    prompt = build_user_prompt(
+    built = build_user_prompt(
         {
             "type": "a2ui.client_event",
             "protocolVersion": "0.8",
@@ -330,9 +332,10 @@ def test_agent_prompt_builder_accepts_a2ui_client_event_dict(monkeypatch):
         language="zh",
     )
 
-    assert "你收到了一次 A2UI 组件交互" in prompt
-    assert "submit_form" in prompt
-    assert "张三" in prompt
+    # a2ui 事件走早退路径：返回 BuiltUserPrompt，user_query 承载 a2ui prompt
+    assert "你收到了一次 A2UI 组件交互" in built.user_query
+    assert "submit_form" in built.user_query
+    assert "张三" in built.user_query
 
 
 @pytest.mark.asyncio

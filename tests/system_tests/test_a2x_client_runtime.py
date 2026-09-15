@@ -110,9 +110,10 @@ def _make_request(session_id: str = "web_a2x_system_test") -> tuple[AgentRequest
         is_stream=False,
         metadata={"source": "a2x_system_test"},
     )
+    built = build_user_prompt(query, files={}, channel=channel, language=language)
     inputs = {
         "conversation_id": session_id,
-        "query": build_user_prompt(query, files={}, channel=channel, language=language),
+        "query": built.interaction_prefix + built.user_query + built.statusline_directive,
         "channel": channel,
         "language": language,
     }

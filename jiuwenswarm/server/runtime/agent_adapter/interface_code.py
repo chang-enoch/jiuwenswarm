@@ -1239,6 +1239,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                 project_dir=runtime_config.project_dir or self._project_dir,
             )
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
+            self._runtime_prompt_rail.set_user_message_context(runtime_config.user_message_context)
         # PermissionInterruptRail: per-request trusted_dirs/project_dir 注入，
         # 使这些子树的文件读写执行及目录内脚本直执行按 allow 处理。
         # 用 getattr 兼容绕过 __init__ 的测试构造（_permission_rail 仅在 rail 构建流程赋值）。
