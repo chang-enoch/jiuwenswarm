@@ -2978,18 +2978,15 @@ async def test_consume_stream_with_query_broadcasts_leader_and_teammate_outputs(
     )
 
     assert ready_calls == [("sess-leader-only", "demo-team")]
-    # After team.runtime_ready is broadcast, seen_team_events=True so
-    # chat.final events are suppressed; team.completed emits
-    # chat.processing_status(is_complete=True) instead.
+    # 终态判定改为状态真值后：chat.final 不再逐次发终态（有成员产出的轮次
+    # 非干净纯文本，走 settle/team.completed 路径）；回合终态只在
+    # team.completed 处发一次。
     assert [event["event_type"] for event in broadcasted] == [
         "chat.processing_status",
         "team.runtime_ready",
         'chat.final',
-        'chat.processing_status',
         'chat.final',
-        'chat.processing_status',
         'chat.final',
-        'chat.processing_status',
         "chat.processing_status",
         'team.completed',
     ]
@@ -2999,11 +2996,6 @@ async def test_consume_stream_with_query_broadcasts_leader_and_teammate_outputs(
     # Round-end processing_status (from team.completed)
     assert broadcasted[-2]["is_processing"] is False
     assert broadcasted[-2]["is_complete"] is True
-    for index, event in enumerate(broadcasted):
-        if event.get("event_type") == "chat.final":
-            next_event = broadcasted[index + 1]
-            assert next_event["event_type"] == "chat.processing_status"
-            assert next_event["is_processing"] is False
 
 
 @pytest.mark.anyio
