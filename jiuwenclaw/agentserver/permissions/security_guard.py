@@ -320,8 +320,8 @@ def _bl_fetch_from_api() -> dict[str, list[str]] | None:
     for scene in data:
         if not isinstance(scene, dict):
             continue
-        scene_name = scene.get("sceneName", "")
-        blacklist = scene.get("blacklist", [])
+        scene_name = scene.get("sceneName") or ""
+        blacklist = scene.get("blacklist") or []
         if not isinstance(blacklist, list):
             continue
         for item in blacklist:
@@ -375,7 +375,11 @@ async def get_blacklist() -> dict[str, list[str]]:
             if now - _bl_cache["ts"] < ttl:
                 return cached
 
-    fetched = await asyncio.to_thread(_bl_fetch_with_retry)
+    try:
+        fetched = await asyncio.to_thread(_bl_fetch_with_retry)
+    except Exception as exc:
+        logger.warning("[blacklist] get_blacklist unexpected error: %s, pass-through", exc)
+        fetched = None
 
     if fetched is not None:
         with _bl_cache_lock:
