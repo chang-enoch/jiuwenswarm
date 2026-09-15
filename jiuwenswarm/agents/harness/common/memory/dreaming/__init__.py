@@ -42,15 +42,16 @@ async def start_dreaming(
     """Start dreaming service.
     Idempotent: same mode repeated call returns existing instance.
     """
-    if mode in _orchestrators:
-        return _orchestrators[mode]
-
     from .sweeper import DreamingConfig, Sweeper
 
     cfg = DreamingConfig.load(mode)
     if not cfg.enabled:
+        await stop_dreaming(mode)
         logger.info("[dreaming] %s mode enabled=false, not started", mode)
         return None
+
+    if mode in _orchestrators:
+        return _orchestrators[mode]
 
     sweeper = Sweeper(sessions_dir, output_dir, mode=mode)
     sweeper.init()

@@ -35,6 +35,7 @@ from openjiuwen.harness.prompts import resolve_language
 from openjiuwen.harness.rails import SkillUseRail
 
 from jiuwenswarm.agents.swarm.context import SwarmBuildContext
+from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,8 @@ class CodeProjectMemoryInput(ConstructionInput):
 )
 def build_code_project_memory(params: dict[str, Any], ctx: SwarmBuildContext) -> Any:
     """Build ProjectMemoryRail (auto-loads JIUWENSWARM.md / CLAUDE.md etc.)."""
+    if not is_builtin_memory_enabled("code", ctx.config or {}):
+        return None
     from jiuwenswarm.agents.harness.common.rails import ProjectMemoryRail
 
     try:
@@ -300,6 +303,9 @@ class CodeCodingMemoryInput(ConstructionInput):
 )
 def build_code_coding_memory(params: dict[str, Any], ctx: SwarmBuildContext) -> Any:
     """Build CodingMemoryRail and publish it on ``ctx.extras`` for code_agent reuse."""
+    if not is_builtin_memory_enabled("code", ctx.config or {}):
+        ctx.extras.pop(CODING_MEMORY_EXTRAS_KEY, None)
+        return None
     try:
         from jiuwenswarm.server.runtime.agent_adapter.interface_code import (
             create_coding_memory_rail,
@@ -316,7 +322,7 @@ def build_code_coding_memory(params: dict[str, Any], ctx: SwarmBuildContext) -> 
         rail = create_coding_memory_rail(
             project_dir=inp.project_dir,
             agent_workspace_dir=workspace_root,
-            config={"embed": inp.embed_config},
+            config={**(ctx.config or {}), "embed": inp.embed_config},
         )
         # Share the instance with the code_agent sub-agent via the build context.
         ctx.extras[CODING_MEMORY_EXTRAS_KEY] = rail

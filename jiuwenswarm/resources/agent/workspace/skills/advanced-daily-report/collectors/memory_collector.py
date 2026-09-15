@@ -8,6 +8,7 @@
 - 提取工作摘要
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -16,6 +17,39 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 _REPORT_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def legacy_memory_enabled(workspace_dir: str | Path) -> bool:
+    """Use Swarm's legacy switch; standalone skill processes read its YAML."""
+    try:
+        from jiuwenswarm.common.config import get_config
+        from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_legacy_workspace_memory_enabled
+    except ImportError:
+        pass
+    else:
+        return is_legacy_workspace_memory_enabled(get_config())
+    try:
+        import yaml
+    except ImportError:
+        return False
+    try:
+        roots = ([Path(os.environ["JIUWENSWARM_DATA_DIR"])]
+                 if os.environ.get("JIUWENSWARM_DATA_DIR") else list(Path(workspace_dir).resolve().parents))
+        config_file = next(root / "config/config.yaml" for root in roots
+                           if (root / "config/config.yaml").is_file())
+        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+        def resolve(value):
+            return re.sub(r"\$\{([^:}]+)(?::-([^}]*))?\}",
+                          lambda m: os.environ.get(m[1], m[2] or ""), str(value))
+        memory = config.get("memory", {})
+        engine = resolve(memory.get("engine", "builtin")).strip().lower()
+        provider = resolve(memory.get("external", {}).get("provider", "")).strip().lower()
+        enabled = config.get("modes", {}).get("agent", {}).get("memory", {}).get("enabled", False)
+        return ((engine in {"external", "both"} and provider == "old-celia")
+                or (engine in {"builtin", "both"} and resolve(memory.get("mode", "local")).strip().lower() == "local"
+                    and resolve(enabled).strip().lower() == "true"))
+    except (OSError, ValueError, TypeError, AttributeError, StopIteration, yaml.YAMLError):
+        return False
 
 
 @dataclass
@@ -110,6 +144,8 @@ class MemoryCollector:
             date = datetime.now(_REPORT_TZ).strftime("%Y-%m-%d")
 
         data = MemoryData()
+        if not legacy_memory_enabled(self.workspace_dir):
+            return data
 
         # 读取今日记忆
         today_file = self.memory_dir / f"{date}.md"

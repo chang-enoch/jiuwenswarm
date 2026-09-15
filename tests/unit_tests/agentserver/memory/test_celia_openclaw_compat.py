@@ -113,7 +113,10 @@ def test_memory_query_extracts_direct_and_wrapped_a2a():
     assert context.message_id == "msg"
 
 
-def test_memory_query_five_actions_and_wire_shape(tmp_path):
+def test_memory_query_five_actions_and_wire_shape(tmp_path, monkeypatch):
+    monkeypatch.setattr("jiuwenswarm.common.config.get_config", lambda: {
+        "memory": {"engine": "external", "external": {"provider": "old-celia"}},
+    })
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "USER.md").write_text("user detail", encoding="utf-8")

@@ -8,7 +8,11 @@ from jiuwenswarm.agents.harness.common import memory_rpc
 
 
 @pytest.mark.asyncio
-async def test_coding_memory_dir_is_project_scoped_under_workspace(tmp_path):
+async def test_coding_memory_dir_is_project_scoped_under_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_rpc, "get_config", lambda: {
+        "memory": {"mode": "local", "engine": "builtin"},
+        "modes": {"code": {"memory": {"enabled": True}}},
+    })
     workspace = tmp_path / "agent_workspace"
     project_dir = tmp_path / "project"
     coding_memory_dir = workspace / "coding_memory" / "project"
