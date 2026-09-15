@@ -408,6 +408,67 @@ class PptCommon:
             return text[:max_chars] + "\n\n...(内容已截断)"
         return text
 
+    _TRANSIENT_LOCK_ERROR_MARKERS: tuple[str, ...] = (
+        "cannot operate on a closed database",
+        "database is locked",
+        "database table is locked",
+    )
+    # 退避间隔需覆盖秒级的陈旧锁存活期，立即重试大概率命中同一把坏锁
+    _TRANSIENT_LOCK_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+    @classmethod
+    def _tool_result_failure_text(cls, result: Any) -> str:
+        """从 read_file 工具结果中提取失败错误文本；成功结果返回空串。"""
+        if hasattr(result, "success"):
+            if result.success is False:
+                if hasattr(result, "error") and result.error:
+                    return str(result.error)
+                return str(result)
+            return ""
+        if isinstance(result, str):
+            text = result.strip()
+            return text if text.startswith(("success=False", "success= False")) else ""
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                error = result.get("error")
+                return str(error) if error else str(result)
+            return ""
+        return ""
+
+    @classmethod
+    def _is_transient_lock_failure(cls, failure_text: str) -> bool:
+        lowered = failure_text.lower()
+        return any(marker in lowered for marker in cls._TRANSIENT_LOCK_ERROR_MARKERS)
+
+    @classmethod
+    async def _wait_for_transient_retry(
+        cls,
+        log_prefix: str,
+        attempt: int,
+        path: str,
+        failure_text: str,
+    ) -> bool:
+        """瞬时锁错误按退避间隔等待重试；额度耗尽返回 False。"""
+        if attempt > len(cls._TRANSIENT_LOCK_RETRY_DELAYS):
+            logger.warning(
+                "%s 读取文件瞬时锁错误(重试耗尽) path=%s: %s",
+                log_prefix,
+                path,
+                failure_text,
+            )
+            return False
+        delay = cls._TRANSIENT_LOCK_RETRY_DELAYS[attempt - 1]
+        logger.warning(
+            "%s 读取文件瞬时锁错误(第%d次)，%.1fs后重试 path=%s: %s",
+            log_prefix,
+            attempt,
+            delay,
+            path,
+            failure_text,
+        )
+        await asyncio.sleep(delay)
+        return True
+
     @classmethod
     async def read_file_with_retry(
         cls,
@@ -416,24 +477,28 @@ class PptCommon:
         *,
         log_prefix: str = "[ppt]",
     ) -> str:
-        """读取文件内容；非 AbortError 异常时重试一次。"""
+        """读取文件内容；瞬时锁错误（异常或失败结果）按退避序列重试，其他异常重试一次。"""
         if not path:
             return ""
         if not node.has_tool("read_file"):
             logger.warning("%s read_file 工具不可用 %s", log_prefix, path)
             return ""
-        for attempt in (1, 2):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 result = await node.call_tool("read_file", file_path=path)
-                return cls.parse_tool_file_content(result)
             except Exception as e:
                 if isinstance(e, AbortError):
                     raise
-                if attempt < 2:
+                if cls._is_transient_lock_failure(str(e)):
+                    if await cls._wait_for_transient_retry(log_prefix, attempt, path, str(e)):
+                        continue
+                    return ""
+                if attempt == 1:
                     logger.warning(
-                        "%s 读取文件失败(第%d次)，重试 path=%s: %s",
+                        "%s 读取文件失败(第1次)，重试 path=%s: %s",
                         log_prefix,
-                        attempt,
                         path,
                         e,
                     )
@@ -445,7 +510,15 @@ class PptCommon:
                     e,
                 )
                 return ""
-        return ""
+
+            failure_text = cls._tool_result_failure_text(result)
+            if failure_text and cls._is_transient_lock_failure(failure_text):
+                if await cls._wait_for_transient_retry(
+                    log_prefix, attempt, path, failure_text
+                ):
+                    continue
+                return ""
+            return cls.parse_tool_file_content(result)
 
     @classmethod
     async def write_file(
