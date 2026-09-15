@@ -502,10 +502,7 @@ def _sync_target_total_pages(inputs: dict[str, Any]) -> None:
         return
     mode = str(inputs.get("page_structure_mode") or "default").strip().lower()
     if mode == "explicit_sequence":
-        # 清单条目数应由上游槽位给出；已有合法值则保留
-        existing = inputs.get("total_pages")
-        if isinstance(existing, int) and existing > 0:
-            return
+        # 清单条目数应由上游槽位给出；本函数不得替 explicit 推算
         return
     mid = PptCommon.resolve_mid_structural_page_count(
         page_count,
@@ -1084,6 +1081,7 @@ def _apply_answer_item(
         if count is not None:
             inputs["page_count"] = count
             inputs["page_count_user_specified"] = True
+            _sync_target_total_pages(inputs)
     elif field == "audience":
         inputs["audience"] = _audience_from_label(label, other_text)
     elif field == "presentation_purpose":
@@ -1417,6 +1415,7 @@ async def _llm_default_batch_fields(
         # 超时/空答兜底视为「页数收集已完成」，否则 HITL resume 会因
         # page_count_user_specified=False 再次进入 P2.2，形成页数↔风格死循环。
         inputs["page_count_user_specified"] = True
+        _sync_target_total_pages(inputs)
     if "audience" in missing_fields:
         audience = payload.get("audience")
         inputs["audience"] = (

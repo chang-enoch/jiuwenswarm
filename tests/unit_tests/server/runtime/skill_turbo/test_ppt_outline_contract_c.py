@@ -292,6 +292,35 @@ def test_merge_slot_explicit_preserves_total_pages():
     assert inputs["total_pages"] == 4
 
 
+def test_p22_answer_resyncs_stale_total_pages_after_p21_guess():
+    """P2.1 预填 total 后，P2.2 用户改 page_count 必须重算 total_pages。"""
+    inputs: dict = {}
+    rc._merge_slot_payload(
+        inputs,
+        {
+            "topic": "主题",
+            "page_count": 8,
+            "page_count_basis": "content",
+            "page_count_user_specified": False,
+            "page_structure_mode": "default",
+            "exclude_cover_ending": False,
+            "structural_page_request": "none",
+        },
+    )
+    assert inputs["total_pages"] == 10
+
+    rc._apply_answer_item(
+        inputs,
+        {
+            "header": "页数",
+            "selected_options": ["5"],
+        },
+    )
+    assert inputs["page_count"] == 5
+    assert inputs["page_count_user_specified"] is True
+    assert inputs["total_pages"] == 7
+
+
 def test_content_pages_from_total_respects_exclude():
     from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.ppt_common import PptCommon
 
