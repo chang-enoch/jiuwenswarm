@@ -66,8 +66,26 @@ def _thinking_discipline_prompt(language: str) -> PromptSection:
    - ❌ 错误：[核心摘要：本周完成客户A三期需求评审，确认3个核心模块交付范围……。]（这是把产物文案搬进思考）
 4. **决策 = 结论 + 一句理由**：方案取舍（如表头设计、列数据选择）、约束核对（模糊词查询、日期排算）仍要思考，但每项一两行给出结论即可，不展开成文。
 5. **思考预算**：单轮思考一般不超过 20 行。下一步动作已明确时，压缩到几行直接发起工具调用。
+
+## 写文件轮（强制）
+
+本轮的动作是：直接调用写文件类工具（write_file / edit_file）产出文件。素材、模板与方案均已在前文确定。
+
+思考只允许两行以内：
+1. 第一行：写哪个文件（如「按前文 content.md 与 common 模板渲染 document.html」）。
+2. 随后立即发起工具调用。
+
+**硬规则（违反任一条即为错误输出，即使产物正确也算失败）：**
+- 将要写入文件的具体内容——HTML/Markdown 全文或片段、TOC 结构与锚点 id 映射、章节标题清单、占位符→值映射、逐条文案、表格行——只允许出现在 tool_calls 参数里，严禁在思考中出现任何一部分。
+- 占位符替换、markdown→HTML 转换、锚点与 id 生成，全部在工具参数中直接完成，禁止在思考中预演或罗列。
+- 所需素材已在前文工具结果中，**禁止**为确认内容再调用 read_file / grep 等工具；禁止复述 content.md、模板或上下文已有结构。
 """
+        # 「写文件轮」小节正文为实验验证的 v2 原文逐字节保留（2026-09-16 llm_reason_test_0915
+        # 独立采样：n=7 中 6/7 rtok≤150、中位 52 vs 基线中位 1005）。该措辞高度敏感：
+        # 例举替换、括号化、追加任一改动均使压制力崩塌（v3~v6 四版证伪），修改前必须重放复验。
     else:
+        # en 「Write-file turn」is a structural translation of the verified cn v2.
+        # cn wording is highly sensitive (see cn-branch comment); do not casually rephrase en either.
         content = """# Thinking discipline (mandatory, for reasoning_content)
 
 Both the thinking process and tool-call arguments are fully persisted and billed. Thinking is for **decisions**—what to do, which option to pick, which constraints to watch. Artifacts are for **content**. The two must not overlap.
@@ -81,6 +99,19 @@ Both the thinking process and tool-call arguments are fully persisted and billed
    - Wrong: [Core summary: This week finished the phase-3 review for customer A and confirmed the delivery scope of 3 core modules...] (that moves artifact copy into thinking)
 4. **Decision = conclusion + one reason**: Tradeoffs (headers, column choices) and constraint checks (fuzzy-term lookup, date arithmetic) still belong in thinking, but one or two lines per item—do not expand into prose.
 5. **Thinking budget**: Keep a single turn of thinking to about 20 lines. When the next action is already clear, compress to a few lines and issue the tool call.
+
+## Write-file turn (mandatory)
+
+This turn's action is: call a write-file tool (write_file / edit_file) directly to produce the file. Source material, template, and plan are already settled earlier in the conversation.
+
+Thinking may be at most two lines:
+1. Line 1: which file to write (e.g. "render document.html from earlier content.md and the common template").
+2. Then issue the tool call immediately.
+
+**Hard rules (breaking any one is incorrect output, even if the artifact is correct):**
+- Concrete content destined for the file—full or partial HTML/Markdown, TOC structure and anchor-id mapping, chapter-title lists, placeholder→value mapping, per-item copy, table rows—may appear only in `tool_calls` arguments; none of it may appear in thinking.
+- Placeholder substitution, markdown→HTML conversion, and anchor/id generation must be done directly in the tool arguments; do not preview or enumerate them in thinking.
+- Required source material is already in earlier tool results. **Do not** call read_file / grep or similar to re-confirm content; do not restate content.md, the template, or structure already present in context.
 """
     return PromptSection(
         name=LocalSectionName.THINKING_DISCIPLINE,

@@ -34,6 +34,25 @@ def test_thinking_discipline_cn_covers_hard_rules():
     assert "tool_calls" in content
 
 
+def test_thinking_discipline_cn_write_file_turn_section():
+    # 「写文件轮」小节：实验验证的 v2 原文（措辞敏感，修改前须重放复验，见 prompt_builder 注释）
+    content = _thinking_discipline_prompt("cn").content["cn"]
+    assert "## 写文件轮（强制）" in content
+    assert "TOC 结构与锚点 id 映射" in content
+    assert "为确认内容再调用 read_file" in content
+    # 小节位于思考纪律主标题之后
+    assert content.index("# 思考纪律") < content.index("## 写文件轮")
+
+
+def test_thinking_discipline_en_write_file_turn_section():
+    # en 「Write-file turn」mirrors the verified cn v2 structure (see prompt_builder comments)
+    content = _thinking_discipline_prompt("en").content["en"]
+    assert "## Write-file turn (mandatory)" in content
+    assert "TOC structure and anchor-id mapping" in content
+    assert "read_file" in content
+    assert content.index("# Thinking discipline") < content.index("## Write-file turn")
+
+
 def test_thinking_discipline_en_covers_hard_rules():
     content = _thinking_discipline_prompt("en").content["en"]
     assert "# Thinking discipline" in content
