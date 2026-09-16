@@ -95,11 +95,7 @@ process_restart() {
 
 # ==================== Main function ====================
 main() {
-    local default_admin_password="${DEPLOY_VARS[IDENTITY_ADMIN_PASSWORD]}"
-    local default_user1_password="${DEPLOY_VARS[IDENTITY_USER1_PASSWORD]}"
     read_env_from_file "${CUSTOM_ENV_FILE}" "DEPLOY_VARS"
-    DEPLOY_VARS[IDENTITY_ADMIN_PASSWORD]="${DEPLOY_VARS[IDENTITY_ADMIN_PASSWORD]:-$default_admin_password}"
-    DEPLOY_VARS[IDENTITY_USER1_PASSWORD]="${DEPLOY_VARS[IDENTITY_USER1_PASSWORD]:-$default_user1_password}"
     parse_args "$@"
     link_mtls_check
     detect_os
