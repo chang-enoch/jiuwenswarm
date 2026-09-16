@@ -180,6 +180,14 @@ async def test_external_mode_blocks_legacy_dreaming_even_with_env_override(confi
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled,tool,blocked", [
     (True, "memory_store", True),
+    (True, "mcp_celia-memory_celia_memory_store", True),
+    (False, "mcp_celia-memory_celia_memory_store", True),
+    (True, "mcp_celia-memory_celia_memory_global_load", False),
+    (False, "mcp_celia-memory_celia_memory_global_load", True),
+    (True, "mcp_celia-memory_celia_memory_scene_load", False),
+    (False, "mcp_celia-memory_celia_memory_scene_load", True),
+    (True, "mcp_celia-memory_celia_memory_record_search", False),
+    (False, "mcp_celia-memory_celia_memory_record_search", True),
     (True, "mcp_celia-memory_celia.memory_store", True),
     (True, "mcp_celia-memory_celia.memory_record_search", False),
     (False, "mcp_celia-memory_celia.memory_record_search", True),
@@ -202,9 +210,10 @@ async def test_avatar_permissions_cover_current_memory_tools(enabled, tool, bloc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
-async def test_sensitive_filter_obeys_existing_switch_for_celia(config, enabled):
+@pytest.mark.parametrize("tool_name", ["mcp_celia-memory_celia_memory_store", "mcp_celia-memory_celia.memory_store"])
+async def test_sensitive_filter_obeys_existing_switch_for_celia(config, enabled, tool_name):
     config["memory"]["forbidden_memory_definition"] = {"enabled": enabled, "patterns": ["AUDIT_SECRET"]}
-    ctx = SimpleNamespace(extra={}, inputs=SimpleNamespace(tool_name="mcp_celia-memory_celia.memory_store",
+    ctx = SimpleNamespace(extra={}, inputs=SimpleNamespace(tool_name=tool_name,
                           tool_args={"content": "AUDIT_SECRET"}, tool_call=None))
     await MemoryForbiddenRail().before_tool_call(ctx)
     assert bool(ctx.extra.get("_skip_tool")) is enabled

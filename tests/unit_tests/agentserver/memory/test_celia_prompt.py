@@ -19,9 +19,9 @@ def test_packaged_celia_prompt_contains_current_memory_contract():
     content = prompt_module.load_celia_agent_prompt()
 
     assert content.startswith("## Memory")
-    assert "`mcp_celia-memory_celia.memory_store` only for three specific circumstances" in content
-    assert "`mcp_celia-memory_celia.memory_scene_load`" in content
-    assert "`mcp_celia-memory_celia.memory_record_search`" in content
+    assert "`mcp_celia-memory_celia_memory_store` only for three specific circumstances" in content
+    assert "`mcp_celia-memory_celia_memory_scene_load`" in content
+    assert "`mcp_celia-memory_celia_memory_record_search`" in content
     assert "searchType='atomic_fact'" in content
     assert "USER.md" not in content and "MEMORY.md" not in content
     assert "CELIA_MEMORY_OVERVIEW" not in content and "CELIA_MEMORY_SCENES" not in content
