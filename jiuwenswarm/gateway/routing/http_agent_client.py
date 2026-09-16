@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _PUSH_RETRY_SECONDS = 3.0
+# 企业按 Pod 订阅：连续 TCP 失败才停，避免活 Pod 闪断被立刻 drop。
+_PUSH_MAX_CONNECT_FAILURES = 3
 # 与 WebSocketAgentServerClient._delayed_cleanup_cancelled_request_id 对齐。
 _CANCELLED_RID_TTL_SECONDS = 2.0
 
@@ -142,6 +144,7 @@ class HttpSseAgentServerClient(AgentServerClient):
         timeout_s: float = AGENT_REQUEST_TIMEOUT_SECONDS,
         http_client: httpx.AsyncClient | None = None,
         link_mtls_config: LinkMTLSConfig | None = None,
+        retry_push_connect: bool = True,
     ) -> None:
         self._timeout_s = float(timeout_s)
         self._http = http_client
@@ -158,6 +161,9 @@ class HttpSseAgentServerClient(AgentServerClient):
         self._cancelled_request_ids: set[str] = set()
         self._inflight_stream_ids: dict[str, _StreamScope | None] = {}
         self._link_mtls = link_mtls_config
+        # False：连续 TCP 失败后停（企业按 Pod IP）。True：继续重连（开源固定 URL）。
+        self._retry_push_connect = retry_push_connect
+        self._push_connect_failures = 0
 
     def _link_config(self) -> LinkMTLSConfig:
         if self._link_mtls is None:
@@ -181,7 +187,21 @@ class HttpSseAgentServerClient(AgentServerClient):
         self, handler: Callable[[dict[str, Any]], Awaitable[None]] | None
     ) -> None:
         self._on_server_push = handler
-        if handler is not None and self._running and self._push_task is None:
+        self._start_push_loop()
+
+    def add_push_done_callback(
+        self, callback: Callable[[asyncio.Task[None]], None]
+    ) -> None:
+        """Observe push-loop exit without poking ``_push_task``."""
+        task = self._push_task
+        if isinstance(task, asyncio.Task):
+            task.add_done_callback(callback)
+
+    def _start_push_loop(self) -> None:
+        task = self._push_task
+        if task is not None and task.done():
+            self._push_task = None
+        if self._on_server_push is not None and self._running and self._push_task is None:
             self._push_task = asyncio.create_task(self._push_loop(), name="agent-http-push")
 
     @property
@@ -260,9 +280,9 @@ class HttpSseAgentServerClient(AgentServerClient):
             )
         self._server_ready = True
         self._running = True
+        self._push_connect_failures = 0
         logger.info("[HttpSseAgentServerClient] health ok: %s", health_url)
-        if self._on_server_push is not None and self._push_task is None:
-            self._push_task = asyncio.create_task(self._push_loop(), name="agent-http-push")
+        self._start_push_loop()
 
     async def disconnect(self) -> None:
         self._running = False
@@ -471,6 +491,7 @@ class HttpSseAgentServerClient(AgentServerClient):
                     ),
                     timeout=timeout,
                 ) as response:
+                    self._push_connect_failures = 0
                     response.raise_for_status()
                     async for frame in iter_sse_data_frames(response):
                         if frame.get("event_type") == "gateway.push_ready":
@@ -500,6 +521,21 @@ class HttpSseAgentServerClient(AgentServerClient):
             except Exception as exc:  # noqa: BLE001
                 if not self._running:
                     return
+                if not self._retry_push_connect and isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout)
+                ):
+                    self._push_connect_failures += 1
+                    if self._push_connect_failures >= _PUSH_MAX_CONNECT_FAILURES:
+                        logger.warning(
+                            "[HttpSseAgentServerClient] events/stream 目标不可达，停止推送循环: "
+                            "%s url=%s failures=%s",
+                            exc,
+                            url,
+                            self._push_connect_failures,
+                        )
+                        self._running = False
+                        self._server_ready = False
+                        return
                 logger.warning(
                     "[HttpSseAgentServerClient] events/stream 断开，%.0fs 后重连: %s",
                     _PUSH_RETRY_SECONDS,
