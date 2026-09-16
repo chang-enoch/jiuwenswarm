@@ -5180,12 +5180,22 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     .get("model_name", "gpt-4"),
                 },
             ),
-            _RailBuildInfo(
-                "_context_processor_rail",
-                _build_context_processor_rail,
-                {"config": self._config_cache},
-            ),
         ]
+        _ctx_engine_cfg = self._config_cache.get("context_engine_config", {})
+        _ctx_engine_enabled = _ctx_engine_cfg.get("enabled", False) if isinstance(_ctx_engine_cfg, dict) else False
+        if _ctx_engine_enabled:
+            rail_infos.append(
+                _RailBuildInfo(
+                    "_context_processor_rail",
+                    _build_context_processor_rail,
+                    {"config": self._config_cache},
+                )
+            )
+        else:
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] ContextProcessorRail skipped at cold start "
+                "(context_engine_config.enabled=false)"
+            )
 
         if self._is_xiaoyi_channel():
             rail_infos = [info for info in rail_infos if info.attr_name != "_permission_rail"]
