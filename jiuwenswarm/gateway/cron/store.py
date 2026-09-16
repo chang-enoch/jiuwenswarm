@@ -288,7 +288,8 @@ class CronJobStore:
         job = CronJob(
             id=str(job_id or "").strip() or uuid.uuid4().hex,
             name=str(name or "").strip(),
-            enabled=bool(enabled),
+            # 建好即启用：None 与缺省同等对待（bool(None) 会静默变 False）。
+            enabled=bool(enabled) if enabled is not None else True,
             cron_expr=str(cron_expr or "").strip(),
             timezone=str(timezone or "").strip(),
             wake_offset_seconds=int(wake_offset_seconds) if wake_offset_seconds is not None else 0,

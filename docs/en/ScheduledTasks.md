@@ -123,7 +123,7 @@ Scheduled task configurations are saved at:
 
 ### Create via Chat
 
-When the Agent has the `cron_create_job` tool capability, you can create scheduled tasks directly through natural language conversation.
+When the Agent has the `cron` tool capability, you can create scheduled tasks directly through natural language conversation.
 
 **Example Conversation:**
 

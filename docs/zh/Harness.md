@@ -285,7 +285,7 @@ Cron tool 族用于对接宿主提供的定时任务 backend。它可以暴露�
 | Skill / 工具发现 | `skill_tool`、`list_skill`、`search_tools`、`load_tools` | 调用技能、查看技能，渐进式搜索和加载工具 | `SkillUseRail`、`ProgressiveToolRail` 注册；受 skill 目录和渐进工具配置影响 |
 | Memory / Coding Memory | `memory_*`、`coding_memory_*` | 读写长期记忆、代码经验和项目知识 | `MemoryRail`、`CodingMemoryRail` 等 memory rails 注册 |
 | Agent 模式与用户交互 | `switch_mode`、`enter_plan_mode`、`exit_plan_mode`、`ask_user` | 切换普通 / 计划模式，在关键分支向用户发起确认或补充输入 | `AgentModeRail`、`AskUserRail` 或宿主交互 rail 注册 |
-| Worktree / Cron | `enter_worktree`、`exit_worktree`、`cron`、`cron_list_jobs`、`cron_get_job`、`cron_create_job`、`cron_update_job`、`cron_delete_job`、`cron_toggle_job`、`cron_preview_job` | 进入隔离 git worktree，管理定时任务和周期自动化 | `WorktreeRail` 或宿主 cron backend 注册；cron 兼容统一工具和拆分工具两种形态 |
+| Worktree / Cron | `enter_worktree`、`exit_worktree`、`cron` | 进入隔离 git worktree，管理定时任务和周期自动化 | `WorktreeRail` 或宿主 cron backend 注册；cron 为统一 action 分发工具（list/add/update/remove/run） |
 | 移动 GUI / 浏览器运行时 | 移动坐标 / 导航工具、浏览器运行时工具 | 移动端 GUI 操作、浏览器任务运行、运行时健康检查和取消控制 | 由移动 GUI / browser runtime 相关工具包或宿主 runtime 注册 |
 
 #### 内置 Rail

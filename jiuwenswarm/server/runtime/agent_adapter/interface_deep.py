@@ -779,6 +779,8 @@ class _RailBuildInfo:
         """Normalize the optional params mapping to an empty dict."""
         self.params = self.params or {}
 
+# 统一 cron 工具名为 "cron"；legacy cron_* 名称保留在集合里作为安全网，
+# 用于摘除旧版本注册残留 / 历史会话重放的工具卡片。
 _CRON_TOOL_NAMES = frozenset(
     {
         "cron",
@@ -6554,7 +6556,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # 单 agent 模式的 cron 执行会话 id 形如 "__cron___{ts}_{hex}"（warm pool
             # 以 channel_id="__cron__" 作前缀生成，见 agent_warm_pool._new_session_id），
             # 此前只判 "cron" 前缀会漏掉它。且 agent 实例跨会话共享：普通会话注册过的
-            # cron 工具须在此主动摘除，否则执行中的模型仍能调 cron_create_job，
+            # cron 工具须在此主动摘除，否则执行中的模型仍能调 cron 工具，
             # 把任务描述里"每天/每周…"等字样再建一遍定时任务。
             self._remove_registered_cron_tools()
             return
