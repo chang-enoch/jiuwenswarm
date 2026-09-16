@@ -188,6 +188,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         self._pod_clients: dict[str, HttpSseAgentServerClient] = {}
         self._pod_connect_lock = asyncio.Lock()
         self._rpc_origins: dict[tuple[str, str], str] = {}
+        self._drop_tasks: set[asyncio.Task[None]] = set()
 
     def set_server_push_handler(
         self, handler: Callable[[dict[str, Any]], Awaitable[None]] | None
@@ -217,11 +218,16 @@ class RuntimeRoutedAgentClient(AgentServerClient):
     async def _ensure_pod_push(self, base_url: str) -> None:
         if self._on_server_push is None:
             return
+        stale: HttpSseAgentServerClient | None = None
         async with self._pod_connect_lock:
             self._ensure_connected()
             client = self._pod_clients.get(base_url)
+            # Fallback if push-done drop hasn't run yet (same IP reused).
+            if client is not None and not getattr(client, "_running", True):
+                stale = self._pod_clients.pop(base_url)
+                client = None
             if client is None:
-                client = HttpSseAgentServerClient()
+                client = HttpSseAgentServerClient(retry_push_connect=False)
                 client.set_server_push_handler(
                     lambda wire: self._handle_pod_push(base_url, wire)
                 )
@@ -232,7 +238,56 @@ class RuntimeRoutedAgentClient(AgentServerClient):
                     await client.disconnect()
                     raise
                 self._pod_clients[base_url] = client
+                client.add_push_done_callback(
+                    lambda _task, url=base_url, bound=client: self._schedule_drop_pod_client(
+                        url, bound
+                    )
+                )
+        if stale is not None:
+            try:
+                await stale.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RuntimeRouted] 断开旧 Pod 推送客户端失败: %s (%s)",
+                    base_url,
+                    exc,
+                )
         await client.wait_push_ready()
+
+    def _schedule_drop_pod_client(
+        self, base_url: str, client: HttpSseAgentServerClient
+    ) -> None:
+        if not self._connected:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._drop_pod_client(base_url, client),
+                name="runtime-drop-pod-push",
+            )
+        except RuntimeError:
+            return
+        self._drop_tasks.add(task)
+        task.add_done_callback(self._drop_tasks.discard)
+
+    async def _drop_pod_client(
+        self, base_url: str, client: HttpSseAgentServerClient
+    ) -> None:
+        async with self._pod_connect_lock:
+            if self._pod_clients.get(base_url) is not client:
+                return
+            self._pod_clients.pop(base_url, None)
+        logger.warning(
+            "[RuntimeRouted] 推送循环已结束，丢弃客户端: %s",
+            base_url,
+        )
+        try:
+            await client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RuntimeRouted] 断开旧 Pod 推送客户端失败: %s (%s)",
+                base_url,
+                exc,
+            )
 
     async def connect(self, uri: str) -> None:
         _ = uri
@@ -248,6 +303,10 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         async with self._pod_connect_lock:
             clients = list(self._pod_clients.values())
             self._pod_clients.clear()
+        drop_tasks = list(self._drop_tasks)
+        self._drop_tasks.clear()
+        if drop_tasks:
+            await asyncio.gather(*drop_tasks, return_exceptions=True)
         results = await asyncio.gather(
             *(client.disconnect() for client in clients),
             return_exceptions=True,

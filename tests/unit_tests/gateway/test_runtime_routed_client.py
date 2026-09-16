@@ -248,13 +248,17 @@ async def test_concurrent_pod_subscription_and_failed_registration_cleanup(monke
     created = []
 
     class PodClient:
-        def __init__(self):
+        def __init__(self, *, retry_push_connect: bool = True, **_kwargs):
+            assert retry_push_connect is False
             created.append(self)
             self.closed = False
             self.fail = False
 
         def set_server_push_handler(self, handler):
             self.handler = handler
+
+        def add_push_done_callback(self, callback):
+            return None
 
         async def connect(self, uri):
             self.fail = "bad" in uri
@@ -278,6 +282,133 @@ async def test_concurrent_pod_subscription_and_failed_registration_cleanup(monke
             await client._ensure_pod_push("http://bad")
         assert created[-1].closed
         assert "http://bad" not in client._pod_clients
+    finally:
+        await client.disconnect()
+    assert all(pod.closed for pod in created)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_pod_push_client_is_replaced_on_next_ensure(monkeypatch):
+    created = []
+
+    class PodClient:
+        def __init__(self, *, retry_push_connect: bool = True, **_kwargs):
+            assert retry_push_connect is False
+            created.append(self)
+            self.closed = False
+            self._running = True
+
+        def set_server_push_handler(self, handler):
+            self.handler = handler
+
+        def add_push_done_callback(self, callback):
+            return None
+
+        async def connect(self, uri):
+            self.uri = uri
+
+        async def wait_push_ready(self):
+            return None
+
+        async def disconnect(self):
+            self.closed = True
+            self._running = False
+
+    monkeypatch.setattr(_routed_mod, "HttpSseAgentServerClient", PodClient)
+    client = RuntimeRoutedAgentClient(route_client=_FakeRoute(), http_client=_FakeHttp())
+    client.set_server_push_handler(lambda wire: asyncio.sleep(0))
+    await client.connect("unused")
+    dead = "http://10.244.0.190:8766"
+    live = "http://10.244.0.192:8766"
+    try:
+        await client._ensure_pod_push(dead)
+        assert dead in client._pod_clients
+        created[0]._running = False
+        await client._ensure_pod_push(dead)
+        assert created[0].closed is True
+        assert client._pod_clients[dead] is created[1]
+        await client._ensure_pod_push(live)
+        assert set(client._pod_clients) == {dead, live}
+        assert len(created) == 3
+    finally:
+        await client.disconnect()
+    assert all(pod.closed for pod in created)
+
+
+@pytest.mark.asyncio
+async def test_push_task_done_drops_pod_client_immediately(monkeypatch):
+    created = []
+
+    class PodClient:
+        def __init__(self, *, retry_push_connect: bool = True, **_kwargs):
+            assert retry_push_connect is False
+            created.append(self)
+            self.closed = False
+            self._running = True
+            self._push_task: asyncio.Task[None] | None = None
+            self._stop = asyncio.Event()
+            self._done_callbacks = []
+
+        def set_server_push_handler(self, handler):
+            self.handler = handler
+
+        def add_push_done_callback(self, callback):
+            task = self._push_task
+            if isinstance(task, asyncio.Task):
+                task.add_done_callback(callback)
+                return
+            self._done_callbacks.append(callback)
+
+        async def connect(self, uri):
+            self.uri = uri
+
+            async def _loop() -> None:
+                await self._stop.wait()
+
+            self._push_task = asyncio.create_task(_loop())
+            for callback in self._done_callbacks:
+                self._push_task.add_done_callback(callback)
+            self._done_callbacks.clear()
+
+        async def wait_push_ready(self):
+            return None
+
+        async def disconnect(self):
+            self.closed = True
+            self._running = False
+            self._stop.set()
+            task = self._push_task
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        async def simulate_unreachable(self):
+            self._running = False
+            self._stop.set()
+            task = self._push_task
+            if isinstance(task, asyncio.Task):
+                await asyncio.wait_for(asyncio.shield(task), timeout=2)
+
+    monkeypatch.setattr(_routed_mod, "HttpSseAgentServerClient", PodClient)
+    client = RuntimeRoutedAgentClient(route_client=_FakeRoute(), http_client=_FakeHttp())
+    client.set_server_push_handler(lambda wire: asyncio.sleep(0))
+    await client.connect("unused")
+    dead = "http://10.244.0.190:8766"
+    live = "http://10.244.0.192:8766"
+    try:
+        await client._ensure_pod_push(dead)
+        assert dead in client._pod_clients
+        await created[0].simulate_unreachable()
+        if client._drop_tasks:
+            await asyncio.gather(*list(client._drop_tasks), return_exceptions=True)
+        assert dead not in client._pod_clients
+        assert created[0].closed is True
+        await client._ensure_pod_push(live)
+        assert list(client._pod_clients) == [live]
+        assert len(created) == 2
     finally:
         await client.disconnect()
     assert all(pod.closed for pod in created)
