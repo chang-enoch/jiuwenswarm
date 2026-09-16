@@ -60,6 +60,7 @@ def _make_adapter(**state: object) -> JiuWenSwarmDeepAdapter:
     adapter = object.__new__(JiuWenSwarmDeepAdapter)
     adapter._is_session_scoped_adapter = True  # pylint: disable=protected-access
     adapter._parent_session_id = None  # pylint: disable=protected-access
+    adapter._session_adapter_last_used = {}  # pylint: disable=protected-access
     for name, value in state.items():
         setattr(adapter, name, value)
     return adapter
@@ -70,6 +71,7 @@ async def test_interaction_supplement_clears_pending_ask_user_state() -> None:
     """Supplement text must start a new turn, not answer the interrupted question."""
     loop_session = MagicMock()
     loop_session.get_session_id.return_value = "tui_sess_1"
+    loop_session.commit = AsyncMock()
     interruption_state = _interruption_state("ask_user")
     loop_session.get_state.return_value = interruption_state
     context = MagicMock()
@@ -100,8 +102,53 @@ async def test_interaction_supplement_clears_pending_ask_user_state() -> None:
     loop_session.update_state.assert_called_once_with({INTERRUPTION_KEY: None})
     context.pop_messages.assert_called_once_with(1, with_history=True)
     context_engine.save_contexts.assert_awaited_once_with(loop_session)
+    loop_session.commit.assert_awaited_once_with()
     assert response.payload["intent"] == "supplement"
     assert response.payload["new_input"] == "再执行一次"
+
+
+@pytest.mark.parametrize("tool_names", [("ask_user",), ("ask_user", "confirm")])
+@pytest.mark.asyncio
+async def test_interaction_cancel_clears_pending_interrupt_state(
+    tool_names: tuple[str, ...],
+) -> None:
+    """Stopping abandons the whole pending interaction, including mixed rounds."""
+    loop_session = MagicMock()
+    loop_session.get_session_id.return_value = "tui_sess_1"
+    loop_session.commit = AsyncMock()
+    interruption_state = _interruption_state(*tool_names)
+    loop_session.get_state.return_value = interruption_state
+    context = MagicMock()
+    context.get_messages.return_value = [
+        SimpleNamespace(tool_calls=[]),
+        interruption_state.ai_message,
+    ]
+    context_engine = MagicMock()
+    context_engine.get_context.return_value = context
+    context_engine.save_contexts = AsyncMock()
+
+    instance = MagicMock()
+    instance._interaction_started = True
+    instance._loop_session = loop_session
+    instance.react_agent = SimpleNamespace(context_engine=context_engine)
+    instance.goal_manager = None
+    instance.cancel_round = AsyncMock(return_value=False)
+
+    rail = MagicMock()
+    rail.get_cancelled_tool_results.return_value = []
+    adapter = _make_adapter(
+        _active_session_ids={},
+        _stream_event_rail=rail,
+        _instance=instance,
+    )
+
+    response = await adapter.process_interrupt(_build_cancel_request())
+
+    loop_session.update_state.assert_called_once_with({INTERRUPTION_KEY: None})
+    context.pop_messages.assert_called_once_with(1, with_history=True)
+    context_engine.save_contexts.assert_awaited_once_with(loop_session)
+    loop_session.commit.assert_awaited_once_with()
+    assert response.payload["intent"] == "cancel"
 
 
 @pytest.mark.parametrize(
@@ -127,7 +174,7 @@ async def test_supplement_keeps_unrelated_interrupt_state(
 
     cleared = await getattr(
         adapter,
-        "_clear_pending_ask_user_interrupt_for_supplement",
+        "_clear_pending_interaction_interrupt",
     )(session_id)
 
     assert cleared is False
@@ -153,7 +200,7 @@ async def test_supplement_keeps_ask_user_state_when_context_cannot_be_rolled_bac
 
     cleared = await getattr(
         adapter,
-        "_clear_pending_ask_user_interrupt_for_supplement",
+        "_clear_pending_interaction_interrupt",
     )("tui_sess_1")
 
     assert cleared is False

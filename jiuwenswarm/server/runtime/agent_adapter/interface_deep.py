@@ -1823,11 +1823,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             return None
         return self._resolve_interrupt_session_id(loop_sid)
 
-    async def _clear_pending_ask_user_interrupt_for_supplement(
+    async def _clear_pending_interaction_interrupt(
         self,
         session_id: str | None,
+        *,
+        require_pure_ask_user: bool = True,
     ) -> bool:
-        """Drop a superseded pure ask_user round without leaving an open tool call."""
+        """Drop an abandoned interaction round without leaving open tool calls."""
         instance = getattr(self, "_instance", None)
         loop_session = getattr(instance, "_loop_session", None)
         loop_sid = self._deep_agent_loop_session_id()
@@ -1840,7 +1842,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             interrupted_tools = getattr(state, "interrupted_tools", None)
             if not isinstance(interrupted_tools, dict) or not interrupted_tools:
                 return False
-            if any(
+            if require_pure_ask_user and any(
                 getattr(getattr(entry, "tool_call", None), "name", None) != "ask_user"
                 for entry in interrupted_tools.values()
             ):
@@ -1848,9 +1850,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
             ai_message = getattr(state, "ai_message", None)
             pending_calls = list(getattr(ai_message, "tool_calls", None) or [])
-            if not pending_calls or any(
-                getattr(tool_call, "name", None) != "ask_user"
-                for tool_call in pending_calls
+            if not pending_calls:
+                return False
+            if require_pure_ask_user and any(
+                getattr(tool_call, "name", None) != "ask_user" for tool_call in pending_calls
             ):
                 return False
 
@@ -1877,18 +1880,23 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             context.pop_messages(1, with_history=True)
             loop_session.update_state({INTERRUPTION_KEY: None})
             await context_engine.save_contexts(loop_session)
+            # save_contexts() only copies the updated context into the session
+            # state.  Persist the full session checkpoint as well, otherwise an
+            # adapter eviction or process restart can reload the abandoned
+            # ask_user interruption from storage.
+            await loop_session.commit()
         except Exception:
-            logger.debug(
-                "[JiuWenSwarmDeepAdapter] interrupt(supplement): failed to inspect "
-                "pending ask_user state session=%s",
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] interrupt: failed to inspect "
+                "pending interaction state session=%s",
                 target_sid,
                 exc_info=True,
             )
             return False
 
         logger.info(
-            "[JiuWenSwarmDeepAdapter] interrupt(supplement): cleared pending "
-            "ask_user state session=%s",
+            "[JiuWenSwarmDeepAdapter] interrupt: cleared pending "
+            "interaction state session=%s",
             target_sid,
         )
         return True
@@ -8106,8 +8114,16 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 "[JiuWenSwarmDeepAdapter] interrupt(%s): interaction cancel failed",
                 intent,
             )
-        if intent == "supplement" and isinstance(new_input, str) and new_input.strip():
-            await self._clear_pending_ask_user_interrupt_for_supplement(request.session_id)
+        # cancel 会放弃整个当前交互回合；supplement 仅在纯 ask_user 回合下做
+        # 保守清理。两者都必须同时移除持久化 interrupt state 和上下文尾部
+        # tool_call，否则下一条普通消息会被旧交互当作回答消费。
+        if intent == "cancel":
+            await self._clear_pending_interaction_interrupt(
+                request.session_id,
+                require_pure_ask_user=False,
+            )
+        elif isinstance(new_input, str) and new_input.strip():
+            await self._clear_pending_interaction_interrupt(request.session_id)
         message = "任务已切换" if intent == "supplement" else "任务已取消"
 
         payload: dict[str, Any] = {
