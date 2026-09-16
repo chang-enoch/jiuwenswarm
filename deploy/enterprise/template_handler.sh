@@ -154,14 +154,8 @@ enable_dev_mode_if_needed() {
             ;;
     esac
 
-    # Pin to the current master node (hostPath is local) and run as root so
-    # the hostPath-mounted source is readable/writable inside the container.
+    # Pin to the current master node (hostPath is local)
     yq eval 'select(.kind == "Deployment").spec.template.spec.nodeName = "'"${DEPLOY_VARS["CURRENT_NODE_NAME"]}"'"' -i "${file}"
-    yq eval 'select(.kind == "Deployment").spec.template.spec.securityContext.fsGroup = 0' -i "${file}"
-    yq eval 'select(.kind == "Deployment").spec.template.spec.containers[0].securityContext = {
-        "runAsUser": 0,
-        "runAsGroup": 0
-    }' -i "${file}"
 }
 
 add_resource_if_set() {
