@@ -422,6 +422,23 @@ def resolve_request_mode(
                 from_web_composition=True,
             )
 
+    new_canonical = resolve_new_canonical_mode(mode_text)
+    if new_canonical is not None:
+        manager_mode, sub_mode, canonical_mode = new_canonical
+        canonical_work_mode = canonical_mode.split(".", maxsplit=2)[1]
+        return ResolvedMode(
+            manager_mode=manager_mode,
+            sub_mode=sub_mode,
+            canonical_mode=canonical_mode,
+            work_mode=canonical_work_mode,
+            is_plan=canonical_mode in PLAN_CANONICAL_MODES,
+            is_team=canonical_mode in TEAM_CANONICAL_MODES,
+            is_code_profile=canonical_work_mode == "code",
+            profile="code" if canonical_work_mode == "code" else "normal",
+            normal_mode=base_mode_without_plan(canonical_mode),
+            from_web_composition=False,
+        )
+
     manager_mode, sub_mode, canonical_mode = legacy_resolver(
         mode_text, work_mode=work_mode
     )

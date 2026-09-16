@@ -4,38 +4,45 @@
 
 from __future__ import annotations
 
-from jiuwenswarm.server.runtime.agent_adapter import interface_deep
-from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
-    JiuWenSwarmDeepAdapter,
-)
+from jiuwenswarm.server.runtime.session import session_history, session_metadata
 
 
 def test_subagent_history_writes_use_dedicated_child_bucket(monkeypatch) -> None:
-    persisted = []
+    persisted: list[dict] = []
+    metadata_updates: list[dict] = []
     monkeypatch.setattr(
-        interface_deep,
-        "append_history_record",
-        lambda **kwargs: persisted.append(kwargs),
+        session_history,
+        "_ensure_flush_thread_started",
+        lambda: None,
     )
-    projection = {
-        "parent_session_id": "parent-session",
-        "subagent_id": "subagent-1",
-        "task_id": "task-1",
-        "seq": 1,
-        "role": "assistant",
-        "content": "result",
-        "summary": "working",
-        "event_type": "chat.final",
-    }
-
-    JiuWenSwarmDeepAdapter._persist_subagent_transcript_message(projection)
-    JiuWenSwarmDeepAdapter._persist_subagent_activity(projection)
-    JiuWenSwarmDeepAdapter._persist_subagent_roster_history(
-        projection,
-        {"description": "worker"},
+    monkeypatch.setattr(session_history, "_flush_on_request_switch", lambda *_args: None)
+    monkeypatch.setattr(
+        session_history,
+        "_route_event",
+        lambda _sid, item, _event_type, _root: persisted.append(item),
+    )
+    monkeypatch.setattr(
+        session_metadata,
+        "update_session_metadata",
+        lambda **kwargs: metadata_updates.append(kwargs),
     )
 
-    assert len(persisted) == 3
-    assert all(item["session_id"] == "parent-session" for item in persisted)
-    assert all(item["subagent_id"] == "subagent-1" for item in persisted)
-    assert all(item["mode"] == "subagent" for item in persisted)
+    session_history.append_history_record(
+        session_id="parent-session",
+        request_id="request-1",
+        channel_id="web",
+        role="assistant",
+        content="result",
+        timestamp=1.0,
+        event_type="chat.final",
+        task_id="task-1",
+        subagent_id="subagent-1",
+        mode="subagent",
+    )
+
+    assert len(persisted) == 1
+    assert persisted[0]["session_id"] == "parent-session"
+    assert persisted[0]["subagent_id"] == "subagent-1"
+    assert persisted[0]["mode"] == "subagent"
+    assert metadata_updates[0]["session_id"] == "parent-session"
+    assert metadata_updates[0]["mode"] is None

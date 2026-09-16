@@ -30,15 +30,14 @@ def _resolve(params):
     return resolve_request_mode(params, resolve_agent_request_mode)
 
 
-def test_request_preserves_original_mode_when_web_composition_rewrites_it():
+def test_request_uses_current_merged_agent_mode_semantics():
     request = AgentRequest(
         request_id="req-1",
         params={"mode": "agent.plan", "work_mode": "code"},
     )
 
-    assert _apply_resolved_mode_to_request(request, work_mode="code") == ("code", "plan")
-    assert request.params["mode"] == "code.plan"
-    assert getattr(request, "_original_mode") == "agent.plan"
+    assert _apply_resolved_mode_to_request(request, work_mode="code") == ("code", "normal")
+    assert request.params["mode"] == "code.normal"
 
 
 # ── Web 组合：work_mode 决定 profile，mode 决定是否 plan / team ─────────────
@@ -108,16 +107,16 @@ def test_plan_exit_mode_is_profile_aware(mode, work_mode, expected_normal):
 
 @pytest.mark.parametrize("work_mode", ["work", "code"])
 def test_web_team_plan_is_not_composable(work_mode):
-    """Team Plan 不参与 Web 组合，正式别名始终选择 normal profile。"""
+    """Team Plan 不参与 Web 组合，并沿用当前 code-team 路由。"""
     resolved = _resolve({"mode": "team.plan", "work_mode": work_mode})
 
     assert resolved.from_web_composition is False
     assert (resolved.manager_mode, resolved.sub_mode, resolved.canonical_mode) == (
+        "code",
         "team",
-        "plan",
-        "team.plan.normal",
+        "team.plan",
     )
-    assert resolved.profile == "normal"
+    assert resolved.profile == "code"
 
 
 # ── P6.4：新三段命名串 agent.work.normal / agent.work.plan 的 Web 组合分支 ────
@@ -267,7 +266,7 @@ def test_new_canonical_ignores_supplemented_work_mode(mode, work_mode, expected)
     ("raw_mode", "expected"),
     [
         ("agent", ("agent", None, "agent")),
-        ("agent.plan", ("agent", "plan", "agent.plan")),
+        ("agent.plan", ("agent", None, "agent")),
         ("agent.fast", ("agent", None, "agent")),
         ("plan", ("agent", None, "agent")),
         ("code.normal", ("code", "normal", "code.normal")),
@@ -275,9 +274,9 @@ def test_new_canonical_ignores_supplemented_work_mode(mode, work_mode, expected)
         ("code.team", ("code", "team", "code.team")),
         ("team.code", ("code", "team", "code.team")),
         ("team", ("team", None, "team")),
-        ("team.plan", ("team", "plan", "team.plan.normal")),
-        ("team.plan.normal", ("team", "plan", "team.plan.normal")),
-        ("team.plan.code", ("code", "team", "team.plan.code")),
+        ("team.plan", ("code", "team", "team.plan")),
+        ("team.plan.normal", ("code", "team", "team.plan")),
+        ("team.plan.code", ("code", "team", "team.plan")),
     ],
 )
 def test_legacy_modes_are_untouched_without_work_mode(raw_mode, expected):
@@ -330,12 +329,12 @@ def test_legacy_neutral_modes_still_follow_work_mode(raw_mode, work_mode, expect
 def test_invalid_work_mode_falls_back_to_legacy():
     resolved = _resolve({"mode": "agent.plan", "work_mode": "nonsense"})
 
-    # 非法 work_mode 退历史解析：agent.plan 按真实 plan 模式落 legacy canonical。
+    # 非法 work_mode 退历史解析，并沿用当前合并后的 agent 语义。
     assert resolved.from_web_composition is False
     assert (resolved.manager_mode, resolved.sub_mode, resolved.canonical_mode) == (
-        "agent", "plan", "agent.plan",
+        "agent", None, "agent",
     )
-    assert resolved.is_plan is True
+    assert resolved.is_plan is False
 
 
 def test_missing_mode_defaults_to_agent():
