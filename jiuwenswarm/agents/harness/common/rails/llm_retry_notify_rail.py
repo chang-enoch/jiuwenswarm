@@ -35,6 +35,15 @@ _COUNT_ATTRS: dict[str, str] = {
     "transient_invoke": "transient_invoke_retry_count",
 }
 
+_INITIAL_BACKOFF = 5.0
+_MAX_BACKOFF = 60.0
+_BACKOFF_FACTOR = 2.0
+
+
+def _exponential_backoff(attempt: int) -> float:
+    """Return exponential backoff delay: initial * factor^attempt, capped at max."""
+    return min(_INITIAL_BACKOFF * (_BACKOFF_FACTOR ** attempt), _MAX_BACKOFF)
+
 
 def _parent_accepts_retry_transient_invoke_errors() -> bool:
     return "retry_transient_invoke_errors" in inspect.signature(LLMRetryRail.__init__).parameters
@@ -58,6 +67,9 @@ class NotifyingLLMRetryRail(LLMRetryRail):
         parent_kwargs = dict(kwargs)
         if _parent_accepts_retry_transient_invoke_errors():
             parent_kwargs["retry_transient_invoke_errors"] = retry_transient_invoke_errors
+        parent_kwargs["backoff_seconds"] = [
+            _exponential_backoff(i) for i in range(kwargs.get("max_retries", 2))
+        ]
         super().__init__(**parent_kwargs)
 
         if not hasattr(self, "transient_invoke_retry_count"):
