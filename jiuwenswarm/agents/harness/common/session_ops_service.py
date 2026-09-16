@@ -969,6 +969,7 @@ async def warmup_session_context(
     *,
     deep_agent: "DeepAgent",
     session_id: str,
+    exclude_request_id: str | None = None,
 ) -> bool:
     """Restart-safe restore of context_engine messages from on-disk history.
 
@@ -982,6 +983,10 @@ async def warmup_session_context(
     context_engine。与 ``rewind_session_context`` 的区别：不截断 history、
     不清理 Session state（agent/workflow 状态已由 checkpointer 在 pre_run
     恢复）、不强写 checkpointer（消息持久化本就由 history.jsonl 承担）。
+
+    ``chat.send`` 会在 adapter 冷启动前先把当前用户消息持久化。调用方可传入
+    ``exclude_request_id``，使 warmup 仅恢复此前历史；当前轮仍由正常的 inputs
+    路径注入一次，避免首轮在模型上下文中重复。
     """
     react_agent = getattr(deep_agent, "react_agent", None)
     if react_agent is None:
@@ -1005,6 +1010,19 @@ async def warmup_session_context(
 
     if not isinstance(history_records, list) or not history_records:
         return False
+
+    excluded_request_id = (exclude_request_id or "").strip()
+    if excluded_request_id:
+        history_records = [
+            record
+            for record in history_records
+            if not (
+                isinstance(record, dict)
+                and str(record.get("request_id") or "").strip() == excluded_request_id
+            )
+        ]
+        if not history_records:
+            return False
 
     context_messages, skipped = _build_context_messages_from_history(history_records)
     if not context_messages:
