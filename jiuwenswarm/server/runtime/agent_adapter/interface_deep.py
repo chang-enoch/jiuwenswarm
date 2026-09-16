@@ -849,6 +849,22 @@ def parse_int(value: Any, default: int) -> int:
         return default
 
 
+def _resolve_completion_timeout(react_cfg: dict[str, Any] | None) -> float | None:
+    """Resolve ``react.completion_timeout`` for ``create_deep_agent``.
+
+    Missing key keeps the 3600s safety net. ``null`` / ``0`` / ``""`` mean
+    unlimited (``wait_completion(timeout=None)``). Positive numbers are seconds.
+    """
+    raw = (react_cfg or {}).get("completion_timeout", 3600.0)
+    if raw in (None, "", 0, 0.0):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 3600.0
+    return None if value <= 0 else value
+
+
 def _deep_agent_context_engine_config(react_cfg: dict[str, Any] | None) -> ContextEngineConfig:
     """供 ``create_deep_agent(..., context_engine_config=...)`` 使用（与 agent-core 集成测试方法二一致）。
 
@@ -5353,7 +5369,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             vision_model_config=self._vision_model_config,
             audio_model_config=self._audio_model_config,
             enable_read_image_multimodal=self._resolve_enable_read_image_multimodal(config),
-            completion_timeout=config.get("completion_timeout", 3600.0),
+            completion_timeout=_resolve_completion_timeout(config),
             # 渐进式工具曝光：对齐 develop 部署默认（todo 工具 always-visible 优先级最高，
             # 核心工作工具 default-visible，其余工具经 search_tools/load_tools 延迟发现）
             progressive_tool_enabled=get_progressive_tool_enabled(config_base),
@@ -5918,7 +5934,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             enable_llm_retry_rail=((config_base.get("execution_guard") or {}).get("llm_retry_rail") or {}).get(
                 "enabled", False
             ),
-            completion_timeout=config.get("completion_timeout", 3600.0),
+            completion_timeout=_resolve_completion_timeout(config),
         )
 
         # 装配生命周期点位：实例重建前的扩展状态重置

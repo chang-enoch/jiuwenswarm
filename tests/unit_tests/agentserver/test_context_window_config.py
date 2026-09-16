@@ -8,6 +8,7 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_code import (
 )
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     _deep_agent_context_engine_config,
+    _resolve_completion_timeout,
 )
 
 
@@ -25,6 +26,28 @@ def test_deep_agent_context_engine_config_ignores_invalid_context_window_tokens(
     )
 
     assert config.context_window_tokens is None
+
+
+def test_resolve_completion_timeout_defaults_to_3600_when_missing():
+    assert _resolve_completion_timeout({}) == 3600.0
+    assert _resolve_completion_timeout(None) == 3600.0
+
+
+def test_resolve_completion_timeout_null_and_zero_mean_unlimited():
+    assert _resolve_completion_timeout({"completion_timeout": None}) is None
+    assert _resolve_completion_timeout({"completion_timeout": 0}) is None
+    assert _resolve_completion_timeout({"completion_timeout": 0.0}) is None
+    assert _resolve_completion_timeout({"completion_timeout": ""}) is None
+    assert _resolve_completion_timeout({"completion_timeout": "0"}) is None
+
+
+def test_resolve_completion_timeout_positive_seconds():
+    assert _resolve_completion_timeout({"completion_timeout": 6000}) == 6000.0
+    assert _resolve_completion_timeout({"completion_timeout": "600"}) == 600.0
+
+
+def test_resolve_completion_timeout_invalid_falls_back_to_3600():
+    assert _resolve_completion_timeout({"completion_timeout": "not-a-number"}) == 3600.0
 
 
 @pytest.mark.asyncio
