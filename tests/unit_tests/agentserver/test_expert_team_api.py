@@ -495,16 +495,15 @@ async def test_chat_non_team_mode_rejected_when_team_bound(
 
 
 def test_build_team_name_strips_channel_prefix() -> None:
-    """桌面会话 id 形如 desktop_<ts>_<uuid>，[:8] 会切到恒定前缀 desktop_ ——
-    必须剥渠道段，否则同渠道所有会话撞名共用 team DB（建表竞态同根）。"""
+    """桌面会话 id 形如 desktop_<ts>_<uuid>：后缀取末段 uuid12——渠道段恒定。"""
     from jiuwenswarm.server.runtime.expert.expert_service import (
         build_expert_group_team_name,
     )
 
     name_a = build_expert_group_team_name("stock-partner-team", "desktop_19abc001_deadbeef01")
     name_b = build_expert_group_team_name("stock-partner-team", "desktop_19abc002_cafef00d02")
-    assert name_a != name_b
-    assert name_a.startswith("expert-group-stock-partner-team-")
+    assert name_a == "expert-group-stock-partner-team-deadbeef01"
+    assert name_b == "expert-group-stock-partner-team-cafef00d02"
     assert "desktop" not in name_a  # 渠道前缀不应进入 team_name
 
 
@@ -518,12 +517,13 @@ def test_build_team_name_rejects_empty_session_id() -> None:
 
 
 def test_build_team_name_no_underscore_id() -> None:
+    """非三段式 id（显式传入的渠道 id）：退化为整体后 12 字符（区分度在尾部）。"""
     from jiuwenswarm.server.runtime.expert.expert_service import (
         build_expert_group_team_name,
     )
 
     assert build_expert_group_team_name("grp", "plain-session-id-123") == (
-        "expert-group-grp-plain-se"
+        "expert-group-grp-ssion-id-123"
     )
 
 
