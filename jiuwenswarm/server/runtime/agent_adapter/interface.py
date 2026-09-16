@@ -2707,6 +2707,7 @@ class JiuWenSwarm:
         a2ui_pending_render_sent = False
         a2ui_stream_probe = ""
         _yielded_from_queue = 0
+        completed_yielded = False
         logger.info(
             "[JiuWenSwarm] consumer loop starting: request_id=%s is_team=%s is_first=%s",
             rid, is_team_mode, is_team_first_request,
@@ -2958,6 +2959,8 @@ class JiuWenSwarm:
                                 if next_final_content:
                                     final_answer_content = next_final_content
                                     final_answer_chunks.clear()
+                        if getattr(data, "is_complete", False):
+                            completed_yielded = True
                         yield data
                     elif isinstance(data, dict) and isinstance(data.get("event_type"), str):
                         et = str(data.get("event_type"))
@@ -3115,6 +3118,22 @@ class JiuWenSwarm:
                     exc_info=True,
                 )
             logger.info("[JiuWenSwarm] 流式处理被中断: request_id=%s", rid)
+            # 取消不再让流静默死亡：补发一个如实标注 cancelled 的终止帧，
+            # 客户端从此可用"收到终止帧"确定性收尾，无需靠超时区分
+            # "服务端慢"与"流已取消"。复用 chat.error 形状（信封映射现成：
+            # is_final + status=failed + details.code=cancelled），不新增
+            # 事件类型。已有终止帧时不双发。
+            if not completed_yielded:
+                yield AgentResponseChunk(
+                    request_id=rid,
+                    channel_id=cid,
+                    payload={
+                        "event_type": "chat.error",
+                        "code": "cancelled",
+                        "error": "任务已取消",
+                    },
+                    is_complete=True,
+                )
             raise
         finally:
             # The adapter producer owns RuntimeOutputStream.  Cancelling and
