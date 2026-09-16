@@ -535,6 +535,8 @@ react:
   agent_name: main_agent
   enable_task_loop: true
   max_iterations: 100
+  # 默认配置设为不限制单轮 task-loop 等待。null/0 = 不限制；键缺失时 adapter 仍回退 3600
+  completion_timeout: null
   model_name: ${MODEL_NAME}
   skill_mode: all
   # code_agent / research_agent 默认不启用；只有显式配置 enabled: true 才会显示并可被 task_tool 调用
