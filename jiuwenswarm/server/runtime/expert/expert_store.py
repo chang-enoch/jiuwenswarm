@@ -98,8 +98,8 @@ async def resolve_expert_package_dir(expert_id: str) -> Path:
     cached = get_cached_expert_package_dir(expert_id)
     if cached is not None:
         return cached
-    if os.environ.get(LOCAL_DIRS_ENV) == "1":
-        # 调试模式：LocalDir 源不落缓存，miss 回退 fetch 是常态
+    if os.environ.get(LOCAL_DIRS_ENV, "1") == "1":
+        # 本地源启用（默认）：LocalDir 源不落缓存，miss 回退 fetch 是常态
         logger.info(
             "expert package cache miss, fallback to source fetch "
             "(local dirs enabled): %s",
@@ -459,13 +459,17 @@ _default_source: ExpertPackageSource | None = None
 
 
 def get_expert_source() -> ExpertPackageSource:
-    """source 工厂：local override（env 开启时）> 仓库 > 包缓存（experts_cache）。"""
+    """source 工厂：本地专家包目录源（默认启用，env 显式设 "0" 关闭）> 仓库 > 包缓存（experts_cache）。
+
+    本地源默认开启：expert-manager 技能创建、用户导入的专家包落在本地 experts/
+    目录，需此源才会进入 experts.list 从而可召唤；桌面端与 CLI 均默认生效。
+    """
     global _default_source
     if _default_source is None:
         sources: list[ExpertPackageSource] = []
-        if os.environ.get(LOCAL_DIRS_ENV) == "1":
+        if os.environ.get(LOCAL_DIRS_ENV, "1") == "1":
             sources.append(LocalDirExpertPackageSource())
-            logger.info("expert local dir override enabled (%s)", get_agent_experts_dir())
+            logger.info("expert local dir source enabled (%s)", get_agent_experts_dir())
         sources.append(HttpRepoExpertPackageSource())
         sources.append(CachedExpertPackageSource())
         _default_source = ChainExpertPackageSource(sources)
