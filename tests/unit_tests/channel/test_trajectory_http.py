@@ -1264,8 +1264,13 @@ def test_web_proxy_preserves_canonical_outer_host_without_loopback(
         status = 200
         reason = "OK"
 
-        @staticmethod
-        def read() -> bytes:
+        def __init__(self) -> None:
+            self._consumed = False
+
+        def read1(self, _size: int = -1) -> bytes:
+            if self._consumed:
+                return b""
+            self._consumed = True
             return b'{"ok":true}'
 
         @staticmethod

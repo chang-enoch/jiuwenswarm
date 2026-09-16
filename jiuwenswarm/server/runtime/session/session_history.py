@@ -1109,6 +1109,7 @@ def append_history_record(
     mode: str | None = None,
     sessions_root: str | Path | None = None,
     task_id: str | None = None,
+    subagent_id: str | None = None,
 ) -> None:
     """向指定 session 的 history.json 追加一条 JSONL 记录（可合并事件先缓冲）。"""
     sid = (session_id or "default").strip() or "default"
@@ -1143,6 +1144,8 @@ def append_history_record(
         item["event_type"] = event_type
     if task_id:
         item["task_id"] = task_id
+    if subagent_id:
+        item["subagent_id"] = subagent_id
     if isinstance(extra, dict) and extra:
         serialized_extra, extra_changed = _serialize_value_with_flag(extra)
         if isinstance(serialized_extra, dict):
