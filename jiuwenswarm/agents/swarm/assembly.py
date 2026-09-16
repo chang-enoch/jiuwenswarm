@@ -360,7 +360,7 @@ def _apply_agent_group(spec: Any, agent_group_name: str, package_dir: Path | Non
         )
 
     spec.predefined_members = predefined_members
-    spec.team_mode = "hybrid"
+    spec.team_mode = "predefined"
     spec.dispatch_mode = "autonomous"
     spec.enable_task_verification = False
 

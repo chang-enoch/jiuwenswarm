@@ -176,16 +176,15 @@ def build_expert_group_team_name(expert_id: str, session_id: str) -> str:
     """会话级唯一 team_name，避免多会话共用 team DB 目录。
 
     会话 id 形如 ``{channel}_{hex时间戳}_{uuid12}``（agent_manager.create_session）。
-    直接 ``session_id[:8]`` 会切到恒定渠道前缀（如 "desktop_"），同渠道所有会话
-    撞名共用 team DB——必须剥掉首个下划线前的渠道段再截断。空 session_id 显式
-    拒绝（残缺 team_name 一旦写入 metadata 即固化，后续多会话串台）。
+    后缀取末段 uuid12：纯随机 48bit，无撞名窗口。。
     """
     if not session_id:
         raise ValueError(
             f"build_expert_group_team_name 要求非空 session_id（expert_id={expert_id}）"
         )
-    sid_body = session_id.split("_", 1)[1] if "_" in session_id else session_id
-    return f"expert-group-{expert_id}-{sid_body[:8]}"
+    segments = session_id.split("_")
+    suffix = segments[2] if len(segments) >= 3 and segments[2] else session_id[-12:]
+    return f"expert-group-{expert_id}-{suffix}"
 
 
 @dataclass
