@@ -366,11 +366,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         if len(host_values) != 1:
             return None
         raw_host = str(host_values[0] or "").strip()
+        if not raw_host or len(raw_host) > 512 or not raw_host.isascii():
+            return None
         if (
-            not raw_host
-            or len(raw_host) > 512
-            or not raw_host.isascii()
-            or raw_host.endswith(":")
+            raw_host.endswith(":")
             or any(character.isspace() for character in raw_host)
             or any(separator in raw_host for separator in ("/", "\\", "?", "#", "@", ","))
         ):
@@ -385,10 +384,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             hostname is None
             or parsed_host.username is not None
             or parsed_host.password is not None
-            or parsed_host.path
-            or parsed_host.query
-            or parsed_host.fragment
         ):
+            return None
+        if parsed_host.path or parsed_host.query or parsed_host.fragment:
             return None
         normalized_hostname = hostname.lower().rstrip(".")
         if not normalized_hostname or "%" in normalized_hostname:
