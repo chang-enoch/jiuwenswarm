@@ -21,10 +21,14 @@ from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
 _MEMORY_WRITE_TOOLS = frozenset({
     "write_memory", "edit_memory", "coding_memory_write", "coding_memory_edit",
     "memory_store", "mcp_celia-memory_celia.memory_store",
+    "mcp_celia-memory_celia_memory_store",
 })
 _MEMORY_READ_TOOLS = frozenset({
     "read_memory", "memory_search", "memory_get", "coding_memory_read",
     "memory_global_load", "memory_scene_load", "memory_record_search",
+    "mcp_celia-memory_celia_memory_global_load",
+    "mcp_celia-memory_celia_memory_scene_load",
+    "mcp_celia-memory_celia_memory_record_search",
     "mcp_celia-memory_celia.memory_global_load",
     "mcp_celia-memory_celia.memory_scene_load",
     "mcp_celia-memory_celia.memory_record_search",

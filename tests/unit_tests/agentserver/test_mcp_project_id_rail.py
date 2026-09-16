@@ -138,8 +138,8 @@ async def test_celia_project_env_fallback_overrides_model_value(monkeypatch) -> 
     monkeypatch.setattr(session_metadata, "get_session_metadata", lambda _sid: {})
     monkeypatch.setattr(interface_deep, "_CRON_TOOL_METADATA", SimpleNamespace(get=lambda: {}))
     monkeypatch.setenv("CELIA_CELIAWORK_PROJECT_ID", "fallback-project")
-    ctx = _context("mcp_celia-memory_celia.memory_store", {"content": "x", "project_id": "fake"},
-                   mcp_scope=("celia-memory", "celia.memory_store"))
+    ctx = _context("mcp_celia-memory_celia_memory_store", {"content": "x", "project_id": "fake"},
+                   mcp_scope=("celia-memory", "celia_memory_store"))
     await McpProjectIdRail(session_id="business-session").before_tool_call(ctx)
     assert ctx.inputs.tool_args["project_id"] == "fallback-project"
 
