@@ -1631,7 +1631,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         waiters = getattr(lock, "_waiters", None)
         return any(not waiter.cancelled() for waiter in list(waiters or ()))
 
-    async def _get_or_create_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter":
+    async def _get_or_create_session_adapter(
+        self,
+        session_id: str | None,
+        *,
+        warmup_exclude_request_id: str | None = None,
+    ) -> "JiuWenSwarmDeepAdapter":
         """Return the session-owned adapter, creating and initializing it once."""
         if self._is_session_scoped_adapter:
             self._touch_session_adapter(session_id)
@@ -1687,6 +1692,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
+                    exclude_request_id=warmup_exclude_request_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -9311,7 +9317,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             AgentResponse 包含执行结果
         """
         if not self._is_session_scoped_adapter:
-            session_adapter = await self._get_or_create_session_adapter(request.session_id)
+            session_adapter = await self._get_or_create_session_adapter(
+                request.session_id,
+                warmup_exclude_request_id=request.request_id,
+            )
             try:
                 return await session_adapter.process_message_impl(request, inputs)
             finally:
@@ -9686,7 +9695,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # "entering runner streaming" line so the pre-dispatch work is visible.
         stream_impl_started_at = time.monotonic()
         if not self._is_session_scoped_adapter:
-            session_adapter = await self._get_or_create_session_adapter(request.session_id)
+            session_adapter = await self._get_or_create_session_adapter(
+                request.session_id,
+                warmup_exclude_request_id=request.request_id,
+            )
             try:
                 async for chunk in session_adapter.process_message_stream_impl(request, inputs):
                     yield chunk
