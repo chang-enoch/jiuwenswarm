@@ -49,8 +49,8 @@ def test_default_templates_mount_new_celia_without_legacy_extraction(template, m
 
 def test_providers_load_separate_matching_prompts():
     new, old = load_celia_agent_prompt(), load_old_celia_agent_prompt()
-    assert "`mcp_celia-memory_celia.memory_store`" in new and "USER.md" not in new
-    assert "`memory_store`" in old and "mcp_celia-memory_celia.memory_" not in old
+    assert "`mcp_celia-memory_celia_memory_store`" in new and "USER.md" not in new
+    assert "`memory_store`" in old and "mcp_celia-memory_celia_memory_" not in old
     assert "USER.md" in old
 
 

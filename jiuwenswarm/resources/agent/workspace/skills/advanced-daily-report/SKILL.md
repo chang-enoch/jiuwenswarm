@@ -3,7 +3,7 @@ name: advanced-daily-report
 version: 2.0.0
 description: 进阶版日报生成器，支持多数据源采集、工作分析、趋势对比、周报月报聚合
 tags: [report, automation, productivity, daily, weekly, monthly, advanced]
-allowed_tools: [mcp_celia-memory_celia.memory_record_search, bash, read_file, write_file]
+allowed_tools: [mcp_celia-memory_celia_memory_record_search, bash, read_file, write_file]
 ---
 
 # 进阶版日报生成器
@@ -76,7 +76,7 @@ daily-report/
 **脚本会自动采集以下数据**：
 - **Git 提交记录**：通过 `git log` 命令读取 `D:/Download/jiuwenswarm` 仓库的提交历史
 - **邮箱邮件统计**：通过 IMAP 协议连接 `.env` 中配置的邮箱账户读取邮件统计（需要邮箱授权码）
-- **记忆系统**：脚本仅在旧文件记忆开启时采集本地记录。Celia 模式下，用 `mcp_celia-memory_celia.memory_record_search` 检索所需工作记录，结合返回结果补充报告。
+- **记忆系统**：脚本仅在旧文件记忆开启时采集本地记录。Celia 模式下，用 `mcp_celia-memory_celia_memory_record_search` 检索所需工作记录，结合返回结果补充报告。
 - **待办事项**：读取 `~/.jiuwenswarm/agent/sessions/` 下各会话的 `todo.md` 文件
 
 ### 手动触发
