@@ -8047,7 +8047,7 @@ class JiuWenSwarmDeepAdapter:
                     base_url=emb_cfg["base_url"],
                     model=emb_cfg["model"],
                 )
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 

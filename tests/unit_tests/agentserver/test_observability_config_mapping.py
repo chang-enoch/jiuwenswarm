@@ -25,3 +25,15 @@ def test_observability_backend_and_attribute_limit_can_be_configured() -> None:
 
     assert config.backend == "langfuse"
     assert config.max_attributes == 512
+
+
+def test_trace_message_redaction_settings_are_forwarded_to_sdk() -> None:
+    config = build_observability_config(
+        {"redact_prompts": True, "redact_completions": True},
+        service_name="jiuwenswarm-agent",
+        default_backend="otlp",
+        traces_dir="/tmp/traces",
+    )
+
+    assert config.redact_prompts is True
+    assert config.redact_completions is True
