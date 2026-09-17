@@ -6,6 +6,8 @@
 > **对应实现**：`jiuwenswarm/gateway/channel_manager/web/web_http_app.py`、`web_http_dispatch.py`、`outbound.py`、`web_http_server.py`、`web_ws_transport.py`；Handler / MessageHandler 与 A1 共用。  
 > **证据原则**：标注「代码行为」均可回溯至上述源码；未实现项写「代码未定义」，**禁止当作已冻结承诺**。产品排期、Ingress、Token claims 等见 **附录 A**。
 
+> **A2A 专项接口**：13 个出站 Web HTTP 路由、企业版实际放行范围以及 Manager Config Receiver 的 6 个写操作，统一见 [Gateway A2A HTTP 接口文档](Gateway%20A2A接口文档.md)。本文保留 Web HTTP 通用信封、身份头和状态码约定，不重复维护 A2A DTO。
+
 ```text
 【WS / A1】浏览器/BFF ── JSON 帧 ──► Gateway /ws        ──► Handler / MH ──► Agent
 【HTTP/A2】浏览器/BFF ── REST/SSE ──► Gateway /api/v1   ──► 同一套 Handler / MH ──► Agent
