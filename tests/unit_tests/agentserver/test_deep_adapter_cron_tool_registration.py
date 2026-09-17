@@ -55,7 +55,7 @@ def _make_adapter(language: str = "cn") -> tuple[JiuWenSwarmDeepAdapter, dict[st
 
     def _build_cron_tools() -> list[_FakeTool]:
         counters["build"] += 1
-        return [_FakeTool("cron"), _FakeTool("cron_list_jobs")]
+        return [_FakeTool("cron")]
 
     adapter._build_cron_tools = _build_cron_tools
     adapter._resolve_runtime_language = lambda: adapter._language
@@ -73,11 +73,8 @@ def test_cron_tools_are_built_once_across_turns() -> None:
         adapter._ensure_cron_tools_registered("sess_a")
 
     assert counters["build"] == 1
-    assert adapter._instance.ability_manager.add_calls == 2
-    assert {card.name for card in adapter._instance.ability_manager.cards} == {
-        "cron",
-        "cron_list_jobs",
-    }
+    assert adapter._instance.ability_manager.add_calls == 1
+    assert {card.name for card in adapter._instance.ability_manager.cards} == {"cron"}
 
 
 def test_language_change_rebuilds_cron_tools() -> None:
@@ -90,7 +87,7 @@ def test_language_change_rebuilds_cron_tools() -> None:
 
     assert counters["build"] == 2
     # Rebuilt, not accumulated: the previous generation is detached first.
-    assert len(adapter._instance.ability_manager.cards) == 2
+    assert len(adapter._instance.ability_manager.cards) == 1
 
 
 def test_agent_rebuild_reregisters_cron_tools() -> None:
@@ -106,10 +103,7 @@ def test_agent_rebuild_reregisters_cron_tools() -> None:
     adapter._ensure_cron_tools_registered("sess_a")
 
     assert counters["build"] == 2
-    assert {card.name for card in adapter._instance.ability_manager.cards} == {
-        "cron",
-        "cron_list_jobs",
-    }
+    assert {card.name for card in adapter._instance.ability_manager.cards} == {"cron"}
 
 
 @pytest.mark.parametrize("session_id", ["heartbeat_1", "cron_job_7", "__cron___18f2c1_ab12cd34"])
@@ -139,15 +133,12 @@ def test_cron_execution_session_strips_residual_cron_tools() -> None:
     """Tools registered by a normal session must not leak into a cron run.
 
     The agent instance is shared across sessions; without the strip, a cron
-    execution session would inherit cron_create_job from a previous normal
+    execution session would inherit the cron tool from a previous normal
     turn and re-create schedules from task text like "每天 9 点…"。
     """
     adapter, counters = _make_adapter()
     adapter._ensure_cron_tools_registered("sess_a")
-    assert {card.name for card in adapter._instance.ability_manager.cards} == {
-        "cron",
-        "cron_list_jobs",
-    }
+    assert {card.name for card in adapter._instance.ability_manager.cards} == {"cron"}
 
     adapter._ensure_cron_tools_registered("__cron___18f2c1_ab12cd34")
 
@@ -157,7 +148,4 @@ def test_cron_execution_session_strips_residual_cron_tools() -> None:
     # A later normal session must re-register through the regular path.
     adapter._ensure_cron_tools_registered("sess_a")
     assert counters["build"] == 2
-    assert {card.name for card in adapter._instance.ability_manager.cards} == {
-        "cron",
-        "cron_list_jobs",
-    }
+    assert {card.name for card in adapter._instance.ability_manager.cards} == {"cron"}
