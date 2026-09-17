@@ -34,6 +34,7 @@ from openjiuwen.agent_teams.rails.team_context import (
 from openjiuwen.harness.rails.personal_context import PersonalContextRail
 
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
+from jiuwenswarm.common.utils import get_user_workspace_dir
 from jiuwenswarm.server.runtime.runtime_scope import RuntimeScopeKey
 from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import (
     RuntimePromptRail,
@@ -93,7 +94,7 @@ def _build_personal_context_rail(
     """Mount even when disabled so live members observe subsequent switch changes."""
     del params, context
     try:
-        return PersonalContextRail(Path.home() / ".jiuwenswarm" / ".personal_context")
+        return PersonalContextRail(get_user_workspace_dir() / ".personal_context")
     except Exception as exc:
         logger.warning(
             "[swarm.personal_context] optional Rail construction failed (%s)",

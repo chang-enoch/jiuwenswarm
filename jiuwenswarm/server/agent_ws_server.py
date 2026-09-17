@@ -29,6 +29,7 @@ from jiuwenswarm.agents.harness.common.tools.acp_output_tools import get_acp_out
 from jiuwenswarm.common.utils import (
     get_agent_sessions_dir,
     get_config_file,
+    get_user_workspace_dir,
     mask_sensitive,
     resolve_tenant_sessions_dir,
 )
@@ -368,7 +369,7 @@ class AgentWebSocketServer:
         self._jiuwenbox_runner = JiuwenBoxRunner.instance()
         # AgentServer 内唯一持有的进程内 PersonalContext Host；Context Rail 使用同一固定目录。
         self._personal_context_host = PersonalContextHostAPI(
-            home=Path.home() / ".jiuwenswarm" / ".personal_context",
+            home=get_user_workspace_dir() / ".personal_context",
         )
         self._personal_context_start_task: asyncio.Task[None] | None = None
         # Proactive recommendation engine (set by app_agentserver for debug trigger)

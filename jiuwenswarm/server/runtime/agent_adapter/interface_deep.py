@@ -586,6 +586,7 @@ from jiuwenswarm.common.utils import (
     get_multi_tenant_user_workspace_dir,
     get_prompt_attachment_dir,
     get_runtime_state_path,
+    get_user_workspace_dir,
     resolve_tenant_sessions_dir,
     reset_free_search_runtime_flags,
     resolve_agent_registered_skill_dirs,
@@ -10193,7 +10194,7 @@ class JiuWenSwarmDeepAdapter:
             if rail is None:
                 try:
                     rail = PersonalContextRail(
-                        Path.home() / ".jiuwenswarm" / ".personal_context"
+                        get_user_workspace_dir() / ".personal_context"
                     )
                     await self._instance.register_rail(rail)
                 except Exception as exc:  # noqa: BLE001
