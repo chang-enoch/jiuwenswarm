@@ -148,6 +148,7 @@ async def test_reverse_rpc_over_real_http_sse(monkeypatch, stream):
             assert kwargs["query"] == "weather"
             if stream:
                 assert kwargs["source_resource_id"] == "bot-1"
+                assert kwargs["source_user_id"] == "user-1"
             return {"items": [{"agent_id": "weather"}], "total": 1}
 
         async def outbound_dispatch_task(self, **kwargs):
@@ -177,7 +178,7 @@ async def test_reverse_rpc_over_real_http_sse(monkeypatch, stream):
     client = RuntimeRoutedAgentClient(route_client=route)
     handler = object.__new__(MessageHandler)
     handler._stream_sessions = {"req-1": "sess-1"}
-    handler._stream_metadata = {"req-1": {"routing": {"bot_id": "bot-1"}}}
+    handler._stream_metadata = {"req-1": {"user_id": "user-1", "routing": {"bot_id": "bot-1"}}}
     handler._stream_channels = {"req-1": "web"}
     handler.set_a2a_outbound_tool_manager(Manager())
 

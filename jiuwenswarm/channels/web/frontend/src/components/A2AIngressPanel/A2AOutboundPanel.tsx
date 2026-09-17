@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronDown, Plus, Power, RefreshCw, Search, Server, Trash2, X } from 'lucide-react';
 import { isEnterprise } from '../../edition';
+import { RUNTIME_SCOPE_CHANGED_EVENT } from '../../services/runtimeScope';
 import type { WebError } from '../../types/websocket';
 import { Switch } from '../Switch';
 import { A2AOutboundCredentialInput } from './A2AOutboundCredentialInput';
@@ -59,6 +60,27 @@ export function A2AOutboundPanel({ isConnected, request, headerActionsContainer 
   } | null>(null);
   const generationRef = useRef(createA2AOutboundRequestScope());
   const editGenerationRef = useRef(createA2AOutboundRequestScope());
+  const awaitingReconnectRef = useRef(false);
+  const userScopeRef = useRef(createA2AOutboundRequestScope());
+
+  useEffect(() => {
+    if (isConnected) awaitingReconnectRef.current = false;
+  }, [isConnected]);
+
+  useEffect(() => {
+    if (!enterpriseMode) return;
+    const clearUserState = () => {
+      awaitingReconnectRef.current = true;
+      userScopeRef.current.next();
+      generationRef.current.next();
+      setAgents([]);
+      setBusy(null);
+      setError(null);
+      setNotice(null);
+    };
+    window.addEventListener(RUNTIME_SCOPE_CHANGED_EVENT, clearUserState);
+    return () => window.removeEventListener(RUNTIME_SCOPE_CHANGED_EVENT, clearUserState);
+  }, [enterpriseMode]);
 
   useEffect(() => {
     editGenerationRef.current.next();
@@ -69,7 +91,7 @@ export function A2AOutboundPanel({ isConnected, request, headerActionsContainer 
   }, [isConnected]);
 
   const refresh = useCallback(async () => {
-    if (!isConnected) return;
+    if (!isConnected || awaitingReconnectRef.current) return;
     const generation = generationRef.current.next();
     try {
       const [payload, rawSettings] = enterpriseMode
@@ -202,12 +224,13 @@ export function A2AOutboundPanel({ isConnected, request, headerActionsContainer 
   };
 
   const operate = async (agent: A2AOutboundAgent, operation: 'toggle' | 'refresh' | 'confirm' | 'reject' | 'delete') => {
-    if (busy || !isConnected) return;
+    if (busy || !isConnected || awaitingReconnectRef.current) return;
     if (operation === 'delete' && !window.confirm(t('a2aIngress.outbound.deleteConfirm'))) return;
     setBusy(`${operation}:${agent.agent_id}`);
     setError(null);
     setNotice(null);
     generationRef.current.next();
+    const generation = userScopeRef.current.next();
     try {
       let payload: unknown;
       if (operation === 'toggle') {
@@ -219,6 +242,7 @@ export function A2AOutboundPanel({ isConnected, request, headerActionsContainer 
       else if (operation === 'confirm' || operation === 'reject')
         payload = await request('a2a.outbound.confirm_revision', { agent_id: agent.agent_id, accept: operation === 'confirm' });
       else payload = await request('a2a.outbound.delete', { agent_id: agent.agent_id });
+      if (!userScopeRef.current.accepts(generation)) return;
       if (operation === 'delete') setAgents(current => current.filter(item => item.agent_id !== agent.agent_id));
       else {
         const updated = normalizeA2AOutboundAgent(payload);
@@ -226,10 +250,11 @@ export function A2AOutboundPanel({ isConnected, request, headerActionsContainer 
         setAgents(current => current.map(item => (item.agent_id === updated.agent_id ? updated : item)));
       }
     } catch (nextError) {
+      if (!userScopeRef.current.accepts(generation)) return;
       setError(errorMessage(nextError));
       void refresh();
     } finally {
-      setBusy(null);
+      if (userScopeRef.current.accepts(generation)) setBusy(null);
     }
   };
 

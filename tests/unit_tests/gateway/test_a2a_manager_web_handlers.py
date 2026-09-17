@@ -151,7 +151,7 @@ class _OutboundRegistryProbe:
     async def register(self, params):
         return {"agent_id": "agent-1", "display_name": params.get("display_name")}
 
-    async def list_agents(self):
+    async def list_agents(self, *, source_user_id=None):
         return {"items": [], "total": 0}
 
     async def get_agent(self, agent_id):
@@ -160,7 +160,7 @@ class _OutboundRegistryProbe:
     async def update_agent(self, agent_id, params):
         return {"agent_id": agent_id, **params}
 
-    async def set_user_enabled(self, agent_id, user_enabled):
+    async def set_user_enabled(self, agent_id, user_enabled, *, source_user_id=None):
         return {
             "agent_id": agent_id,
             "user_enabled": user_enabled,
