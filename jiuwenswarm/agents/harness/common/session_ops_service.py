@@ -965,24 +965,73 @@ def _build_context_messages_from_history(
     return filtered_messages, skipped
 
 
+async def _try_restore_from_checkpointer(
+    *,
+    context_engine: Any,
+    session: Any,
+    react_agent: Any,
+    session_id: str,
+) -> bool:
+    """恢复持久化 checkpointer 中压缩后的 context，避免重启后重复压缩。
+
+    上一轮 turn 结束时的 ``save_contexts(session)`` + ``session.commit()`` 已把
+    压缩后的 context 快照写进 session state，并由 checkpointer 持久化到 sqlite。
+    这里调用 ``create_context`` **不带** ``history_messages``，走
+    ``context_engine._load_state_from_session`` → ``context.load_state(states)``
+    恢复压缩快照；若带 ``history_messages`` 则会覆盖这些快照、触发再次压缩——
+    这正是本改造要消除的行为。
+
+    Returns:
+        恢复出非空 context 返回 True；checkpointer 无可用快照（或恢复失败）
+        返回 False，由调用方回退到 history.jsonl 全量重灌。
+    """
+    try:
+        await context_engine.create_context(
+            session=session,
+            processors=_get_context_processors(react_agent),
+        )
+    except Exception as exc:
+        logger.warning(
+            "warmup_session_context: checkpointer restore failed for %s (%s); "
+            "falling back to history rebuild",
+            session_id, exc,
+        )
+        return False
+
+    context = context_engine.get_context(session_id=session_id)
+    if context is not None and context.get_messages():
+        logger.info(
+            "warmup_session_context: session=%s restored %d messages from checkpointer "
+            "(compressed, no re-compression)",
+            session_id, len(context.get_messages()),
+        )
+        return True
+
+    # checkpointer 无可用快照（新会话 / 从未 commit）→ 清掉空 context，让
+    # history 重灌在干净的 buffer 上进行。
+    try:
+        await context_engine.clear_context(session_id=session_id)
+    except Exception as exc:
+        logger.warning("warmup_session_context: clear_context failed for %s: %s", session_id, exc)
+    return False
+
+
 async def warmup_session_context(
     *,
     deep_agent: "DeepAgent",
     session_id: str,
     exclude_request_id: str | None = None,
 ) -> bool:
-    """Restart-safe restore of context_engine messages from on-disk history.
+    """Restart-safe restore of context_engine messages.
 
-    对话消息只存在于 context_engine 的进程内存（``_context_pool``），不落
-    checkpointer。server 重启或 session adapter 被空闲驱逐后重建时 pool 为
-    空，而 chat.send 主路径不会把磁盘 history.jsonl 回灌给模型，导致
-    "能看到历史列表但继续对话失忆"。
+    在新建 session adapter（``start_interaction`` 之后）调用。恢复顺序：
+    1. 优先从持久化 checkpointer 恢复压缩后的 context 快照（由上一轮
+       ``save_contexts``+``commit`` 写入），避免重启后用全量 history 重灌导致
+       再次压缩——这是「重启后不重复压缩」的核心。
+    2. 仅当 checkpointer 无可用快照时，才从磁盘 history.jsonl 全量重灌兜底
+       （历史上只有 history.jsonl 一种来源，故保留该分支）。
 
-    在新建 session adapter（``start_interaction`` 之后）调用：若内存 context
-    缺失且磁盘上有历史记录，则将全量 history 转换为 openjiuwen 消息并灌回
-    context_engine。与 ``rewind_session_context`` 的区别：不截断 history、
-    不清理 Session state（agent/workflow 状态已由 checkpointer 在 pre_run
-    恢复）、不强写 checkpointer（消息持久化本就由 history.jsonl 承担）。
+    与 ``rewind_session_context`` 的区别：不截断 history、不强写 checkpointer。
 
     ``chat.send`` 会在 adapter 冷启动前先把当前用户消息持久化。调用方可传入
     ``exclude_request_id``，使 warmup 仅恢复此前历史；当前轮仍由正常的 inputs
@@ -1002,6 +1051,32 @@ async def warmup_session_context(
         # 全新会话，磁盘无历史，静默跳过
         return False
 
+    session = resolve_live_agent_session(deep_agent, session_id)
+    if session is None:
+        # 正常调用点（start_interaction 之后）live session 必在；兜底临时 Session。
+        try:
+            from openjiuwen.core.single_agent import create_agent_session
+
+            session = create_agent_session(
+                session_id=session_id, card=getattr(deep_agent, "card", None)
+            )
+            await session.pre_run(inputs=None)
+        except Exception as exc:
+            logger.warning("warmup_session_context: pre_run failed for %s: %s", session_id, exc)
+            return False
+
+    # ── 优先：从持久化 checkpointer 恢复压缩后的 context ──
+    # create_context 不带 history_messages → _load_state_from_session 恢复压缩
+    # 快照，不覆盖已压好的内容，从而消掉重启后的重复压缩。
+    if await _try_restore_from_checkpointer(
+        context_engine=context_engine,
+        session=session,
+        react_agent=react_agent,
+        session_id=session_id,
+    ):
+        return True
+
+    # ── 兜底：checkpointer 无可用快照时，从磁盘 history.jsonl 全量重灌 ──
     try:
         history_records = load_history_records(session_id)
     except OSError as exc:
@@ -1031,24 +1106,10 @@ async def warmup_session_context(
         )
         return False
 
-    session = resolve_live_agent_session(deep_agent, session_id)
-    if session is None:
-        # 正常调用点（start_interaction 之后）live session 必在；兜底临时 Session。
-        try:
-            from openjiuwen.core.single_agent import create_agent_session
-
-            session = create_agent_session(
-                session_id=session_id, card=getattr(deep_agent, "card", None)
-            )
-            await session.pre_run(inputs=None)
-        except Exception as exc:
-            logger.warning("warmup_session_context: pre_run failed for %s: %s", session_id, exc)
-            return False
-
     try:
         await context_engine.create_context(
             session=session,
- 	        processors=_get_context_processors(react_agent),
+	        processors=_get_context_processors(react_agent),
             history_messages=context_messages,
         )
     except Exception as exc:
