@@ -1816,7 +1816,7 @@ dependencies = [
     { name = "lxml" },
     { name = "mutagen" },
     { name = "numpy" },
-    { name = "openjiuwen", extra = ["claude", "codex"] },
+    { name = "openjiuwen" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
@@ -1847,6 +1847,9 @@ dependencies = [
 [package.optional-dependencies]
 a2a = [
     { name = "a2a-sdk", extra = ["http-server"] },
+]
+cli-agents = [
+    { name = "openjiuwen", extra = ["claude", "codex"] },
 ]
 desktop = [
     { name = "pywebview" },
@@ -1987,8 +1990,9 @@ requires-dist = [
     { name = "mutagen", specifier = ">=1.47.0" },
     { name = "mutagen", marker = "extra == 'harmony'", specifier = ">=1.47.0" },
     { name = "numpy", specifier = ">=1.24.0" },
+    { name = "openjiuwen", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=br_0.1.16.post2.hotfix" },
     { name = "openjiuwen", marker = "extra == 'harmony'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=br_0.1.16.post2.hotfix" },
-    { name = "openjiuwen", extras = ["claude", "codex"], git = "https://gitcode.com/openJiuwen/agent-core.git?rev=br_0.1.16.post2.hotfix" },
+    { name = "openjiuwen", extras = ["claude", "codex"], marker = "extra == 'cli-agents'", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=br_0.1.16.post2.hotfix" },
     { name = "openjiuwen", extras = ["postgres", "zmq"], marker = "extra == 'distribute'" },
     { name = "opentelemetry-api", specifier = ">=1.28.0" },
     { name = "opentelemetry-api", marker = "extra == 'harmony'", specifier = ">=1.28.0" },
@@ -2041,7 +2045,7 @@ requires-dist = [
     { name = "wecom-aibot-sdk", specifier = ">=1.0.5" },
     { name = "wecom-aibot-sdk", marker = "extra == 'harmony'", specifier = ">=1.0.5" },
 ]
-provides-extras = ["harmony", "a2a", "ssh", "desktop", "dev", "tui", "distribute", "shell-ast", "test"]
+provides-extras = ["harmony", "a2a", "ssh", "desktop", "dev", "tui", "distribute", "cli-agents", "shell-ast", "test"]
 
 [package.metadata.requires-dev]
 dev = [
