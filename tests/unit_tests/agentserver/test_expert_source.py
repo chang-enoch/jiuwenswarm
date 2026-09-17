@@ -506,16 +506,25 @@ def test_validate_rejects_skill_dir_escape(tmp_path: Path) -> None:
         es.validate_expert_package(pkg)
 
 
-def test_validate_rejects_skill_entry_without_dir(tmp_path: Path) -> None:
-    """skills 条目缺 dir 键 → 拒载。"""
-    pkg = _make_package(tmp_path, "security-reviewer")
+def test_validate_skips_empty_skill_entries(tmp_path: Path) -> None:
+    """skills 空值条目（缺 dir 键 / null / 空串 dir）→ 跳过并记 warning，不拒载。
+
+    与 agent-core 装载侧 _build_skill_specs 同规放宽；非空残缺（目录不存在、
+    缺 SKILL.md）仍由上方用例保证拒载。
+    """
+    pkg = _make_package(tmp_path, "security-reviewer", skills=["skills/threat-modeling"])
     manifest = json.loads((pkg / "manifest.json").read_text(encoding="utf-8"))
-    manifest["skills"] = [{"mode": "all"}]
+    manifest["skills"] = [
+        {"mode": "all"},  # 缺 dir 键
+        None,  # null 条目
+        {"dir": ""},  # 空串 dir
+        {"dir": "skills/threat-modeling"},  # 合法条目不受影响
+    ]
     (pkg / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
-    with pytest.raises(es.InvalidExpertPackage, match="dir"):
-        es.validate_expert_package(pkg)
+    warnings = es.validate_expert_package(pkg)
+    assert any("空值条目" in w for w in warnings)
 
 
 def test_validate_rejects_missing_manifest(tmp_path: Path) -> None:
@@ -654,11 +663,11 @@ class TestHttpRepoOverNamedPipe:
             request_line = head.split(b"\r\n", 1)[0].decode("latin-1")
             status, body = responder(request_line)
             payload = (
-                f"HTTP/1.1 {status} OK\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Content-Type: application/octet-stream\r\n"
-                "\r\n"
-            ).encode("latin-1") + body
+                          f"HTTP/1.1 {status} OK\r\n"
+                          f"Content-Length: {len(body)}\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "\r\n"
+                      ).encode("latin-1") + body
             await stream.write(payload)
 
         server = await np_transport.serve_pipe(
@@ -747,6 +756,8 @@ class TestHttpRepoOverNamedPipe:
         source = es.HttpRepoExpertPackageSource(base_url="np://claw-test-np-expert-down")
         with pytest.raises(es.ExpertRepoUnavailable):
             await source.list()
+
+
 def test_metadata_init_defaults_expert_type_agent(sessions_dir: Path) -> None:
     sm.init_session_metadata(session_id="t1", channel_id="desktop")
     assert sm.get_session_metadata("t1", cache_bust=True)["expert_type"] == "agent"

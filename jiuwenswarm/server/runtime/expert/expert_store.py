@@ -170,11 +170,20 @@ def validate_expert_package(package_dir: Path) -> list[str]:
         if not tool_file or not (package_dir / str(tool_file)).is_file():
             raise InvalidExpertPackage(f"tools 条目引用的文件不存在: {tool_entry!r}")
     pkg_root = package_dir.resolve()
+    skipped_empty_skills = 0
     for skill_entry in manifest.get("skills") or []:
+        # skill 条目是目录引用（loader: {"dir": "skills/xxx", "mode": ..., ...}）；
+        # 空值条目（null / 空 dict / 缺 dir 键 / dir 为空串）跳过——agent-core
+        # 装载侧 _build_skill_specs 同规放宽；非空残缺（目录不存在/缺 SKILL.md）
+        # 与非 dict 非法条目仍报错
+        if not skill_entry or (
+            isinstance(skill_entry, dict) and not skill_entry.get("dir")
+        ):
+            skipped_empty_skills += 1
+            continue
         skill_dir_raw = (
             skill_entry.get("dir") if isinstance(skill_entry, dict) else None
         )
-        # skill 条目是目录引用（loader: {"dir": "skills/xxx", "mode": ..., ...}）
         if not skill_dir_raw:
             raise InvalidExpertPackage(f"skills 条目缺少 dir: {skill_entry!r}")
         skill_path = (package_dir / str(skill_dir_raw)).resolve()
@@ -196,6 +205,8 @@ def validate_expert_package(package_dir: Path) -> list[str]:
         if package_dir.resolve() not in avatar_path.parents or not avatar_path.is_file():
             raise InvalidExpertPackage(f"metadata.avatar 声明的头像文件不存在: {avatar}")
     warnings: list[str] = []
+    if skipped_empty_skills:
+        warnings.append(f"skills 忽略 {skipped_empty_skills} 个空值条目")
     if "model" in manifest:
         warnings.append("model 字段不生效（根模板 model 不会被使用），请移除")
     return warnings
@@ -309,12 +320,37 @@ def _single_top_level_prefix(names: list[str]) -> str:
     return f"{candidate}/" if candidate else ""
 
 
+def _to_long_path(p: Path | str) -> str:
+    """Windows 下转 ``\\\\?\\`` 扩展长度路径，规避 MAX_PATH=260 限制；其他平台原样返回。
+
+    带前缀后 Windows 不再做
+    规范化（相对路径、``..`` 不解析），调用前必须已是绝对路径。
+    """
+    s = os.path.abspath(os.fspath(p))
+    if os.name != "nt":
+        return s
+    if s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s.lstrip("\\")
+    return "\\\\?\\" + s
+
+
+# 扩展长度路径总上限约 32767 字符，留余量提前拒绝，让失败落在明确文案里
+# 而不是底层 WinError；单段 255 字符限制由文件系统自行拒绝。
+_LONG_PATH_GUARD = 32700
+
+
 def _extract_zip(content: bytes, target_dir: Path) -> None:
     """解压到 target_dir（先清空旧目录），拒绝路径逃逸的条目。
 
     容错：条目全部位于同一个一级目录前缀下时自动剥掉该层，让
     ``manifest.json`` 落到包根目录，与平铺打包形态等价。
+
+    Windows 全程走 ``\\\\?\\`` 前缀路径（见 ``_to_long_path``），规避 MAX_PATH
+    导致的 WinError 3 假「路径不存在」。
     """
+    target_str = _to_long_path(target_dir)
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
         names = zf.namelist()
         for name in names:
@@ -322,15 +358,21 @@ def _extract_zip(content: bytes, target_dir: Path) -> None:
             if normalized.is_absolute() or ".." in normalized.parts:
                 raise ValueError(f"zip 条目路径非法: {name}")
         prefix = _single_top_level_prefix(names)
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.exists(target_str):
+            shutil.rmtree(target_str)
+        os.makedirs(target_str, exist_ok=True)
         for name in names:
             rel = name[len(prefix):] if prefix else name
             if not rel or rel.endswith("/"):
                 continue
-            dest = target_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            # 逐段拼接而非 rel 整体 join：前缀模式下 Windows 不做分隔符/`.` 规范化
+            parts = [p for p in rel.split("/") if p not in ("", ".")]
+            if not parts:
+                continue
+            dest = os.path.join(target_str, *parts)
+            if len(dest) > _LONG_PATH_GUARD:
+                raise ValueError(f"zip 条目路径过长: {name[:80]}")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
             with zf.open(name) as src, open(dest, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
