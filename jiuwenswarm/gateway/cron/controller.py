@@ -155,6 +155,9 @@ class CronController:
         jobs = await self._store.list_jobs()
         return [j.to_dict() for j in jobs]
 
+    async def list_run_records(self) -> list[dict[str, Any]]:
+        return await self._store.list_run_records()
+
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         job = await self._store.get_job(job_id)
         return job.to_dict() if job else None
