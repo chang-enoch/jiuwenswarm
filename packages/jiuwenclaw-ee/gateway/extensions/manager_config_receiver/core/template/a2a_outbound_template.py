@@ -172,6 +172,8 @@ class A2AOutboundTemplateService:
                     await repo.upsert(projection)
                 for row in old_user_states:
                     user_state = _row_for_restore(row, "updated_at")
+                    if user_state is None:
+                        continue
                     user_state.setdefault("user_id", None)
                     await user_states.upsert(user_state)
                 runtime_state = _row_for_restore(

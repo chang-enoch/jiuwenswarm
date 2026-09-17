@@ -797,16 +797,18 @@ def test_a2a_delete_restores_projection_and_local_state_on_cleanup_failure(
     assert client.post(path, json=_outbound_payload()).status_code == 200
     user_states = repos["a2a_outbound_user_state"]
     runtime_states = repos["a2a_outbound_runtime_state"]
-    client.portal.call(
-        lambda: user_states.create(
-            {
-                "template_id": "a2a-weather",
-                "user_id": "user-1",
-                "user_enabled": False,
-                "updated_at": datetime.now(timezone.utc),
-            }
+    expected_user_states = {"user-1": False, "user-2": True, None: False}
+    for user_id, enabled in expected_user_states.items():
+        client.portal.call(
+            lambda user_id=user_id, enabled=enabled: user_states.create(
+                {
+                    "template_id": "a2a-weather",
+                    "user_id": user_id,
+                    "user_enabled": enabled,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
         )
-    )
     client.portal.call(
         lambda: runtime_states.create(
             {
@@ -836,12 +838,13 @@ def test_a2a_delete_restores_projection_and_local_state_on_cleanup_failure(
         )
         is not None
     )
-    assert (
-        client.portal.call(lambda: user_states.get(template_id="a2a-weather", user_id="user-1"))[
-            "user_enabled"
-        ]
-        is False
+    restored_user_states = client.portal.call(
+        lambda: user_states.list(filters={"template_id": "a2a-weather"})
     )
+    assert len(restored_user_states) == len(expected_user_states)
+    assert {
+        row["user_id"]: row["user_enabled"] for row in restored_user_states
+    } == expected_user_states
     assert client.portal.call(
         lambda: runtime_states.get(template_id="a2a-weather")
     )["availability"] == A2AOutboundAvailability.UNREACHABLE.value
@@ -849,9 +852,9 @@ def test_a2a_delete_restores_projection_and_local_state_on_cleanup_failure(
 
     monkeypatch.setattr(runtime_states, "delete", original_delete)
     client.portal.call(lambda: service.delete("a2a-weather"))
-    assert (
-        client.portal.call(lambda: user_states.get(template_id="a2a-weather", user_id="user-1")) is None
-    )
+    assert client.portal.call(
+        lambda: user_states.list(filters={"template_id": "a2a-weather"})
+    ) == []
 
 
 @pytest.mark.asyncio
