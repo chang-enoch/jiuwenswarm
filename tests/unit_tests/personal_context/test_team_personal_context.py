@@ -12,6 +12,12 @@ from openjiuwen.harness.prompts import PromptAttachmentManager
 from openjiuwen.harness.rails.personal_context import PersonalContextRail
 from jiuwenswarm.agents.swarm import register_swarm_providers
 from jiuwenswarm.agents.swarm.config_specs import build_member_capability_specs
+from jiuwenswarm.common import utils as swarm_utils
+
+
+def _patch_workspace_base_dir(monkeypatch, tmp_path: Path) -> None:
+    """Rail home now resolves via get_user_workspace_dir(), so patch its cache."""
+    monkeypatch.setattr(swarm_utils, "_workspace_base_dir", tmp_path / ".jiuwenswarm")
 
 
 @pytest.mark.parametrize(
@@ -36,7 +42,7 @@ def test_team_personal_context_spec_survives_member_serialization(
     selected = [spec for spec in specs if spec.type == "swarm.personal_context"]
     assert len(selected) == 1
     assert selected[0].params == {}
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    _patch_workspace_base_dir(monkeypatch, tmp_path)
     restored = RailSpec.model_validate(selected[0].model_dump())
     first = restored.build(language="cn", context=SimpleNamespace())
     second = restored.build(language="cn", context=SimpleNamespace())
@@ -54,7 +60,7 @@ async def test_team_existing_and_new_members_follow_shared_switch(
     import openjiuwen.harness.rails.personal_context as rail_module
 
     register_swarm_providers()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    _patch_workspace_base_dir(monkeypatch, tmp_path)
     home = tmp_path / ".jiuwenswarm" / ".personal_context"
     root = home / "workspace" / "context"
     root.mkdir(parents=True)
@@ -106,7 +112,7 @@ async def test_team_personal_context_keeps_tool_call_result_adjacency(
     tmp_path, monkeypatch
 ):
     register_swarm_providers()
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    _patch_workspace_base_dir(monkeypatch, tmp_path)
     home = tmp_path / ".jiuwenswarm" / ".personal_context"
     root = home / "workspace" / "context"
     root.mkdir(parents=True)

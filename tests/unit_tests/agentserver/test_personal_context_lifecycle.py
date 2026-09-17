@@ -99,7 +99,13 @@ def test_personal_context_cancellation_handlers_do_not_raise_inside_except() -> 
 async def test_agentserver_constructs_one_host_at_fixed_home(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("C:/users/tester")))
+    from jiuwenswarm.common import utils as utils_module
+
+    monkeypatch.setattr(
+        utils_module,
+        "_workspace_base_dir",
+        Path("C:/users/tester/.jiuwenswarm"),
+    )
     server = _server(monkeypatch)
 
     assert len(_FakePersonalContextHost.instances) == 1
