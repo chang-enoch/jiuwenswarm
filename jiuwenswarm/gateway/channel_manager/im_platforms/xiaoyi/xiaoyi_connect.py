@@ -43,6 +43,7 @@ from jiuwenswarm.gateway.routing.keys import XiaoyiDeliveryTarget
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
 from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.push import XiaoYiPushService, PushConfig
 from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.formatter import (
+    build_tool_call_part,
     get_status_state_for_event,
     get_status_text_for_event,
     is_retry_notice_text,
@@ -1159,9 +1160,11 @@ class XiaoyiChannel(BaseChannel):
                 else get_status_text_for_event(msg.event_type, msg.payload)
             )
             status_state = get_status_state_for_event(msg.event_type, msg.payload)
+            # 工具事件：附带结构化 data part（status-update 的 message.parts 里）
+            _tool_part = build_tool_call_part(msg.event_type, msg.payload)
             for url_key in list(self._ws_connections.keys()):
                 await self._send_status_update_with_state(
-                    task_id, session_id, status_text, status_state, url_key
+                    task_id, session_id, status_text, status_state, url_key, extra_part=_tool_part
                 )
             if status_state in {"completed", "failed", "canceled"} and session_id:
                 await self._finalize_session(
@@ -1534,9 +1537,10 @@ class XiaoyiChannel(BaseChannel):
             if ws_session and ws_task:
                 status_text = get_status_text_for_event(msg.event_type, msg.payload)
                 status_state = get_status_state_for_event(msg.event_type, msg.payload)
+                _team_tool_part = build_tool_call_part(msg.event_type, msg.payload)
                 for url_key in list(self._ws_connections.keys()):
                     await self._send_status_update_with_state(
-                        ws_task, ws_session, status_text, status_state, url_key
+                        ws_task, ws_session, status_text, status_state, url_key, extra_part=_team_tool_part
                     )
             return
         if msg.event_type == EventType.CHAT_FILE:
@@ -3088,10 +3092,21 @@ class XiaoyiChannel(BaseChannel):
             await self._send_agent_response(session_id, task_id, response, url_key)
 
     async def _send_status_update_with_state(
-            self, task_id: str, session_id: str, message: str, state: str, url_key: str
+            self,
+            task_id: str,
+            session_id: str,
+            message: str,
+            state: str,
+            url_key: str,
+            extra_part: dict | None = None,
     ) -> None:
         """发送状态更新消息（A2A 格式），支持自定义状态."""
         is_final = state in {"completed", "failed", "canceled"}
+        parts: list[dict] = [{"kind": "text", "text": message}]
+        # 工具事件附结构化 data part（kind:"data"，A2A 规范内），端侧据此渲染工具卡；
+        # 老客户端忽略未知 part，text 文案仍照常下发。
+        if extra_part:
+            parts.append(extra_part)
         response = {
             "jsonrpc": "2.0",
             "id": f"msg_{int(time.time() * 1000)}",
@@ -3102,7 +3117,7 @@ class XiaoyiChannel(BaseChannel):
                 "status": {
                     "message": {
                         "role": "agent",
-                        "parts": [{"kind": "text", "text": message}],
+                        "parts": parts,
                     },
                     "state": state,
                 },

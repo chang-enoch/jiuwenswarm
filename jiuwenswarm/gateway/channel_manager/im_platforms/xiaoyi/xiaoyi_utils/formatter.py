@@ -183,6 +183,78 @@ def build_reasoning_text_part(text: str) -> dict[str, Any]:
     }
 
 
+# 工具结果回传上限
+_TOOL_RESULT_MAX_CHARS = 2000
+
+
+def _truncate_text(text: str, limit: int = _TOOL_RESULT_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…(truncated {len(text)})"
+
+
+def build_tool_call_part(event_type: EventType | None, payload: dict | None) -> dict[str, Any] | None:
+    """构建工具调用的结构化 data part（A2A parts 支持 text/file/data）。
+
+    端侧（手机 / 桌面镜像）据此渲染工具卡：id 是稳定关联键，tool_call 与
+    tool_result 两侧都用同一个 tool_call_id 配对。text 文案仍照常下发，
+    老客户端忽略未知的 data part 即可。
+
+    形状：
+        {"kind": "data", "data": {"toolCall": {
+            "id", "name", "displayName", "status", "arguments", "result", "isError"}}}
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    if event_type == EventType.CHAT_TOOL_CALL:
+        tool_call = payload.get("tool_call")
+        if not isinstance(tool_call, dict):
+            return None
+        call_id = str(tool_call.get("tool_call_id") or tool_call.get("id") or "")
+        name = str(tool_call.get("name") or "")
+        display_name = str(tool_call.get("display_name") or "")
+        arguments = tool_call.get("arguments")
+        if isinstance(arguments, str):
+            # 端侧统一按对象消费；解析不了就原样放进 rawArguments
+            try:
+                arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                arguments = None
+        info: dict[str, Any] = {
+            "id": call_id,
+            "name": name,
+            "status": "running",
+        }
+        if display_name:
+            info["displayName"] = display_name
+        if arguments is not None:
+            info["arguments"] = arguments
+        return {"kind": "data", "data": {"toolCall": info}}
+
+    if event_type == EventType.CHAT_TOOL_RESULT:
+        call_id = str(payload.get("tool_call_id") or payload.get("id") or "")
+        name = str(payload.get("tool_name") or "")
+        is_error = bool(payload.get("is_error") or payload.get("isError"))
+        result = payload.get("result")
+        if result is None:
+            result = payload.get("content")
+        if isinstance(result, (dict, list)):
+            result = json.dumps(result, ensure_ascii=False)
+        result_text = str(result) if result is not None else ""
+        info = {
+            "id": call_id,
+            "name": name,
+            "status": "failed" if is_error else "completed",
+            "isError": is_error,
+        }
+        if result_text:
+            info["result"] = _truncate_text(result_text, _TOOL_RESULT_MAX_CHARS)
+        return {"kind": "data", "data": {"toolCall": info}}
+
+    return None
+
+
 def build_file_part(files: list[FileInfo]) -> dict[str, Any]:
     """
     构建文件消息部分。
@@ -555,11 +627,17 @@ def should_send_as_status_update(event_type: EventType | None) -> bool:
 
     # Status update 用于以下事件：
     # - CHAT_PROCESSING_STATUS: 处理状态
-    # 注：CHAT_TOOL_CALL / CHAT_TOOL_RESULT 不再转 status-update
-    # （「正在使用工具：xxx」逻辑已移除）；进行中的 todo 步骤文案由
-    # todo.updated 帧的 activeForm 经 xiaoyi_connect 单独下发。
+    # - CHAT_TOOL_CALL / CHAT_TOOL_RESULT: 工具调用过程（2026-09-15 恢复）
+    #   桌面镜像轮此前完全看不到工具调用：本地 xiaoyi 会话历史里有
+    #   chat.tool_call/tool_result 落盘，但云端 A2A 帧被这里过滤掉了，
+    #   PC 直播期（只看帧）只能显示文本/思考，工具卡要等轮次结束回补历史
+    #   才出现。这里恢复下发：手机端与桌面镜像都能看到「正在使用工具：xxx」
+    #   /「工具 xxx 执行完成」的过程状态。进行中的 todo 步骤文案仍由
+    #   todo.updated 帧的 activeForm 经 xiaoyi_connect 单独下发。
     status_events = {
         EventType.CHAT_PROCESSING_STATUS,
+        EventType.CHAT_TOOL_CALL,
+        EventType.CHAT_TOOL_RESULT,
     }
 
     return event_type in status_events
