@@ -226,12 +226,18 @@ def _resolve_default_model_config(
         # back to the page-selected model instead of the first list item.
         requested = (requested_model_name or "").strip()
         if requested:
+            matches: list[dict[str, Any]] = []
             for item in defaults_raw:
                 if not isinstance(item, dict):
                     continue
                 mcc = item.get("model_client_config") or {}
                 if isinstance(mcc, dict) and mcc.get("model_name") == requested:
-                    return item
+                    matches.append(item)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(f"requested team model is ambiguous: {requested!r}")
+            raise ValueError(f"requested team model not found: {requested!r}")
 
         for item in defaults_raw:
             if isinstance(item, dict):
@@ -474,9 +480,12 @@ def _build_agents_config(
                 agent_config = {}
         else:
             agent_config = dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
-        referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
-        if referenced_model is not None:
-            agent_config["model"] = referenced_model
+        if requested_model_name and requested_model_name.strip():
+            agent_config["model"] = deepcopy(default_model)
+        else:
+            referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
+            if referenced_model is not None:
+                agent_config["model"] = referenced_model
         # No longer auto-fill all skills from global into each member by default.
         # On spawn, each member workspace exposes only its configured skill links.
         # Team-shared skills are maintained in the team workspace skill view.

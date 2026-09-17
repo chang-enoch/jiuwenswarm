@@ -163,6 +163,84 @@ def test_load_team_spec_dict_uses_first_models_defaults_entry_for_team(monkeypat
     assert model["model_request_config"]["temperature"] == 0.1
 
 
+def test_requested_model_overrides_every_team_agent_model_and_preserves_other_fields():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://first.example.test/v1",
+                        "api_key": "sk-first",
+                        "model_name": "first-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.1},
+                },
+                {
+                    "model_client_config": {
+                        "api_base": "https://selected.example.test/v1",
+                        "api_key": "sk-selected",
+                        "model_name": "selected-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.8},
+                },
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {
+                        "leader": {
+                            "model": {
+                                "model_client_config": {"model_name": "leader-default"},
+                                "model_request_config": {"model": "leader-default"},
+                            },
+                            "skills": ["planning"],
+                        },
+                        "teammate": {
+                            "model": {
+                                "model_client_config": {"model_name": "teammate-default"},
+                                "model_request_config": {"model": "teammate-default"},
+                            },
+                            "max_iterations": 7,
+                        },
+                    },
+                }
+            }
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="selected-model")
+
+    for agent in spec["agents"].values():
+        assert agent["model"]["model_client_config"]["model_name"] == "selected-model"
+        assert agent["model"]["model_client_config"]["api_key"] == "sk-selected"
+        assert agent["model"]["model_request_config"]["model"] == "selected-model"
+    assert spec["agents"]["leader"]["skills"] == ["planning"]
+    assert spec["agents"]["teammate"]["max_iterations"] == 7
+
+
+def test_requested_model_must_exist_in_models_defaults():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {"model_name": "configured-model"},
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    with pytest.raises(ValueError, match="requested team model not found"):
+        load_team_spec_dict(config_base=config, requested_model_name="missing-model")
+
+
 def _model_identity_ref(*, model_name: str, provider: str, api_base: str) -> str:
     identity = {
         "api_base": api_base.rstrip("/"),
