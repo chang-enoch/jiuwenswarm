@@ -159,6 +159,51 @@ class CronJobStore:
     def path(self) -> Path:
         return self._path
 
+    async def list_run_records(self) -> list[dict[str, Any]]:
+        return await self._run_locked(self._read_run_records)
+
+    def _read_run_records(self) -> list[dict[str, Any]]:
+        path = self._path.with_name("cron_run_records.json")
+        def read(source: Path) -> list[dict[str, Any]]:
+            rows = json.loads(source.read_text(encoding="utf-8-sig")) if source.exists() else []
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                or not row["id"] or not isinstance(row.get("startedAt"), (int, float))
+                for row in rows
+            ):
+                raise ValueError(f"Invalid cron run records: {source}")
+            return rows
+
+        rows = read(path)
+        legacy = self._path.with_name("cron_desktop_runs.json")
+        if legacy.exists():
+            merged = {row["id"]: row for row in read(legacy)}
+            for row in rows:
+                merged[row["id"]] = {**merged.get(row["id"], {}), **row}
+            rows = sorted(merged.values(), key=lambda row: row["startedAt"])
+            self._write_run_records(rows)
+            # 写入或删除失败均保留旧文件；重试时按 ID 合并，不会产生重复记录。
+            legacy.unlink()
+        return rows
+
+    def _write_run_records(self, rows: list[dict[str, Any]]) -> None:
+        path = self._path.with_name("cron_run_records.json")
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(rows, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+
+    async def save_run_record(self, record: dict[str, Any]) -> None:
+        def write():
+            rows = [r for r in self._read_run_records() if r["id"] != record["id"]]
+            rows.append(record)
+            rows.sort(key=lambda r: r["startedAt"])
+            # 保留迁入的历史记录，后续写入也不截断为 500 条。
+            self._write_run_records(rows)
+        await self._run_locked(write)
+
     def _call_under_file_lock(self, fn: Callable[[], _T]) -> _T:
         """在伴生 ``cron_jobs.json.lock`` 上拿跨进程锁后执行 fn（不被原子 replace 覆盖）。
 
