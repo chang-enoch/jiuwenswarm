@@ -272,3 +272,52 @@ async def test_user_state_migration_replaces_template_index(monkeypatch, migrati
     assert len(statements) == 3
     suffix = " ON a2a_outbound_user_state" if dialect_name == "mysql" else ""
     assert statements[-1] == f"DROP INDEX old_unique{suffix}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_ready", [False, True])
+async def test_failed_user_state_upgrade_requires_verified_schema(monkeypatch, migration, schema_ready):
+    events = []
+    failure = DBAPIError("CREATE UNIQUE INDEX", {}, Exception("DDL failed"))
+    columns = [{"name": "template_id"}]
+    indexes = [{"name": "old_unique", "unique": True, "column_names": ["template_id"]}]
+    inspector = SimpleNamespace(
+        has_table=lambda name: True,
+        get_columns=lambda name: columns,
+        get_indexes=lambda name: indexes,
+    )
+    monkeypatch.setattr(migration, "inspect", lambda connection: inspector)
+
+    class Connection:
+        dialect = _dialect("postgresql")
+
+        async def run_sync(self, callback):
+            return callback(self)
+
+        def execute(self, statement):
+            raise failure
+
+    @asynccontextmanager
+    async def begin():
+        try:
+            yield Connection()
+        finally:
+            events.append("rollback")
+            if schema_ready:
+                columns.append({"name": "user_id"})
+                indexes[:] = [{"name": "new_unique", "unique": True,
+                               "column_names": ["template_id", "user_id"]}]
+
+    @asynccontextmanager
+    async def connect():
+        events.append("verify")
+        yield Connection()
+
+    engine = SimpleNamespace(begin=begin, connect=connect)
+    if schema_ready:
+        await migration.ensure_user_state_identity(engine)
+    else:
+        with pytest.raises(DBAPIError) as caught:
+            await migration.ensure_user_state_identity(engine)
+        assert caught.value is failure
+    assert events == ["rollback", "verify"]

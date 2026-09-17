@@ -46,11 +46,11 @@ async def ensure_user_state_identity(engine: AsyncEngine) -> None:
     try:
         async with engine.begin() as connection:
             await connection.run_sync(upgrade)
-    except DBAPIError:
+    except DBAPIError as exc:
         # Only tolerate concurrent upgrades after verifying the complete schema.
         async with engine.connect() as connection:
             if not await connection.run_sync(ready):
-                raise
+                raise exc
 
 
 async def ensure_dispatch_user_column(engine: AsyncEngine) -> None:
