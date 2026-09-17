@@ -148,6 +148,7 @@ permissions:
 
 
 接口细节见 [Gateway对接管理面接口文档.md](../../jiuwenswarm/gateway/docs/Gateway对接管理面接口文档.md) §8。  
+
 实例级 `permissions_config` 表与 `/api/v1/instances/{id}/permissions` **已移除**。
 
 ---
