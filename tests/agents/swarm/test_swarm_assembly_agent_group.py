@@ -59,10 +59,12 @@ def test_apply_agent_group_full_assembly(group_cache: Path) -> None:
 
     _enrich(spec, "sample-expert-group")
 
-    # 7. 模式字段显式写值（不依赖版本默认值）
-    assert spec.team_mode == "hybrid"
+    # 7. 模式字段显式写值（不依赖版本默认值）+ 停滞自愈时钟桌面尺度（120s）
+    assert spec.team_mode == "predefined"
     assert spec.dispatch_mode == "autonomous"
     assert spec.enable_task_verification is False
+    assert spec.stale_claim_idle_timeout == 120
+    assert spec.stale_pending_idle_timeout == 120
 
     # 4. leader prompt = 模板原 prompt + switch notice + AGENT.md + persona + instruction
     assert "原有主理人规则" in spec.leader.prompt
