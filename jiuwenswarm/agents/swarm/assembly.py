@@ -265,7 +265,8 @@ def _apply_agent_group(spec: Any, agent_group_name: str, package_dir: Path | Non
     4. leader prompt 合并（AGENT.md+persona+instruction 拍平后追加到模板原 prompt）；
     5. leader 快照；
     6. 成员覆写 + predefined_members 替换（TeamMemberSpec.prompt = persona+instruction，不含 AGENT.md）；
-    7. 显式写 team_mode/dispatch_mode/enable_task_verification（不依赖版本默认值）。
+    7. 显式写 team_mode/dispatch_mode/enable_task_verification（不依赖版本默认值）
+       + 停滞自愈时钟 stale_claim/stale_pending_idle_timeout=120s（桌面交互尺度）。
     """
     _check_agent_template_spec_support()
 
@@ -363,6 +364,11 @@ def _apply_agent_group(spec: Any, agent_group_name: str, package_dir: Path | Non
     spec.team_mode = "predefined"
     spec.dispatch_mode = "autonomous"
     spec.enable_task_verification = False
+    # 停滞自愈时钟从 agent-core 默认 600s 降到 120s：桌面交互产品里 10 分钟
+    # ≈ 永不自愈（用户 30-60s 无反馈即判卡死）；idle 时钟本身不会误伤在忙
+    # 成员（回合中 idle_seconds() 为 None），短窗只多花少量 nudge 轮次。
+    spec.stale_claim_idle_timeout = 120
+    spec.stale_pending_idle_timeout = 120
 
 
 def enrich_team_spec_for_swarm(
