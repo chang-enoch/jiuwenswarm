@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from jiuwenswarm.common import utils
 
 
@@ -62,8 +60,7 @@ class TestPathResolution:
         session_workspace = utils.get_default_project_session_workspace_dir("abc-123")
         assert isinstance(session_workspace, Path)
         assert session_workspace == (
-            utils.get_default_project_workspace_dir()
-            / "abc-123"
+            utils.get_default_project_workspace_dir() / "abc-123"
         )
         assert session_workspace.exists()
 
@@ -120,11 +117,234 @@ class TestLoggerSetup:
 
     @staticmethod
     def test_logger_handlers():
-        """Test that logger has console and five rotating log files."""
+        """Test that logger has console and five dated log files."""
         logger = utils.setup_logger("INFO")
         handler_types = [type(h).__name__ for h in logger.handlers]
         assert "StreamHandler" in handler_types
-        assert handler_types.count("SafeRotatingFileHandler") == 5
+        assert handler_types.count("DatedDailyFileHandler") == 5
+
+
+class TestDatedDailyFileHandler:
+    """Test the per-day dated log file handler."""
+
+    @staticmethod
+    def test_writes_under_today_date_dir(tmp_path, monkeypatch):
+        """Logs land under <root>/<YYYY-MM-DD>/."""
+        monkeypatch.setenv("JIUWENSWARM_LOG_DIR", str(tmp_path))
+        import datetime
+        import logging
+
+        handler = utils.DatedDailyFileHandler(tmp_path, "gateway.log")
+        lg = logging.getLogger("test_dated_basic")
+        lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
+        lg.propagate = False
+        lg.info("hello dated")
+
+        handler.flush()
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        expected = tmp_path / today / "gateway.log"
+        assert expected.exists()
+        assert "hello dated" in expected.read_text(encoding="utf-8")
+
+    @staticmethod
+    def test_switches_file_across_days(tmp_path, monkeypatch):
+        """Crossing midnight switches to the new day's file."""
+        import logging
+
+        state = {"date": "2026-09-11"}
+        monkeypatch.setattr(
+            utils.DatedDailyFileHandler,
+            "_today",
+            staticmethod(lambda: state["date"]),
+        )
+        handler = utils.DatedDailyFileHandler(tmp_path, "app.log")
+        lg = logging.getLogger("test_dated_switch")
+        lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
+        lg.propagate = False
+
+        lg.info("day one")
+        handler.flush()
+
+        state["date"] = "2026-09-12"
+        lg.info("day two")
+        handler.flush()
+
+        assert "day one" in (tmp_path / "2026-09-11" / "app.log").read_text(
+            encoding="utf-8"
+        )
+        assert "day two" in (tmp_path / "2026-09-12" / "app.log").read_text(
+            encoding="utf-8"
+        )
+
+    @staticmethod
+    def test_rotates_to_old_log_at_size_cap(tmp_path):
+        """Exceeding the daily cap rotates to <stem>.old.log."""
+        import logging
+
+        handler = utils.DatedDailyFileHandler(
+            tmp_path,
+            "app.log",
+            max_bytes=200,
+        )
+        lg = logging.getLogger("test_dated_rotate")
+        lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
+        lg.propagate = False
+
+        for i in range(20):
+            lg.info("message %03d padded to exceed cap", i)
+        handler.flush()
+
+        today = utils.DatedDailyFileHandler._today()
+        backup = tmp_path / today / "app.old.log"
+        assert backup.exists()
+
+
+class TestDatedLogCleanup:
+    """Test retention cleanup and flat→dated migration."""
+
+    @staticmethod
+    def test_cleanup_removes_only_expired_dirs(tmp_path):
+        """Only date-named dirs beyond the window are removed."""
+        import datetime
+
+        now = datetime.datetime(2026, 9, 12)
+        # 90 天窗口：cutoff = 2026-06-14（含），更早的删除。
+        for name in ("2026-06-13", "2026-06-12", "2026-06-14", "2026-09-12"):
+            day_dir = tmp_path / name
+            day_dir.mkdir()
+            (day_dir / "gateway.log").write_text("x", encoding="utf-8")
+
+        removed = utils.cleanup_expired_dated_log_dirs(
+            tmp_path,
+            retention_days=90,
+            now=now,
+        )
+
+        assert removed == 2
+        assert (tmp_path / "2026-09-12").exists()
+        assert (tmp_path / "2026-06-14").exists()
+        assert not (tmp_path / "2026-06-13").exists()
+        assert not (tmp_path / "2026-06-12").exists()
+
+    @staticmethod
+    def test_cleanup_leaves_non_dated_entries(tmp_path):
+        """Non date-named entries are never touched."""
+        import datetime
+
+        now = datetime.datetime(2026, 9, 12)
+        old_day = tmp_path / "2025-01-01"
+        old_day.mkdir()
+        (old_day / "gateway.log").write_text("x", encoding="utf-8")
+        core_dir = tmp_path / "core"
+        core_dir.mkdir()
+        plain_file = tmp_path / "gateway.log"
+        plain_file.write_text("x", encoding="utf-8")
+
+        removed = utils.cleanup_expired_dated_log_dirs(
+            tmp_path,
+            now=now,
+        )
+
+        assert removed == 1
+        assert core_dir.exists()
+        assert plain_file.exists()
+
+    @staticmethod
+    def test_get_dated_logs_dir_under_env_root(tmp_path, monkeypatch):
+        """Dated dir is <logs_root>/<YYYY-MM-DD>."""
+        import datetime
+
+        monkeypatch.setenv("JIUWENSWARM_LOG_DIR", str(tmp_path))
+        now = datetime.datetime(2026, 9, 12, 10, 30)
+        assert utils.get_dated_logs_dir(now) == tmp_path / "2026-09-12"
+
+    @staticmethod
+    def test_migrate_flat_logs_moves_known_files(tmp_path, monkeypatch):
+        """Flat files are moved into their mtime day directory."""
+        import datetime
+        import os
+
+        monkeypatch.setenv("JIUWENSWARM_LOG_DIR", str(tmp_path))
+        flat = tmp_path / "gateway.log"
+        flat.write_text("old log", encoding="utf-8")
+        stamp = datetime.datetime(2026, 9, 10, 12, 0).timestamp()
+        os.utime(flat, (stamp, stamp))
+        # 旧按大小轮转的备份（文件名含时间戳）
+        backup = tmp_path / "full_20260909_080000.log"
+        backup.write_text("old backup", encoding="utf-8")
+        # 未知文件名不动
+        stranger = tmp_path / "unrelated.log"
+        stranger.write_text("keep me", encoding="utf-8")
+
+        utils._migrate_flat_logs_to_dated_dirs(tmp_path)
+
+        assert (tmp_path / "2026-09-10" / "gateway.log").exists()
+        assert (tmp_path / "2026-09-09" / "full_20260909_080000.log").exists()
+        assert stranger.exists()
+        assert not flat.exists()
+
+
+
+class TestAgentCoreLogDirConfigure:
+    """Test configure_agent_core_log_dir（含旧 openjiuwen 回退与历史落点回收）."""
+
+    @staticmethod
+    def test_pins_core_log_dir_and_sets_dated(tmp_path, monkeypatch):
+        """注入 JIUWENSWARM_CORE_LOG_DIR 时 log_path 钉到 core 目录."""
+        import tempfile
+
+        core_dir = Path(tempfile.mkdtemp())
+        monkeypatch.setenv("JIUWENSWARM_CORE_LOG_DIR", str(core_dir))
+        monkeypatch.delenv("JIUWENSWARM_LOG_DIR", raising=False)
+
+        assert utils.configure_agent_core_log_dir() is True
+
+        from openjiuwen.core.common.logging.log_config import (
+            get_log_config_snapshot,
+        )
+
+        snap = get_log_config_snapshot()
+        assert str(core_dir) in str(snap.get("log_path"))
+
+    @staticmethod
+    def test_migrates_legacy_double_layer_logs(tmp_path, monkeypatch):
+        """历史 logs/logs 双层目录迁入 core 目录，目标已存在跳过."""
+        import tempfile
+
+        core_dir = Path(tempfile.mkdtemp())
+        monkeypatch.setenv("JIUWENSWARM_CORE_LOG_DIR", str(core_dir))
+        monkeypatch.delenv("JIUWENSWARM_LOG_DIR", raising=False)
+
+        # 模拟 <workspace>/logs/logs 双层错误落点（绕过 get_user_workspace_dir
+        # 的真实 home：直接构造 legacy 目录再调内部函数）
+        workspace = utils.get_user_workspace_dir()
+        legacy = workspace / "logs" / "logs"
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / "run").mkdir(exist_ok=True)
+        (legacy / "run" / "jiuwen.log").write_text(
+            "legacy core log", encoding="utf-8"
+        )
+        (legacy / "runner.log").write_text("runner", encoding="utf-8")
+
+        try:
+            utils._migrate_legacy_agent_core_logs(core_dir)
+
+            assert (
+                core_dir / "run" / "jiuwen.log"
+            ).read_text(encoding="utf-8") == "legacy core log"
+            assert (core_dir / "runner.log").exists()
+        finally:
+            # 清理测试造的 legacy 目录（不在 tmp_path 下）
+            import shutil
+
+            shutil.rmtree(legacy, ignore_errors=True)
+            try:
+                (workspace / "logs").rmdir()
+            except OSError:
+                pass
 
 
 class TestSourceRecordMasking:
@@ -282,7 +502,12 @@ class TestUserWorkspace:
     @patch("pathlib.Path.exists")
     @patch("builtins.input")
     def test_init_user_workspace_cancelled(
-        self, mock_input, mock_exists, mock_find_root, mock_get_workspace_dir, temp_workspace
+        self,
+        mock_input,
+        mock_exists,
+        mock_find_root,
+        mock_get_workspace_dir,
+        temp_workspace,
     ):
         """Test user workspace initialization when user cancels."""
         # This test requires more complex mocking due to file operations
@@ -314,8 +539,8 @@ class TestMultiInstanceEnvVars:
     def test_workspace_env_var():
         """Test JIUWENSWARM_DATA_DIR environment variable overrides default workspace."""
         # Reset cache before test - must reset _workspace_base_dir for workspace tests
-        setattr(utils, '_workspace_base_dir', None)
-        setattr(utils, '_user_home', None)
+        setattr(utils, "_workspace_base_dir", None)
+        setattr(utils, "_user_home", None)
         original_env = os.environ.pop("JIUWENSWARM_DATA_DIR", None)
         original_home_env = os.environ.pop("JIUWENSWARM_HOME", None)
 
@@ -325,16 +550,16 @@ class TestMultiInstanceEnvVars:
             assert ".jiuwenswarm" in str(default_workspace)
 
             # Reset cache and set env var
-            setattr(utils, '_workspace_base_dir', None)
-            setattr(utils, '_user_home', None)
+            setattr(utils, "_workspace_base_dir", None)
+            setattr(utils, "_user_home", None)
             os.environ["JIUWENSWARM_DATA_DIR"] = "/custom/workspace/path"
             custom_workspace = utils.get_user_workspace_dir()
             # Use Path comparison for cross-platform compatibility
             assert custom_workspace == Path("/custom/workspace/path")
         finally:
             # Cleanup
-            setattr(utils, '_workspace_base_dir', None)
-            setattr(utils, '_user_home', None)
+            setattr(utils, "_workspace_base_dir", None)
+            setattr(utils, "_user_home", None)
             os.environ.pop("JIUWENSWARM_DATA_DIR", None)
             if original_env:
                 os.environ["JIUWENSWARM_DATA_DIR"] = original_env
@@ -345,7 +570,7 @@ class TestMultiInstanceEnvVars:
     def test_jiuwenswarm_home_env_var():
         """Test JIUWENSWARM_HOME environment variable overrides default home."""
         # Reset cache before test
-        setattr(utils, '_user_home', None)
+        setattr(utils, "_user_home", None)
         original_home_env = os.environ.pop("JIUWENSWARM_HOME", None)
         original_workspace_env = os.environ.pop("JIUWENSWARM_DATA_DIR", None)
 
@@ -356,14 +581,14 @@ class TestMultiInstanceEnvVars:
             assert custom_home == Path("/custom/home")
 
             # Workspace should derive from custom home
-            setattr(utils, '_user_home', None)
+            setattr(utils, "_user_home", None)
             os.environ.pop("JIUWENSWARM_HOME", None)  # Clear for fresh test
             workspace = utils.get_user_workspace_dir()
             # Without env vars, should use Path.home()
             assert isinstance(workspace, Path)
         finally:
             # Cleanup
-            setattr(utils, '_user_home', None)
+            setattr(utils, "_user_home", None)
             os.environ.pop("JIUWENSWARM_HOME", None)
             os.environ.pop("JIUWENSWARM_DATA_DIR", None)
             if original_home_env:
@@ -375,8 +600,8 @@ class TestMultiInstanceEnvVars:
     def test_workspace_priority_over_home():
         """Test JIUWENSWARM_DATA_DIR takes priority over JIUWENSWARM_HOME for workspace."""
         # Reset both caches - _workspace_base_dir is used by get_user_workspace_dir
-        setattr(utils, '_workspace_base_dir', None)
-        setattr(utils, '_user_home', None)
+        setattr(utils, "_workspace_base_dir", None)
+        setattr(utils, "_user_home", None)
         original_home_env = os.environ.pop("JIUWENSWARM_HOME", None)
         original_workspace_env = os.environ.pop("JIUWENSWARM_DATA_DIR", None)
 
@@ -389,8 +614,8 @@ class TestMultiInstanceEnvVars:
             workspace = utils.get_user_workspace_dir()
             assert workspace == Path("/workspace/b")
         finally:
-            setattr(utils, '_workspace_base_dir', None)
-            setattr(utils, '_user_home', None)
+            setattr(utils, "_workspace_base_dir", None)
+            setattr(utils, "_user_home", None)
             os.environ.pop("JIUWENSWARM_HOME", None)
             os.environ.pop("JIUWENSWARM_DATA_DIR", None)
             if original_home_env:
@@ -418,47 +643,55 @@ class TestHardcodedPathsPhase2:
         expected_path = workspace / "agent" / "home" / "cron_jobs.json"
         actual_path = get_agent_home_dir() / "cron_jobs.json"
 
-        assert str(actual_path.resolve()) == str(expected_path.resolve()), \
+        assert str(actual_path.resolve()) == str(expected_path.resolve()), (
             f"Expected: {expected_path.resolve()}, Got: {actual_path.resolve()}"
+        )
 
     @staticmethod
     def test_task_tools_path_structure():
         """Test task_tools.py path uses workspace (migrated from legacy jiuwenswarm_workspace)."""
         # Reset caches to ensure clean state after previous tests
-        setattr(utils, '_user_home', None)
-        setattr(utils, '_initialized', False)
-        setattr(utils, '_config_dir', None)
-        setattr(utils, '_workspace_dir', None)
-        setattr(utils, '_root_dir', None)
+        setattr(utils, "_user_home", None)
+        setattr(utils, "_initialized", False)
+        setattr(utils, "_config_dir", None)
+        setattr(utils, "_workspace_dir", None)
+        setattr(utils, "_root_dir", None)
 
-        from jiuwenswarm.agents.harness.common.tools.task_tools import _get_task_data_path
+        from jiuwenswarm.agents.harness.common.tools.task_tools import (
+            _get_task_data_path,
+        )
         from jiuwenswarm.common.utils import get_user_workspace_dir
 
         workspace = get_user_workspace_dir()
         expected_path = workspace / "agent" / "workspace" / "task-data.json"
         actual_path = Path(_get_task_data_path())
 
-        assert str(actual_path.resolve()) == str(expected_path.resolve()), \
+        assert str(actual_path.resolve()) == str(expected_path.resolve()), (
             f"Expected: {expected_path.resolve()}, Got: {actual_path.resolve()}"
+        )
 
     @staticmethod
     def test_im_inbound_path_structure():
         """Test im_inbound.py uses DeepAgent standard USER.md path."""
         # Reset caches to ensure clean state after previous tests
-        setattr(utils, '_user_home', None)
-        setattr(utils, '_initialized', False)
-        setattr(utils, '_config_dir', None)
-        setattr(utils, '_workspace_dir', None)
-        setattr(utils, '_root_dir', None)
+        setattr(utils, "_user_home", None)
+        setattr(utils, "_initialized", False)
+        setattr(utils, "_config_dir", None)
+        setattr(utils, "_workspace_dir", None)
+        setattr(utils, "_root_dir", None)
 
-        from jiuwenswarm.common.utils import get_deepagent_user_md_path, get_user_workspace_dir
+        from jiuwenswarm.common.utils import (
+            get_deepagent_user_md_path,
+            get_user_workspace_dir,
+        )
 
         workspace = get_user_workspace_dir()
         expected_path = workspace / "agent" / "workspace" / "USER.md"
         actual_path = get_deepagent_user_md_path()
 
-        assert str(actual_path.resolve()) == str(expected_path.resolve()), \
+        assert str(actual_path.resolve()) == str(expected_path.resolve()), (
             f"Expected: {expected_path.resolve()}, Got: {actual_path.resolve()}"
+        )
 
 
 class TestAdditionalHardcodedPaths:
@@ -477,9 +710,10 @@ class TestAdditionalHardcodedPaths:
         expected_path = workspace / "agent" / "workspace" / "extensions"
         rail_manager = RailManager()
 
-        extensions_dir = getattr(rail_manager, '_extensions_dir')
-        assert str(extensions_dir.resolve()) == str(expected_path.resolve()), \
+        extensions_dir = getattr(rail_manager, "_extensions_dir")
+        assert str(extensions_dir.resolve()) == str(expected_path.resolve()), (
             f"Expected: {expected_path.resolve()}, Got: {extensions_dir.resolve()}"
+        )
 
     @staticmethod
     def test_config_module_dir_structure(tmp_path):
@@ -492,8 +726,9 @@ class TestAdditionalHardcodedPaths:
         with patch.dict(os.environ, {"JIUWENSWARM_CONFIG_DIR": str(config_dir)}):
             config_module = importlib.reload(config_module)
             module_config_dir = config_module.__dict__["_CONFIG_MODULE_DIR"]
-            assert str(module_config_dir.resolve()) == str(config_dir.resolve()), \
+            assert str(module_config_dir.resolve()) == str(config_dir.resolve()), (
                 f"Expected: {config_dir.resolve()}, Got: {module_config_dir.resolve()}"
+            )
 
         importlib.reload(config_module)
 
@@ -501,14 +736,18 @@ class TestAdditionalHardcodedPaths:
     def test_interactions_dir_structure():
         """Test get_interactions_dir() returns correct path structure."""
         # Reset caches to ensure clean state
-        setattr(utils, '_user_home', None)
-        setattr(utils, '_workspace_base_dir', None)
+        setattr(utils, "_user_home", None)
+        setattr(utils, "_workspace_base_dir", None)
 
-        from jiuwenswarm.common.utils import get_interactions_dir, get_user_workspace_dir
+        from jiuwenswarm.common.utils import (
+            get_interactions_dir,
+            get_user_workspace_dir,
+        )
 
         workspace = get_user_workspace_dir()
         expected_path = workspace / "agent" / "workspace" / "interactions"
         actual_path = get_interactions_dir()
 
-        assert str(actual_path.resolve()) == str(expected_path.resolve()), \
+        assert str(actual_path.resolve()) == str(expected_path.resolve()), (
             f"Expected: {expected_path.resolve()}, Got: {actual_path.resolve()}"
+        )

@@ -213,9 +213,10 @@ async def _run_live_capture(
         metadata={"source": f"system_test_live_capture_{skill_mode}"},
     )
 
+    built = build_user_prompt(query, files={}, channel=channel, language=lang)
     inputs = {
         "conversation_id": session_id,
-        "query": build_user_prompt(query, files={}, channel=channel, language=lang),
+        "query": built.interaction_prefix + built.user_query + built.statusline_directive,
         "channel": channel,
         "language": lang,
     }

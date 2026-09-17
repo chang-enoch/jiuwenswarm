@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -45,6 +47,50 @@ logger = logging.getLogger(__name__)
 # ISO 8601 basic format keeps lexicographic order == chronological order,
 # which is exactly what we want when ``ls``/``find`` enumerates the dir.
 _TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S"
+
+# Desktop-injected outer date root (<dataDir>/logs). When set and the audit
+# log dir lives under it, the JSONL is redirected into today's date directory
+# (<DATE_ROOT>/<YYYY-MM-DD>/<rel>) so jiuwenbox audit logs follow the same
+# dated layout as the jiuwenswarm / agent-core logs.
+_ENV_LOG_DATE_ROOT = "JIUWENSWARM_LOG_DATE_ROOT"
+_DATED_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _resolve_dated_log_dir(log_dir: Path) -> Path:
+    """Align the audit log dir with the unified dated log layout.
+
+    With ``JIUWENSWARM_LOG_DATE_ROOT`` injected (outer date layout, same
+    as the jiuwenswarm / agent-core logs) and ``log_dir`` living under
+    that root, the directory is redirected into today's date directory:
+
+        <DATE_ROOT>/<YYYY-MM-DD>/<rel>
+
+    where ``<rel>`` is ``log_dir`` relative to the date root (e.g.
+    ``jiuwenswarm/<uid>/jiuwenbox``). Already-dated directories and
+    operator-supplied dirs outside the root are kept as-is.
+
+    Args:
+        log_dir: Resolved audit log directory.
+
+    Returns:
+        The directory audit files are written to.
+    """
+    env_date_root = os.environ.get(_ENV_LOG_DATE_ROOT, "").strip()
+    if not env_date_root:
+        return log_dir
+    date_root = Path(env_date_root).expanduser().resolve()
+    try:
+        rel = log_dir.resolve().relative_to(date_root)
+    except ValueError:
+        return log_dir
+    rel_str = rel.as_posix().strip("/")
+    if not rel_str or rel_str == ".":
+        return log_dir
+    first = rel.parts[0] if rel.parts else ""
+    if _DATED_DIR_RE.match(first):
+        return log_dir
+    return date_root / datetime.now().strftime("%Y-%m-%d") / rel_str
+
 
 FilenameStrategy = Literal["disabled", "plain", "timestamped"]
 
@@ -73,7 +119,7 @@ class AuditLogger:
         # but it is only realised on disk when persistence is actually on.
         # That avoids a ``mkdir ~/.jiuwenbox/logs`` side effect on first
         # import for users who never opt into ``--save-logs``.
-        self.log_dir = log_dir or JIUWENBOX_HOME / "logs"
+        self.log_dir = _resolve_dated_log_dir(log_dir or JIUWENBOX_HOME / "logs")
         self.filename_strategy: FilenameStrategy = filename_strategy
         if self.filename_strategy != "disabled":
             self.log_dir.mkdir(parents=True, exist_ok=True)

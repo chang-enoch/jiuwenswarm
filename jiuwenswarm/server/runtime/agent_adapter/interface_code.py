@@ -50,6 +50,7 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     _agent_def_to_subagent_config,
     _deep_agent_context_engine_config,
     _deep_agent_kv_cache_affinity_config,
+    _resolve_completion_timeout,
     parse_int,
 )
 from jiuwenswarm.server.runtime.agent_adapter.assembly_hooks import (
@@ -472,7 +473,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
 
         统一使用 create_deep_agent()，不传 vision_model_config /
         audio_model_config。
-        completion_timeout 从配置读取，可在 react / modes.code 中自定义。
+        completion_timeout 从配置读取。
 
         ``mode="design"`` 时改用 ``build_design_system_prompt()``（对齐 WorkBuddy
         设计模式），并按 design 标记 ``_jiuwenswarm_adapter_mode``；其余行为与
@@ -569,7 +570,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             context_engine_config=_deep_agent_context_engine_config(config),
             kv_cache_affinity_config=_deep_agent_kv_cache_affinity_config(config, model),
             auto_create_workspace=False,
-            completion_timeout=config.get("completion_timeout", 3600.0),
+            completion_timeout=_resolve_completion_timeout(config),
             add_general_purpose_agent=should_add_general,
         )
 
@@ -1239,6 +1240,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                 project_dir=runtime_config.project_dir or self._project_dir,
             )
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
+            self._runtime_prompt_rail.set_user_message_context(runtime_config.user_message_context)
         # PermissionInterruptRail: per-request trusted_dirs/project_dir 注入，
         # 使这些子树的文件读写执行及目录内脚本直执行按 allow 处理。
         # 用 getattr 兼容绕过 __init__ 的测试构造（_permission_rail 仅在 rail 构建流程赋值）。

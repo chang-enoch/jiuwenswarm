@@ -535,6 +535,8 @@ react:
   agent_name: main_agent
   enable_task_loop: true
   max_iterations: 100
+  # 默认配置设为不限制单轮 task-loop 等待。null/0 = 不限制；键缺失时 adapter 仍回退 3600
+  completion_timeout: null
   model_name: ${MODEL_NAME}
   skill_mode: all
   # code_agent / research_agent 默认不启用；只有显式配置 enabled: true 才会显示并可被 task_tool 调用
@@ -1059,39 +1061,39 @@ permissions:
       severity: LOW
     - id: shell_ask_rm
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "rm *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rm(?:\s|$)'
       severity: HIGH
     - id: shell_ask_del
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "del *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)del(?:\s|$)'
       severity: HIGH
     - id: shell_ask_rd
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "rd *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rd(?:\s|$)'
       severity: HIGH
     - id: shell_ask_chmod
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "chmod *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)chmod(?:\s|$)'
       severity: HIGH
     - id: shell_ask_chown
       tools: [bash, mcp_exec_command, create_terminal]
-      pattern: "chown *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)chown(?:\s|$)'
       severity: HIGH
     - id: shell_ask_remove_item
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "Remove-Item *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)Remove-Item(?:\s|$)'
       severity: HIGH
     - id: shell_ask_ri
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "ri *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)ri(?:\s|$)'
       severity: HIGH
     - id: shell_ask_rmdir
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "rmdir *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)rmdir(?:\s|$)'
       severity: HIGH
     - id: shell_ask_erase
       tools: [bash, powershell, mcp_exec_command, create_terminal]
-      pattern: "erase *"
+      pattern: 're:(?i)(^|(?:&&|\|\||[;|&()\n])\s*)erase(?:\s|$)'
       severity: HIGH
     - id: shell_ask_sensitive_file_reads
       tools: [bash, mcp_exec_command, create_terminal]

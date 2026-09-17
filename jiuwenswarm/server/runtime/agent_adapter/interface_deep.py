@@ -849,6 +849,22 @@ def parse_int(value: Any, default: int) -> int:
         return default
 
 
+def _resolve_completion_timeout(react_cfg: dict[str, Any] | None) -> float | None:
+    """Resolve ``react.completion_timeout`` for ``create_deep_agent``.
+
+    Missing key keeps the 3600s safety net. ``null`` / ``0`` / ``""`` mean
+    unlimited (``wait_completion(timeout=None)``). Positive numbers are seconds.
+    """
+    raw = (react_cfg or {}).get("completion_timeout", 3600.0)
+    if raw in (None, "", 0, 0.0):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 3600.0
+    return None if value <= 0 else value
+
+
 def _deep_agent_context_engine_config(react_cfg: dict[str, Any] | None) -> ContextEngineConfig:
     """供 ``create_deep_agent(..., context_engine_config=...)`` 使用（与 agent-core 集成测试方法二一致）。
 
@@ -1631,7 +1647,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         waiters = getattr(lock, "_waiters", None)
         return any(not waiter.cancelled() for waiter in list(waiters or ()))
 
-    async def _get_or_create_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter":
+    async def _get_or_create_session_adapter(
+        self,
+        session_id: str | None,
+        *,
+        warmup_exclude_request_id: str | None = None,
+    ) -> "JiuWenSwarmDeepAdapter":
         """Return the session-owned adapter, creating and initializing it once."""
         if self._is_session_scoped_adapter:
             self._touch_session_adapter(session_id)
@@ -1687,6 +1708,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
+                    exclude_request_id=warmup_exclude_request_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1823,11 +1845,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             return None
         return self._resolve_interrupt_session_id(loop_sid)
 
-    async def _clear_pending_ask_user_interrupt_for_supplement(
+    async def _clear_pending_interaction_interrupt(
         self,
         session_id: str | None,
+        *,
+        require_pure_ask_user: bool = True,
     ) -> bool:
-        """Drop a superseded pure ask_user round without leaving an open tool call."""
+        """Drop an abandoned interaction round without leaving open tool calls."""
         instance = getattr(self, "_instance", None)
         loop_session = getattr(instance, "_loop_session", None)
         loop_sid = self._deep_agent_loop_session_id()
@@ -1840,7 +1864,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             interrupted_tools = getattr(state, "interrupted_tools", None)
             if not isinstance(interrupted_tools, dict) or not interrupted_tools:
                 return False
-            if any(
+            if require_pure_ask_user and any(
                 getattr(getattr(entry, "tool_call", None), "name", None) != "ask_user"
                 for entry in interrupted_tools.values()
             ):
@@ -1848,9 +1872,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
             ai_message = getattr(state, "ai_message", None)
             pending_calls = list(getattr(ai_message, "tool_calls", None) or [])
-            if not pending_calls or any(
-                getattr(tool_call, "name", None) != "ask_user"
-                for tool_call in pending_calls
+            if not pending_calls:
+                return False
+            if require_pure_ask_user and any(
+                getattr(tool_call, "name", None) != "ask_user" for tool_call in pending_calls
             ):
                 return False
 
@@ -1877,18 +1902,23 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             context.pop_messages(1, with_history=True)
             loop_session.update_state({INTERRUPTION_KEY: None})
             await context_engine.save_contexts(loop_session)
+            # save_contexts() only copies the updated context into the session
+            # state.  Persist the full session checkpoint as well, otherwise an
+            # adapter eviction or process restart can reload the abandoned
+            # ask_user interruption from storage.
+            await loop_session.commit()
         except Exception:
-            logger.debug(
-                "[JiuWenSwarmDeepAdapter] interrupt(supplement): failed to inspect "
-                "pending ask_user state session=%s",
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] interrupt: failed to inspect "
+                "pending interaction state session=%s",
                 target_sid,
                 exc_info=True,
             )
             return False
 
         logger.info(
-            "[JiuWenSwarmDeepAdapter] interrupt(supplement): cleared pending "
-            "ask_user state session=%s",
+            "[JiuWenSwarmDeepAdapter] interrupt: cleared pending "
+            "interaction state session=%s",
             target_sid,
         )
         return True
@@ -5172,12 +5202,22 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     .get("model_name", "gpt-4"),
                 },
             ),
-            _RailBuildInfo(
-                "_context_processor_rail",
-                _build_context_processor_rail,
-                {"config": self._config_cache},
-            ),
         ]
+        _ctx_engine_cfg = self._config_cache.get("context_engine_config", {})
+        _ctx_engine_enabled = _ctx_engine_cfg.get("enabled", False) if isinstance(_ctx_engine_cfg, dict) else False
+        if _ctx_engine_enabled:
+            rail_infos.append(
+                _RailBuildInfo(
+                    "_context_processor_rail",
+                    _build_context_processor_rail,
+                    {"config": self._config_cache},
+                )
+            )
+        else:
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] ContextProcessorRail skipped at cold start "
+                "(context_engine_config.enabled=false)"
+            )
 
         if self._is_xiaoyi_channel():
             rail_infos = [info for info in rail_infos if info.attr_name != "_permission_rail"]
@@ -5329,7 +5369,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             vision_model_config=self._vision_model_config,
             audio_model_config=self._audio_model_config,
             enable_read_image_multimodal=self._resolve_enable_read_image_multimodal(config),
-            completion_timeout=config.get("completion_timeout", 3600.0),
+            completion_timeout=_resolve_completion_timeout(config),
             # 渐进式工具曝光：对齐 develop 部署默认（todo 工具 always-visible 优先级最高，
             # 核心工作工具 default-visible，其余工具经 search_tools/load_tools 延迟发现）
             progressive_tool_enabled=get_progressive_tool_enabled(config_base),
@@ -5894,7 +5934,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             enable_llm_retry_rail=((config_base.get("execution_guard") or {}).get("llm_retry_rail") or {}).get(
                 "enabled", False
             ),
-            completion_timeout=config.get("completion_timeout", 3600.0),
+            completion_timeout=_resolve_completion_timeout(config),
         )
 
         # 装配生命周期点位：实例重建前的扩展状态重置
@@ -6849,6 +6889,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         workspace: str | None = None
         project_dir: str | None = None
         supports_user_interaction: bool = True
+        user_message_context: dict[str, Any] | None = None
 
     async def configure_session_runtime(
         self,
@@ -6979,6 +7020,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             self._runtime_prompt_rail.set_model_name(self._resolve_model_name())
             self._runtime_prompt_rail.set_mode(runtime_config.mode)
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
+            # user_message_context 仅在 bind_request 时透传；session-stable 配置
+            # 不应携带每请求的 source/timestamp/skills_to_use 等字段。
+            self._runtime_prompt_rail.set_user_message_context(
+                runtime_config.user_message_context if bind_request else None
+            )
         if self._identity_rail:
             self._identity_rail.set_language(resolved_language)
             # 显式指定 IDENTITY.md 读取路径为全局 agent workspace（跨会话稳定），
@@ -8100,8 +8146,16 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 "[JiuWenSwarmDeepAdapter] interrupt(%s): interaction cancel failed",
                 intent,
             )
-        if intent == "supplement" and isinstance(new_input, str) and new_input.strip():
-            await self._clear_pending_ask_user_interrupt_for_supplement(request.session_id)
+        # cancel 会放弃整个当前交互回合；supplement 仅在纯 ask_user 回合下做
+        # 保守清理。两者都必须同时移除持久化 interrupt state 和上下文尾部
+        # tool_call，否则下一条普通消息会被旧交互当作回答消费。
+        if intent == "cancel":
+            await self._clear_pending_interaction_interrupt(
+                request.session_id,
+                require_pure_ask_user=False,
+            )
+        elif isinstance(new_input, str) and new_input.strip():
+            await self._clear_pending_interaction_interrupt(request.session_id)
         message = "任务已切换" if intent == "supplement" else "任务已取消"
 
         payload: dict[str, Any] = {
@@ -9305,7 +9359,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             AgentResponse 包含执行结果
         """
         if not self._is_session_scoped_adapter:
-            session_adapter = await self._get_or_create_session_adapter(request.session_id)
+            session_adapter = await self._get_or_create_session_adapter(
+                request.session_id,
+                warmup_exclude_request_id=request.request_id,
+            )
             try:
                 return await session_adapter.process_message_impl(request, inputs)
             finally:
@@ -9462,6 +9519,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
             inputs = dict(inputs)
@@ -9679,7 +9737,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # "entering runner streaming" line so the pre-dispatch work is visible.
         stream_impl_started_at = time.monotonic()
         if not self._is_session_scoped_adapter:
-            session_adapter = await self._get_or_create_session_adapter(request.session_id)
+            session_adapter = await self._get_or_create_session_adapter(
+                request.session_id,
+                warmup_exclude_request_id=request.request_id,
+            )
             try:
                 async for chunk in session_adapter.process_message_stream_impl(request, inputs):
                     yield chunk
@@ -9820,6 +9881,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
 
@@ -10071,6 +10133,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     supports_user_interaction=inputs.get(
                         "supports_user_interaction", True
                     ),
+                    user_message_context=inputs.get("user_message_context"),
                 )
             )
             if self._stream_event_rail is not None:

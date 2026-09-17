@@ -13,7 +13,12 @@ def _make_swarm(monkeypatch: pytest.MonkeyPatch) -> interface_module.JiuWenSwarm
         lambda: {"preferred_language": "zh", "memory": {"mode": "disabled"}},
     )
     monkeypatch.setattr(interface_module, "get_memory_mode", lambda _config: "disabled")
-    monkeypatch.setattr(interface_module, "build_user_prompt", lambda *args, **kwargs: "stub-prompt")
+    monkeypatch.setattr(interface_module, "build_user_prompt", lambda *args, **kwargs: interface_module.BuiltUserPrompt(
+        user_query="stub-prompt",
+        context={},
+        interaction_prefix="",
+        statusline_directive="",
+    ))
     return interface_module.JiuWenSwarm()
 
 

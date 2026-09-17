@@ -9,9 +9,58 @@ unless we hook the harness tools here.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Awaitable, Callable
 
 _installed = False
+
+_RUN_IN_BACKGROUND_PARAM = {
+    "cn": "是否后台运行，默认 false；设为 true 时立即返回 PID",
+    "en": "Run in background (default false); returns PID immediately when true",
+}
+_RUN_IN_BACKGROUND_USAGE = {
+    "cn": (
+        "\n - 可将 `run_in_background` 设为 true 后台运行命令；"
+        "仅用于不会自行退出的命令；会结束的长任务用 `timeout`，不要后台。"
+        "不要用 `nohup` 或 `&` 代替该参数。"
+        "起前先查端口是否已有监听；起后核对监听是这次子进程且内容是这次目录，"
+        "不要只看 HTTP 200；失败换端口，不要杀占用进程"
+    ),
+    "en": (
+        "\n - You can set `run_in_background` to true to run the command "
+        "in the background, only when the command will not exit on its own; "
+        "use `timeout` for finite long jobs, not background. "
+        "Do not substitute `nohup` or `&`. "
+        "Before start, check whether the port already has a listener; "
+        "after start, confirm the listener is a child of this PID and the "
+        "content is this directory — do not rely on HTTP 200 alone; "
+        "on failure switch ports and do not kill the occupying process"
+    ),
+}
+_POWERSHELL_BACKGROUND_USAGE = {
+    "cn": (
+        "\n - 后台任务优先设 `background=true`（立刻回 PID）；"
+        "仅用于不会自行退出的命令；会结束的长任务用 `timeout`，不要后台。"
+        "也可用 `Start-Process` 把进程拆出去，但不要 `-Wait`、"
+        "不要 `RedirectStandardOutput`/`Error`；探测请另开，"
+        "起前先查端口是否已有监听；起后核对监听是这次子进程且内容是这次目录，"
+        "不要只看 HTTP 200；失败换端口，不要杀占用进程。"
+        "打开 URL 用前台 `Start-Process` 即可"
+    ),
+    "en": (
+        "\n - Prefer `background=true` for background jobs "
+        "(returns PID immediately), only when the command will not exit "
+        "on its own; use `timeout` for finite long jobs, not background. "
+        "You may detach with `Start-Process`, "
+        "but do not use `-Wait` or `RedirectStandardOutput`/`Error`; "
+        "probe in a separate call; before start check whether the port "
+        "already has a listener; after start confirm the listener is a "
+        "child of this PID and the content is this directory — do not "
+        "rely on HTTP 200 alone; on failure switch ports and do not kill "
+        "the occupying process. "
+        "Opening a URL with `Start-Process` is a finite foreground job"
+    ),
+}
 
 
 def _pre_execute_shell_command(command: str) -> str | None:
@@ -49,6 +98,74 @@ def _shell_mismatch(tool_name: str, command: str) -> str | None:
                 "powershell tool (or mcp_exec_command with shell_type=\"powershell\")."
             )
     return None
+
+
+def _bash_schema_exposes_run_in_background() -> bool:
+    """True when agent-core's bash tool card schema already has the field."""
+    try:
+        from openjiuwen.harness.prompts.tools import get_tool_input_params
+
+        params = get_tool_input_params("bash")
+    except (KeyError, TypeError, AttributeError):
+        return False
+    properties = params.get("properties") if isinstance(params, dict) else None
+    return isinstance(properties, dict) and "run_in_background" in properties
+
+
+def _ensure_bash_background_card(tool: Any, language: str) -> None:
+    """Expose ``run_in_background`` on a BashTool instance card if missing."""
+    card = getattr(tool, "card", None)
+    if card is None:
+        return
+    lang = language if language in _RUN_IN_BACKGROUND_PARAM else "cn"
+    params = getattr(card, "input_params", None)
+    if isinstance(params, dict):
+        properties = params.setdefault("properties", {})
+        if isinstance(properties, dict) and "run_in_background" in properties:
+            return
+        if isinstance(properties, dict):
+            properties["run_in_background"] = {
+                "type": "boolean",
+                "description": _RUN_IN_BACKGROUND_PARAM[lang],
+            }
+    description = getattr(card, "description", None)
+    if isinstance(description, str) and "run_in_background" not in description:
+        card.description = description.rstrip() + _RUN_IN_BACKGROUND_USAGE[lang]
+
+
+def _ensure_powershell_background_card(tool: Any, language: str) -> None:
+    """Append Start-Process usage notes on a PowerShellTool instance card if missing."""
+    card = getattr(tool, "card", None)
+    if card is None:
+        return
+    description = getattr(card, "description", None)
+    if not isinstance(description, str) or "Start-Process" in description:
+        return
+    lang = language if language in _POWERSHELL_BACKGROUND_USAGE else "cn"
+    card.description = description.rstrip() + _POWERSHELL_BACKGROUND_USAGE[lang]
+
+
+def _wrap_card_init(
+    original: Callable[..., None],
+    ensure_fn: Callable[[Any, str], None],
+) -> Callable[..., None]:
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        language = "cn"
+        try:
+            bound = inspect.signature(original).bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            raw_language = bound.arguments.get("language", "cn")
+            if isinstance(raw_language, str):
+                language = raw_language
+        except TypeError:
+            raw_language = kwargs.get("language")
+            if isinstance(raw_language, str):
+                language = raw_language
+        ensure_fn(self, language)
+
+    init.jiuwenswarm_card_wrapped = True  # type: ignore[attr-defined]
+    return init
 
 
 def _wrap_invoke(
@@ -105,6 +222,17 @@ def _patch_tool_class(tool_cls: type, tool_name: str) -> None:
         tool_cls.invoke = _wrap_invoke(tool_cls.invoke, tool_name)
     if not getattr(tool_cls.stream, "jiuwenswarm_safety_wrapped", False):
         tool_cls.stream = _wrap_stream(tool_cls.stream, tool_name)
+    already_card_wrapped = getattr(tool_cls.__init__, "jiuwenswarm_card_wrapped", False)
+    if (
+        tool_name == "bash"
+        and not already_card_wrapped
+        and not _bash_schema_exposes_run_in_background()
+    ):
+        tool_cls.__init__ = _wrap_card_init(tool_cls.__init__, _ensure_bash_background_card)
+    elif tool_name == "powershell" and not already_card_wrapped:
+        tool_cls.__init__ = _wrap_card_init(
+            tool_cls.__init__, _ensure_powershell_background_card
+        )
 
 
 def _contains_unquoted_semicolon(command: str) -> bool:
@@ -173,6 +301,10 @@ def reset_installed_flag() -> None:
 
 
 __all__ = [
+    "_bash_schema_exposes_run_in_background",
+    "_ensure_bash_background_card",
+    "_ensure_powershell_background_card",
+    "_patch_tool_class",
     "_pre_execute_shell_command",
     "_shell_mismatch",
     "_wrap_invoke",

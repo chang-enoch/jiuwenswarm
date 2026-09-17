@@ -9,6 +9,7 @@ import ctypes
 import shutil
 import subprocess
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 # frozen（PyInstaller 打包）模式下，macOS 双击 .app 启动时 cwd 为 "/"，
@@ -212,10 +213,41 @@ def _show_already_running_message() -> None:
 
 
 
+def _diag_log_dir() -> Path:
+    """启动期诊断日志目录：优先 ``JIUWENSWARM_LOG_DIR``（桌面端统一注入）。
+
+    与 ``jiuwenswarm.common.utils.get_bootstrap_log_dir`` 同规则（exe_entry
+    在包 import 之前运行，无法复用，两处需同步维护）：外层日期布局激活
+    （注入 ``JIUWENSWARM_LOG_DATE_ROOT``）时追加当日日期目录——
+    ``<DATE_ROOT>/<YYYY-MM-DD>/<JIUWENSWARM_LOG_DIR 相对 DATE_ROOT 的路径>``。
+    """
+    env_log_dir = os.environ.get("JIUWENSWARM_LOG_DIR", "").strip()
+    base = (
+        Path(env_log_dir).expanduser()
+        if env_log_dir
+        else Path(
+            os.environ.get("JIUWENSWARM_DATA_DIR", Path.home() / ".jiuwenswarm")
+        )
+        / "logs"
+    )
+    env_date_root = os.environ.get("JIUWENSWARM_LOG_DATE_ROOT", "").strip()
+    if not env_date_root:
+        return base
+    date_root = Path(env_date_root).expanduser()
+    try:
+        rel = base.relative_to(date_root)
+    except ValueError:
+        return base
+    rel_str = rel.as_posix().strip("/")
+    if not rel_str:
+        return base
+    return date_root / datetime.now().strftime("%Y-%m-%d") / rel_str
+
+
 def _write_child_error(exc: BaseException) -> None:
     """将子进程的未捕获异常写入日志文件。"""
     try:
-        log_dir = Path(os.environ.get("JIUWENSWARM_DATA_DIR", Path.home() / ".jiuwenswarm")) / "logs"
+        log_dir = _diag_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "jiuwenswarm_exe_error.log"
         with open(log_file, "a", encoding="utf-8", errors="replace") as f:
@@ -259,7 +291,7 @@ def _run_win_setup() -> None:
     """安装器已提权时调用: 在本进程内跑 win_setup, 不再 ShellExecuteW(runas)."""
     # import 失败时也能确认安装器调到了这里.
     try:
-        log_dir = Path(os.environ.get("JIUWENSWARM_DATA_DIR", Path.home() / ".jiuwenswarm")) / "logs"
+        log_dir = _diag_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "win_setup_invoke.log").write_text(
             f"argv={sys.argv!r}\ncwd={os.getcwd()}\n", encoding="utf-8",

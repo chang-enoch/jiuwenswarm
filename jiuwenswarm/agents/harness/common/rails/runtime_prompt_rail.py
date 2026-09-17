@@ -8,6 +8,7 @@ sees the current values without needing to call any tool.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -74,6 +75,7 @@ class RuntimePromptRail(DeepAgentRail):
         self._language = language
         self._channel = channel
         self._trusted_dirs: list[str] | None = None
+        self._user_message_context: dict[str, Any] | None = None
         self._cwd: str | None = None
         self._project_dir: str | None = None
         self._workspace_dir: str | None = None
@@ -100,10 +102,12 @@ class RuntimePromptRail(DeepAgentRail):
             self.system_prompt_builder.remove_section("tui_current_project_policy")
             self.system_prompt_builder.remove_section("trusted_dirs_policy")
             self.system_prompt_builder.remove_section("runtime.binary_context")
+            self.system_prompt_builder.remove_section("user_message_context")
             self.system_prompt_builder.remove_section(_EXTENSION_SYSTEM_POLICY_SECTION)
         self._agent = None
         self.system_prompt_builder = None
         self.attachment_manager = None
+        self._user_message_context = None
 
     def set_language(self, language: str) -> None:
         """per-request 更新语言。"""
@@ -116,6 +120,16 @@ class RuntimePromptRail(DeepAgentRail):
     def set_trusted_dirs(self, trusted_dirs: list[str] | None) -> None:
         """per-request 更新可信目录。"""
         self._trusted_dirs = trusted_dirs
+
+    def set_user_message_context(self, ctx: dict[str, Any] | None) -> None:
+        """per-request 更新 user_message_context（source/timezone/.../skills_to_use 等）。
+
+        由 _build_inputs 收集、经 _RuntimeConfig 透传过来；before_model_call
+        渲染为 prompt attachment 注入到 ``<system-reminder>`` 块。``None``
+        表示该请求未携带上下文（如 a2ui / InteractiveInput 路径），此时
+        清除上一轮残留的 section。
+        """
+        self._user_message_context = dict(ctx) if ctx else None
 
     def set_runtime_paths(
         self,
@@ -342,6 +356,7 @@ class RuntimePromptRail(DeepAgentRail):
             "env",
             "tui_current_project_policy",
             "trusted_dirs_policy",
+            "user_message_context",
             _CELIA_MEMORY_REFERENCE_SECTION,
             _EXTENSION_SYSTEM_POLICY_SECTION):
             self.system_prompt_builder.remove_section(name)
@@ -708,13 +723,33 @@ class RuntimePromptRail(DeepAgentRail):
                     if is_cn else
                     f"| `{agent_workspace_dir}/memory` | Agent memory directory | stores persistent memory | treat as part of the Agent's memory |\n"
                 )
+            # Desktop project sessions already receive the actual directory
+            # values in the late runtime-context block below.  Keep the
+            # surrounding guidance static so a workspace change only affects
+            # that tail, and avoid repeating the same path in the policy.
+            optimize_desktop_workspace_prompt = self._channel == "desktop" and has_project
+            project_and_cwd_match = (
+                optimize_desktop_workspace_prompt
+                and self._same_path(project_dir, runtime_cwd)
+            )
 
             if is_cn:
+                working_directory_line = (
+                    "- 项目目录是你当前的工作空间。\n\n"
+                    if optimize_desktop_workspace_prompt
+                    else "- 项目目录是你当前的工作空间，"
+                    f"当前项目目录是：`{prompt_project_dir}`\n\n"
+                )
+                runtime_directory_lines = (
+                    f"- 当前项目目录与当前工作目录（cwd，也是命令工具默认执行目录）：`{project_dir}`\n"
+                    if project_and_cwd_match
+                    else f"- 当前项目目录：{project_label}\n"
+                    f"- 当前工作目录（cwd，也是命令工具默认执行目录）：`{runtime_cwd}`\n"
+                )
                 directory_content = (
                     "# 目录与运行时上下文\n\n"
                     "## 工作目录\n\n"
-                    "- 项目目录是你当前的工作空间，"
-                    f"当前项目目录是：`{prompt_project_dir}`\n\n"
+                    f"{working_directory_line}"
                     f"{important_files}\n\n"
                     "## 项目目录规则\n\n"
                     "- 用户任务中的相对路径必须相对于当前项目目录路径去解析。\n"
@@ -743,17 +778,27 @@ class RuntimePromptRail(DeepAgentRail):
                     "- 小艺 work 启动配置目录不得用于保存普通任务产物。\n"
                     "- 用户任务中的 `config/`、`memory/`、`skills/`、`todo/` 或 `workspace/` 不自动映射到 小艺 work 内部目录。\n\n"
                     "## 运行时目录上下文\n\n"
-                    f"- 当前项目目录：{project_label}\n"
-                    f"- 当前工作目录（cwd，也是命令工具默认执行目录）：`{runtime_cwd}`\n"
+                    f"{runtime_directory_lines}"
                     f"- Agent 内部数据目录：`{agent_workspace_dir}`\n"
                     f"- 小艺 work 启动配置目录：`{config_dir}`"
                 )
             else:
+                working_directory_line = (
+                    "- The project directory is your current workspace.\n\n"
+                    if optimize_desktop_workspace_prompt
+                    else "- The project directory is your current workspace; "
+                    f"the current project directory is: `{prompt_project_dir}`\n\n"
+                )
+                runtime_directory_lines = (
+                    f"- Current project directory and working directory (cwd, also the default command-tool execution directory): `{project_dir}`\n"
+                    if project_and_cwd_match
+                    else f"- Current project directory: {project_label}\n"
+                    f"- Current working directory (cwd, also the default command-tool execution directory): `{runtime_cwd}`\n"
+                )
                 directory_content = (
                     "# Directory and Runtime Context\n\n"
                     "## Working Directory\n\n"
-                    "- The project directory is your current workspace; "
-                    f"the current project directory is: `{prompt_project_dir}`\n\n"
+                    f"{working_directory_line}"
                     f"{important_files}\n\n"
                     "## Project Directory Rules\n\n"
                     "- Resolve relative paths in user tasks against the current project directory.\n"
@@ -793,8 +838,7 @@ class RuntimePromptRail(DeepAgentRail):
                     "- `config/`, `memory/`, `skills/`, `todo/`, or `workspace/` in a user task do not "
                     "automatically refer to 小艺 work internal directories.\n\n"
                     "## Runtime Directory Context\n\n"
-                    f"- Current project directory: {project_label}\n"
-                    f"- Current working directory (cwd, also the default command-tool execution directory): `{runtime_cwd}`\n"
+                    f"{runtime_directory_lines}"
                     f"- Agent internal data directory: `{agent_workspace_dir}`\n"
                     f"- 小艺 work startup configuration directory: `{config_dir}`"
                 )
@@ -835,11 +879,75 @@ class RuntimePromptRail(DeepAgentRail):
                         f"- Other readable and writable directories that are not the current project: {trusted_dirs_display}\n"
                         "- Ask the user before operating outside the current project and these authorized directories."
                     )
+            # Desktop used to append this policy to every user message. Keep the
+            # same user-visible behavior, but place it in the per-request
+            # runtime tail so it is represented once in system context rather
+            # than copied into history and memory wrappers on every turn.
+            if self._channel == "desktop" and has_project:
+                if is_cn:
+                    directory_content += (
+                        "\n\n## 小艺 Work 工作空间约束\n\n"
+                        "- 上述当前项目目录即用户工作空间。\n"
+                        "- 除非用户明确指定其他位置，否则所有新建、修改和写入的用户任务产物必须落在该目录下；"
+                        "用户任务中的相对路径可相对此目录解析。"
+                    )
+                else:
+                    directory_content += (
+                        "\n\n## XiaoYi Work Workspace Policy\n\n"
+                        "- The current project directory above is the user's workspace.\n"
+                        "- Unless the user explicitly specifies another location, all newly created, modified, "
+                        "or written user-task deliverables must be placed in this directory; relative paths in "
+                        "user tasks may be resolved from it."
+                    )
             self.system_prompt_builder.add_section(PromptSection(
                 name="directory_boundaries",
                 content={"cn": directory_content, "en": directory_content},
                 priority=96,
             ))
+
+        # ── user_message_context ──
+        # source/timezone/preferred_response_language/files_updated_by_user/
+        # type/skills_to_use/cron_output_hint 等字段，由 build_user_prompt 收集、
+        # _RuntimeConfig 透传过来。走 system_prompt_builder.add_section 通道注入
+        # 系统提示词（priority=97 > directory_boundaries 96，排在系统提示词最末尾）；
+        # trusted_dirs 已在 directory_boundaries 中渲染，此处跳过避免重复；
+        # timestamp 已由 runtime.setting section 渲染，同样跳过。
+        self.system_prompt_builder.remove_section("user_message_context")
+        if self._user_message_context:
+            umc_content = self._render_user_message_context(self._user_message_context)
+            # 默认走英文：cn/en 共用同一份英文文案。
+            self.system_prompt_builder.add_section(PromptSection(
+                name="user_message_context",
+                content={"cn": umc_content, "en": umc_content},
+                priority=97,
+            ))
+
+    def _render_user_message_context(self, ctx: dict[str, Any]) -> str:
+        """Render user_message_context dict as a markdown block for the system prompt.
+
+        Always renders in English (default language for this section). Skips:
+        - ``trusted_dirs`` (already rendered in directory_boundaries)
+        - ``content`` (not stored here since build_user_prompt separates it)
+        - ``timestamp`` (already rendered in runtime.setting section)
+        - ``cron_output_hint`` (internal flag, inlined as policy text below)
+        """
+        skip_keys = {"trusted_dirs", "content", "cron_output_hint", "timestamp"}
+        items: list[tuple[str, str]] = []
+        for key, value in ctx.items():
+            if key in skip_keys:
+                continue
+            items.append((key, value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)))
+
+        lines = ["# Current User Message Context", ""]
+        for key, value in items:
+            lines.append(f"- {key}: {value}")
+        if ctx.get("cron_output_hint"):
+            lines.append("")
+            lines.append(
+                "For query tasks, you must output the queried content—"
+                "don't just reply with confirmation, don't record to memory."
+            )
+        return "\n".join(lines)
 
     async def _upsert_prompt_attachment(
         self,

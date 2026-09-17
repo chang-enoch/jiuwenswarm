@@ -74,19 +74,19 @@ async def test_not_settled_when_unread_messages(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_not_settled_when_progress_unavailable(monkeypatch) -> None:
-    """快照不可得 → 退化不补终态（维持旧行为，不会更糟）。"""
+async def test_unknown_when_progress_unavailable(monkeypatch) -> None:
+    """快照不可得 → 返回 None（未知）：调用方续窗重试而非一次性放弃。"""
     _patch_progress(monkeypatch, None)
     _patch_unread(monkeypatch, False)
-    assert await team_helpers._team_round_settled("desktop", "s1") is False
+    assert await team_helpers._team_round_settled("desktop", "s1") is None
 
 
 @pytest.mark.asyncio
-async def test_not_settled_when_unread_unavailable(monkeypatch) -> None:
-    """未读消息读数不可得 → 退化不补终态。"""
+async def test_unknown_when_unread_unavailable(monkeypatch) -> None:
+    """未读消息读数不可得 → 返回 None（未知）：调用方续窗重试。"""
     _patch_progress(monkeypatch, (0, 0, False))
     _patch_unread(monkeypatch, None)
-    assert await team_helpers._team_round_settled("desktop", "s1") is False
+    assert await team_helpers._team_round_settled("desktop", "s1") is None
 
 
 # ------------------------------------------------------------------
@@ -314,6 +314,93 @@ async def test_settle_terminal_cancelled_by_new_activity(monkeypatch) -> None:
     terminals = [
         e
         for e in events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert terminals == []
+
+
+async def _run_retry_round(monkeypatch: pytest.MonkeyPatch, settle_seq: list, trailing: str) -> list[dict]:
+    """settle 读数按序列返回（None=未就绪），final 后带尾随帧。trailing=usage/content。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+    monkeypatch.setattr(team_helpers, "_SETTLE_TERMINAL_QUIET_SEC", 0.01)
+    state = {"calls": 0}
+
+    async def _settled(_cid, _sid):
+        idx = min(state["calls"], len(settle_seq) - 1)
+        state["calls"] += 1
+        return settle_seq[idx]
+
+    monkeypatch.setattr(team_helpers, "_team_round_settled", _settled)
+
+    def _fake_parse(chunk):
+        ctype = getattr(chunk, "type", None)
+        if ctype == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        if ctype == "answer":
+            return {"event_type": "chat.final", "content": chunk.payload}
+        if ctype == "usage":
+            return {"event_type": "chat.usage_metadata"}
+        if ctype == "tool":
+            return {"event_type": "chat.tool_call", "tool_call": {"name": "bash", "tool_call_id": "c1"}}
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+        yield SimpleNamespace(
+            type="controller_output",
+            payload=SimpleNamespace(
+                type="task_completion",
+                data=[SimpleNamespace(data={"output": "正文", "result_type": "answer"})],
+            ),
+            role=None,
+        )
+        if trailing == "usage":
+            yield SimpleNamespace(type="usage", payload={}, role=None)
+        elif trailing == "content":
+            yield SimpleNamespace(type="tool", payload={}, role=None)
+        await asyncio.sleep(0.08)
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+    await team_helpers._consume_stream_with_query(
+        "web", "sess-retry", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+    )
+    return manager.events
+
+
+@pytest.mark.asyncio
+async def test_settle_terminal_retries_when_readings_not_ready(monkeypatch) -> None:
+    """读数未就绪（None）续窗重试：两次 None 后变 True → 终态补发（第三种场景）。"""
+    events = await _run_retry_round(monkeypatch, [None, None, True], trailing="usage")
+    terminals = [
+        e for e in events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert len(terminals) == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_trailing_frame_does_not_cancel_window(monkeypatch) -> None:
+    """final 后的 usage 尾随帧不算新活动：静默窗不被误作废，终态照发。"""
+    events = await _run_retry_round(monkeypatch, [True], trailing="usage")
+    terminals = [
+        e for e in events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert len(terminals) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_forever_abandons_after_max_attempts(monkeypatch) -> None:
+    """读数持续未就绪超过重试上限 → 放弃（维持旧行为等 team.completed）。"""
+    events = await _run_retry_round(monkeypatch, [None, None, None], trailing="usage")
+    terminals = [
+        e for e in events
         if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
     ]
     assert terminals == []

@@ -41,6 +41,18 @@ from openjiuwen.core.common.logging.utils import (
     normalize_and_validate_log_path,
 )
 
+# 按天切分（与 agent-core dated_file_handler 同名同语义）。补丁源可能运行在
+# 未含该模块的旧 openjiuwen 之上——缺模块时禁用按天布局，回落平铺按大小
+# 轮转，绝不让整个 monkeypatch 因 import 失败而失效。
+try:
+    from openjiuwen.core.common.logging.dated_file_handler import (
+        DEFAULT_MAX_BYTES as DEFAULT_DATED_MAX_BYTES,
+        DatedDailyFileHandler,
+    )
+except ImportError:  # pragma: no cover - 旧 openjiuwen 依赖分支
+    DEFAULT_DATED_MAX_BYTES = 2 * 1024 * 1024
+    DatedDailyFileHandler = None
+
 
 class SafeRotatingFileHandler(RotatingFileHandler):
     """
@@ -59,6 +71,7 @@ class SafeRotatingFileHandler(RotatingFileHandler):
             *args: Any,
             log_file_pattern: Optional[str] = None,
             backup_file_pattern: Optional[str] = None,
+            delay: bool = True,
             **kwargs: Any,
     ) -> None:
         """
@@ -83,17 +96,28 @@ class SafeRotatingFileHandler(RotatingFileHandler):
             except OSError:
                 pass
 
-        super().__init__(filename, *args, **kwargs)
+        super().__init__(filename, *args, delay=delay, **kwargs)
         self.backup_file_pattern = backup_file_pattern or "{baseFilename}.{index}"
 
-        # Set log file permissions
+        # Set log file permissions. With delay=True the file does not exist
+        # yet at construction time; permissions are applied on first open.
+        if os.path.exists(self.baseFilename):
+            try:
+                os.chmod(self.baseFilename, 0o640)
+            except OSError as e:
+                raise build_error(
+                    StatusCode.COMMON_LOG_EXECUTION_RUNTIME_ERROR,
+                    error_msg=f"failed to set file permissions: {e}"
+                ) from e
+
+    def _open(self) -> Any:
+        """Open the underlying stream, then enforce secure file permissions."""
+        stream = super()._open()
         try:
             os.chmod(self.baseFilename, 0o640)
-        except OSError as e:
-            raise build_error(
-                StatusCode.COMMON_LOG_EXECUTION_RUNTIME_ERROR,
-                error_msg=f"failed to set file permissions: {e}"
-            ) from e
+        except OSError:  # File may be locked by another handle; keep logging working
+            pass
+        return stream
 
     def _format_filename(self, base_filename: str, pattern: str) -> str:
         """
@@ -297,6 +321,13 @@ class DefaultLogger(LoggerProtocol):
                 # If path normalization fails, use original path
                 abs_log_file = log_file
 
+            dated_handler = self._build_dated_file_handler(abs_log_file)
+            if dated_handler is not None:
+                dated_handler.addFilter(ContextFilter(self.log_type))
+                dated_handler.setFormatter(self._get_formatter())
+                self._logger.addHandler(dated_handler)
+                return
+
             # Ensure log directory exists
             log_dir = os.path.dirname(abs_log_file)
             if log_dir:
@@ -326,6 +357,69 @@ class DefaultLogger(LoggerProtocol):
             file_handler.addFilter(ContextFilter(self.log_type))
             file_handler.setFormatter(self._get_formatter())
             self._logger.addHandler(file_handler)
+
+    def _build_dated_file_handler(self, abs_log_file):
+        """Build a per-day handler when ``log_date_dirs`` is enabled.
+
+        The date directory is inserted under the configured ``log_path``
+        root. With the default layout the date goes directly under the root
+        (``<log_path>/2026-09-12/run/jiuwen.log``); when the desktop pins
+        ``log_path`` to a per-user ``core`` subdirectory, ``log_date_base``
+        names the root the date lands under instead
+        (``<dateBase>/2026-09-12/<…>/core/run/jiuwen.log``).
+        Returns None when the option is off or the log file does not live
+        under ``log_path`` (absolute user overrides keep the flat layout).
+
+        Args:
+            abs_log_file: Absolute path of the configured log file.
+
+        Returns:
+            A configured handler, or None to keep the legacy layout.
+        """
+        if DatedDailyFileHandler is None or not self.config.get("log_date_dirs"):
+            return None
+
+        log_path = self.config.get("log_path")
+        if not log_path:
+            return None
+
+        try:
+            abs_log_root = os.path.abspath(os.path.expanduser(log_path))
+            relative = os.path.relpath(abs_log_file, abs_log_root)
+        except (OSError, ValueError):
+            return None
+        if relative.startswith(os.pardir) or os.path.isabs(relative):
+            return None
+        if not relative or relative == os.curdir:
+            return None
+
+        # 桌面注入形态：log_path 是日期根下的 core 子目录，日期目录要落在
+        # log_date_base（用户层或 <dataRoot>/logs）下，再进 core ——
+        # <dateBase>/<date>/<…>/core/…
+        date_root = abs_log_root
+        core_subdir = ""
+        log_date_base = self.config.get("log_date_base")
+        if log_date_base:
+            try:
+                abs_date_base = os.path.abspath(os.path.expanduser(log_date_base))
+                base_relative = os.path.relpath(abs_log_root, abs_date_base)
+            except (OSError, ValueError):
+                base_relative = None
+            if base_relative and not base_relative.startswith(os.pardir) and not os.path.isabs(base_relative):
+                date_root = abs_date_base
+                core_subdir = base_relative
+
+        max_bytes = get_log_max_bytes(self.config.get("max_bytes", DEFAULT_DATED_MAX_BYTES))
+        if max_bytes <= 0:
+            max_bytes = DEFAULT_DATED_MAX_BYTES
+        try:
+            return DatedDailyFileHandler(
+                base_dir=date_root,
+                filename=os.path.join(core_subdir, relative) if core_subdir else relative,
+                max_bytes=max_bytes,
+            )
+        except OSError:
+            return None
 
     def _get_formatter(self) -> logging.Formatter:
         """

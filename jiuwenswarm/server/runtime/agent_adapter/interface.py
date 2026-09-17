@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import inspect
 import json
 import logging
@@ -778,6 +778,30 @@ Guidelines:
 """
 
 
+@dataclass(frozen=True)
+class BuiltUserPrompt:
+    """Result of build_user_prompt: separates pure user content from injected context.
+
+    Fields:
+        user_query: Pure user content (the raw message the user typed).
+            Contains no JSON wrapper, no "你收到一条消息" prefix, no system metadata.
+        context: Dict of non-content fields (source/timezone/preferred_response_language/.../skills_to_use/
+            trusted_dirs) for injection into the system prompt via RuntimePromptRail.
+            Does NOT contain the ``content`` or ``timestamp`` keys.
+        interaction_prefix: Prefix from metadata.interaction_context (e.g. "\n<ctx>\n\n").
+            Empty string when no interaction_context is present. Caller concatenates
+            this with user_query (and statusline_directive) to form the final user
+            message: ``interaction_prefix + user_query + statusline_directive``.
+        statusline_directive: Suffix injected by /statusline <description> command
+            (the statusline-setup prompt text). Empty string for normal messages.
+    """
+
+    user_query: str
+    context: dict[str, Any]
+    interaction_prefix: str
+    statusline_directive: str
+
+
 def _handle_skills_use_slash_command(query: str) -> Tuple[list, str]:
     """Handle the /skills use slash command"""
     stripped = query.strip()
@@ -832,8 +856,14 @@ def _handle_statusline_prompt_command(query: str) -> Tuple[str, str]:
 
 def build_user_prompt(content: str | dict, files: dict, channel: str, language: str, *,
     trusted_dirs: list[str] | None = None, metadata: dict[str, Any] | None = None,
-    skills: list[str] | None = None) -> str:
+    skills: list[str] | None = None) -> BuiltUserPrompt:
     """Build user prompt for the agent.
+
+    Returns a BuiltUserPrompt that separates the pure user content (``user_query``)
+    from the system-injected metadata (``context``). The caller is responsible
+    for combining ``interaction_prefix + user_query + statusline_directive``
+    into the final user message; ``context`` is routed to the system prompt
+    via prompt_attachment (RuntimePromptRail).
 
     Args:
         skills: 显式传入的 skill 名列表（来自 params.skills，前端从 content 提取）。
@@ -846,7 +876,13 @@ def build_user_prompt(content: str | dict, files: dict, channel: str, language: 
 
     a2ui_prompt = build_user_prompt_if_a2ui_event(content, channel=channel, language=language)
     if a2ui_prompt is not None:
-        return a2ui_prompt
+        # a2ui 事件不走 user_message_context 拆分；保持原 str 返回语义。
+        return BuiltUserPrompt(
+            user_query=a2ui_prompt,
+            context={},
+            interaction_prefix="",
+            statusline_directive="",
+        )
 
     interaction_prefix = ""
     if metadata:
@@ -873,70 +909,60 @@ def build_user_prompt(content: str | dict, files: dict, channel: str, language: 
     else:
         statusline_prompt = ""
 
-    if language == "zh":
-        prompt = "你收到一条消息：\n"
-        if channel == "cron":
-            prompt = "你收到一条消息，对于查询类任务必须输出查询到的内容，不要只回复确认，不要记录到memory：\n"
-    else:
-        prompt = "You receive a new message:\n"
-        if channel == "cron":
-            prompt = ("You receive a new message. For query tasks, you must output the queried content"
-                      "—don't just reply with confirmation, don't record to memory:\n")
-    msg_data: dict[str, Any] = {
-        "source": channel,
+    # cron/heartbeat 渠道：源类型归为 system；并在 context 中带上强制输出提示文案，
+    # 由 RuntimePromptRail 注入到系统提示词（不再塞进 user message 前缀）。
+    source = "system" if channel in ("cron", "heartbeat") else channel
+    msg_type = channel if channel in ("cron", "heartbeat") else "user input"
+
+    # user_message_context：除 content 外的全部字段，注入系统提示词。
+    # 不再含 "content" 字段——user_query 已经单独承载用户原文。
+    # 不再含 "timestamp" 字段——RuntimePromptRail 的 runtime.setting section 已渲染时间。
+    user_message_context: dict[str, Any] = {
+        "source": source,
+        "timezone": "Asia/Shanghai",
         "preferred_response_language": language,
-        "content": content,
-        "type": "user input",
+        "files_updated_by_user": json.dumps(files, ensure_ascii=False),
+        "type": msg_type,
     }
-    if channel in ["cron", "heartbeat"]:
-        msg_data["source"] = "system"
-        msg_data["type"] = channel
+    if channel == "cron":
+        # cron 特殊提示：原本拼在 user prompt 前缀里，现在挪到 context 由系统提示词渲染
+        user_message_context["cron_output_hint"] = True
     if metadata:
         chat_type = str(metadata.get("chat_type") or metadata.get("im_chat_type") or "").strip()
         if chat_type:
-            msg_data["chat_type"] = chat_type
+            user_message_context["chat_type"] = chat_type
         sender_name = str(metadata.get("sender_name") or "").strip()
         if sender_name:
-            msg_data["sender"] = sender_name
-    if channel not in ["cron", "heartbeat"]:
-        msg_data["files_updated_by_user"] = json.dumps(files, ensure_ascii=False)
-    final_prompt = interaction_prefix + prompt + json.dumps(msg_data, ensure_ascii=False)
-    if interaction_prefix:
-        logger.info(
-            "[build_user_prompt][DEBUG] interaction_context 存在，最终 prompt=\n%s",
-            final_prompt,
-        )
-
-    now = datetime.now(timezone(timedelta(hours=8)))
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    user_message_context = {
-        "source": channel,
-        "timezone": "Asia/Shanghai",
-        "timestamp": now_str,
-        "preferred_response_language": language,
-        "content": content,
-        "files_updated_by_user": json.dumps(files, ensure_ascii=False),
-        "type": "user input",
-    }
+            user_message_context["sender"] = sender_name
     if skills_to_use:
         user_message_context["skills_to_use"] = skills_to_use
     if trusted_dirs:
         user_message_context["trusted_dirs"] = json.dumps(trusted_dirs, ensure_ascii=False)
 
-    # 仿 Claude Code statusline-setup: 把指令文本直接嵌入 prompt
-    base_prompt = interaction_prefix + prompt + json.dumps(user_message_context, ensure_ascii=False)
+    # statusline-setup 指令文本独立返回；调用方拼在 user_query 之后。
+    statusline_directive = ""
     if statusline_prompt:
         if language == "zh":
-            return base_prompt + "\n\n你必须按照以下指令配置状态栏：\n" + statusline_prompt
+            statusline_directive = "\n\n你必须按照以下指令配置状态栏：\n" + statusline_prompt
         else:
-            return (
-                base_prompt
-                + "\n\nYou must follow these instructions "
-                + "to configure the status line:\n"
+            statusline_directive = (
+                "\n\nYou must follow these instructions "
+                "to configure the status line:\n"
                 + statusline_prompt
             )
-    return base_prompt
+
+    if interaction_prefix:
+        logger.info(
+            "[build_user_prompt][DEBUG] interaction_context 存在，user_query=\n%s",
+            interaction_prefix + str(content),
+        )
+
+    return BuiltUserPrompt(
+        user_query=str(content),
+        context=user_message_context,
+        interaction_prefix=interaction_prefix,
+        statusline_directive=statusline_directive,
+    )
 
 
 
@@ -1218,6 +1244,7 @@ class JiuWenSwarm:
 
         if isinstance(query, InteractiveInput):
             final_query = query
+            built_user_context: dict[str, Any] | None = None
         else:
             answers = params.get("answers")
             if answers is not None and not isinstance(answers, list):
@@ -1237,8 +1264,9 @@ class JiuWenSwarm:
                 )
                 if interactive_input is not None:
                     final_query = interactive_input
+                    built_user_context = None
                 else:
-                    final_query = build_user_prompt(
+                    built = build_user_prompt(
                         query,
                         files=params.get("files", {}),
                         channel=channel,
@@ -1247,8 +1275,10 @@ class JiuWenSwarm:
                         metadata=request.metadata,
                         skills=skills,
                     )
+                    final_query = built.interaction_prefix + built.user_query + built.statusline_directive
+                    built_user_context = built.context
             else:
-                final_query = build_user_prompt(
+                built = build_user_prompt(
                     query,
                     files=params.get("files", {}),
                     channel=channel,
@@ -1257,6 +1287,8 @@ class JiuWenSwarm:
                     metadata=request.metadata,
                     skills=skills,
                 )
+                final_query = built.interaction_prefix + built.user_query + built.statusline_directive
+                built_user_context = built.context
                 # 调试日志：确认 /statusline prompt 注入是否生效
                 if isinstance(query, str) and "/statusline" in query:
                     logger.info(
@@ -1296,6 +1328,11 @@ class JiuWenSwarm:
             inputs["project_dir"] = project_dir
         if cwd:
             inputs["cwd"] = cwd
+        # 传递 user_message_context 给 RuntimePromptRail 注入系统提示词
+        # （source/timezone/timestamp/preferred_response_language/files_updated_by_user/
+        #   type/skills_to_use/trusted_dirs/cron_output_hint 等）
+        if built_user_context:
+            inputs["user_message_context"] = built_user_context
 
         run = params.get("run")
         if run:
@@ -1492,8 +1529,9 @@ class JiuWenSwarm:
                         answer_value = custom_input
                     else:
                         answer_value = ""
-                    if question_text and answer_value:
-                        answers_dict[question_text] = answer_value
+                    if question_text:
+                        # 空答案表示用户点击了“跳过”；保留题目并显式传递语义。
+                        answers_dict[question_text] = answer_value or "跳过"
                     elif answer_value:
                         free_text_answer = (
                             answer_value
@@ -2669,6 +2707,7 @@ class JiuWenSwarm:
         a2ui_pending_render_sent = False
         a2ui_stream_probe = ""
         _yielded_from_queue = 0
+        completed_yielded = False
         logger.info(
             "[JiuWenSwarm] consumer loop starting: request_id=%s is_team=%s is_first=%s",
             rid, is_team_mode, is_team_first_request,
@@ -2920,6 +2959,8 @@ class JiuWenSwarm:
                                 if next_final_content:
                                     final_answer_content = next_final_content
                                     final_answer_chunks.clear()
+                        if getattr(data, "is_complete", False):
+                            completed_yielded = True
                         yield data
                     elif isinstance(data, dict) and isinstance(data.get("event_type"), str):
                         et = str(data.get("event_type"))
@@ -3077,6 +3118,22 @@ class JiuWenSwarm:
                     exc_info=True,
                 )
             logger.info("[JiuWenSwarm] 流式处理被中断: request_id=%s", rid)
+            # 取消不再让流静默死亡：补发一个如实标注 cancelled 的终止帧，
+            # 客户端从此可用"收到终止帧"确定性收尾，无需靠超时区分
+            # "服务端慢"与"流已取消"。复用 chat.error 形状（信封映射现成：
+            # is_final + status=failed + details.code=cancelled），不新增
+            # 事件类型。已有终止帧时不双发。
+            if not completed_yielded:
+                yield AgentResponseChunk(
+                    request_id=rid,
+                    channel_id=cid,
+                    payload={
+                        "event_type": "chat.error",
+                        "code": "cancelled",
+                        "error": "任务已取消",
+                    },
+                    is_complete=True,
+                )
             raise
         finally:
             # The adapter producer owns RuntimeOutputStream.  Cancelling and

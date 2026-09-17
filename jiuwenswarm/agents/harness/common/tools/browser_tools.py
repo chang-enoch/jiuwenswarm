@@ -20,7 +20,7 @@ from typing import IO, Any
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.core.runner import Runner
 
-from jiuwenswarm.common.utils import get_logs_dir
+from jiuwenswarm.common.utils import get_dated_logs_dir
 
 _BROWSER_MCP_DEFAULT_ID = "playwright_runtime_wrapper"
 _BROWSER_MCP_DEFAULT_NAME = "playwright-runtime-wrapper"
@@ -45,7 +45,9 @@ logger = logging.getLogger(__name__)
 
 
 def _browser_runtime_log_paths() -> tuple[Path, Path]:
-    logs_dir = get_logs_dir()
+    # 按天切分：子进程 stdout/stderr 重定向落当日目录（钉住首写日期，
+    # 对齐桌面会话日志跨天不拆的先例）。
+    logs_dir = get_dated_logs_dir()
     logs_dir.mkdir(parents=True, exist_ok=True)
     return (
         logs_dir / _BROWSER_RUNTIME_STDOUT_LOG,
@@ -101,13 +103,20 @@ def _repo_root() -> Path:
 
 def _browser_move_server_script() -> Path:
     return (
-        _repo_root() / "jiuwenswarm" / "agentserver" / "tools"
-        / "browser-move" / "src" / "playwright_runtime_mcp_server.py"
+        _repo_root()
+        / "jiuwenswarm"
+        / "agentserver"
+        / "tools"
+        / "browser-move"
+        / "src"
+        / "playwright_runtime_mcp_server.py"
     )
 
 
 def _browser_move_src_root() -> Path:
-    return _repo_root() / "jiuwenswarm" / "agentserver" / "tools" / "browser-move" / "src"
+    return (
+        _repo_root() / "jiuwenswarm" / "agentserver" / "tools" / "browser-move" / "src"
+    )
 
 
 def _normalize_client_type(client_type: str) -> str:
@@ -173,7 +182,12 @@ def _ensure_browser_move_client_patch() -> None:
         normalized = _normalize_client_type(getattr(config, "client_type", ""))
         if normalized == "sse":
             if sse_cls is not None:
-                return sse_cls(config.server_path, config.server_name, config.auth_headers, config.auth_query_params)
+                return sse_cls(
+                    config.server_path,
+                    config.server_name,
+                    config.auth_headers,
+                    config.auth_query_params,
+                )
             return original_create_client(config)
         if normalized == "streamable-http":
             return streamable_http_cls(
@@ -257,17 +271,13 @@ def _build_browser_runtime_subprocess_env() -> dict[str, str]:
 
 def _runtime_host() -> str:
     return (
-        os.getenv(_AUTO_RUNTIME_HOST)
-        or os.getenv(_AUTO_SSE_HOST)
-        or "127.0.0.1"
+        os.getenv(_AUTO_RUNTIME_HOST) or os.getenv(_AUTO_SSE_HOST) or "127.0.0.1"
     ).strip()
 
 
 def _runtime_port() -> str:
     return (
-        os.getenv(_AUTO_RUNTIME_PORT)
-        or os.getenv(_AUTO_SSE_PORT)
-        or "8940"
+        os.getenv(_AUTO_RUNTIME_PORT) or os.getenv(_AUTO_SSE_PORT) or "8940"
     ).strip()
 
 
@@ -275,7 +285,9 @@ def _runtime_path(transport: str) -> str:
     env_path = os.getenv(_AUTO_RUNTIME_PATH)
     if not env_path and transport == "sse":
         env_path = os.getenv(_AUTO_SSE_PATH)
-    default_path = "/mcp" if _normalize_client_type(transport) == "streamable-http" else "/sse"
+    default_path = (
+        "/mcp" if _normalize_client_type(transport) == "streamable-http" else "/sse"
+    )
     path = (env_path or default_path).strip() or default_path
     if not path.startswith("/"):
         path = f"/{path}"
@@ -329,7 +341,9 @@ def _start_local_server(transport: str, host: str, port: int, path: str) -> str:
 
     server_script = _browser_move_server_script()
     if not server_script.exists():
-        raise FileNotFoundError(f"browser runtime server script not found: {server_script}")
+        raise FileNotFoundError(
+            f"browser runtime server script not found: {server_script}"
+        )
 
     command = (os.getenv("BROWSER_RUNTIME_MCP_COMMAND") or sys.executable).strip()
     env = _build_browser_runtime_subprocess_env()
@@ -386,7 +400,11 @@ def _start_local_server(transport: str, host: str, port: int, path: str) -> str:
 
 def _parse_local_server_url(server_url: str) -> tuple[str, int, str]:
     parsed = urlparse(server_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port is None:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.port is None
+    ):
         raise ValueError(f"Invalid browser runtime server URL: {server_url}")
     return parsed.hostname, int(parsed.port), parsed.path or "/mcp"
 
@@ -417,7 +435,9 @@ def stop_local_browser_runtime_server() -> None:
 
 
 def restart_local_browser_runtime_server() -> str | None:
-    transport = _normalize_client_type(os.getenv("BROWSER_RUNTIME_MCP_CLIENT_TYPE") or "streamable-http")
+    transport = _normalize_client_type(
+        os.getenv("BROWSER_RUNTIME_MCP_CLIENT_TYPE") or "streamable-http"
+    )
     current_url = _BROWSER_RUNTIME_SERVER_URL
     current_proc = _BROWSER_RUNTIME_PROCESS
 
@@ -431,7 +451,9 @@ def restart_local_browser_runtime_server() -> str | None:
     if current_url:
         host, preferred_port, path = _parse_local_server_url(current_url)
 
-    had_local_server = current_url is not None or (current_proc is not None and current_proc.poll() is None)
+    had_local_server = current_url is not None or (
+        current_proc is not None and current_proc.poll() is None
+    )
     stop_local_browser_runtime_server()
 
     if not had_local_server:
@@ -469,7 +491,9 @@ def _ensure_local_server_started(transport: str) -> str:
     return _start_local_server(normalized, host, port, path)
 
 
-def _build_sse_fallback_config(base_cfg: McpServerConfig, server_url: str | None = None) -> McpServerConfig:
+def _build_sse_fallback_config(
+    base_cfg: McpServerConfig, server_url: str | None = None
+) -> McpServerConfig:
     return McpServerConfig(
         server_id=f"{base_cfg.server_id}_sse",
         server_name=base_cfg.server_name,
@@ -478,7 +502,9 @@ def _build_sse_fallback_config(base_cfg: McpServerConfig, server_url: str | None
     )
 
 
-def _build_sse_retry_config(base_cfg: McpServerConfig, server_url: str) -> McpServerConfig:
+def _build_sse_retry_config(
+    base_cfg: McpServerConfig, server_url: str
+) -> McpServerConfig:
     return McpServerConfig(
         server_id=base_cfg.server_id,
         server_name=base_cfg.server_name,
@@ -487,7 +513,9 @@ def _build_sse_retry_config(base_cfg: McpServerConfig, server_url: str) -> McpSe
     )
 
 
-def _build_streamable_http_config(base_cfg: McpServerConfig, server_url: str | None = None) -> McpServerConfig:
+def _build_streamable_http_config(
+    base_cfg: McpServerConfig, server_url: str | None = None
+) -> McpServerConfig:
     return McpServerConfig(
         server_id=base_cfg.server_id,
         server_name=base_cfg.server_name,
@@ -538,9 +566,15 @@ def build_browser_runtime_mcp_config() -> McpServerConfig | None:
     if not _env_bool("BROWSER_RUNTIME_MCP_ENABLED", default=False):
         return None
 
-    server_id = (os.getenv("BROWSER_RUNTIME_MCP_SERVER_ID") or _BROWSER_MCP_DEFAULT_ID).strip()
-    server_name = (os.getenv("BROWSER_RUNTIME_MCP_SERVER_NAME") or _BROWSER_MCP_DEFAULT_NAME).strip()
-    client_type = _normalize_client_type(os.getenv("BROWSER_RUNTIME_MCP_CLIENT_TYPE") or "streamable-http")
+    server_id = (
+        os.getenv("BROWSER_RUNTIME_MCP_SERVER_ID") or _BROWSER_MCP_DEFAULT_ID
+    ).strip()
+    server_name = (
+        os.getenv("BROWSER_RUNTIME_MCP_SERVER_NAME") or _BROWSER_MCP_DEFAULT_NAME
+    ).strip()
+    client_type = _normalize_client_type(
+        os.getenv("BROWSER_RUNTIME_MCP_CLIENT_TYPE") or "streamable-http"
+    )
 
     if client_type not in _SUPPORTED_CLIENT_TYPES:
         raise ValueError(
@@ -548,7 +582,9 @@ def build_browser_runtime_mcp_config() -> McpServerConfig | None:
         )
 
     if client_type == "sse":
-        server_path = (os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH") or _build_server_url("sse")).strip()
+        server_path = (
+            os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH") or _build_server_url("sse")
+        ).strip()
         return McpServerConfig(
             server_id=server_id,
             server_name=server_name,
@@ -557,7 +593,10 @@ def build_browser_runtime_mcp_config() -> McpServerConfig | None:
         )
 
     if client_type == "streamable-http":
-        server_path = (os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH") or _build_server_url("streamable-http")).strip()
+        server_path = (
+            os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH")
+            or _build_server_url("streamable-http")
+        ).strip()
         return McpServerConfig(
             server_id=server_id,
             server_name=server_name,
@@ -568,14 +607,23 @@ def build_browser_runtime_mcp_config() -> McpServerConfig | None:
     # stdio mode: auto-spawn browser runtime MCP server process.
     server_script = _browser_move_server_script()
     if not server_script.exists():
-        raise FileNotFoundError(f"browser runtime server script not found: {server_script}")
+        raise FileNotFoundError(
+            f"browser runtime server script not found: {server_script}"
+        )
 
     command = (os.getenv("BROWSER_RUNTIME_MCP_COMMAND") or sys.executable).strip()
     args_raw = os.getenv("BROWSER_RUNTIME_MCP_ARGS", "")
     if args_raw.strip():
         args = _parse_args(args_raw)
     else:
-        args = [str(server_script), "--transport", "stdio", "--no-banner", "--log-level", "ERROR"]
+        args = [
+            str(server_script),
+            "--transport",
+            "stdio",
+            "--no-banner",
+            "--log-level",
+            "ERROR",
+        ]
 
     params: dict[str, Any] = {
         "command": command,
@@ -597,13 +645,18 @@ def build_browser_runtime_mcp_config() -> McpServerConfig | None:
     return McpServerConfig(
         server_id=server_id,
         server_name=server_name,
-        server_path=(os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH") or "stdio://playwright-runtime-wrapper").strip(),
+        server_path=(
+            os.getenv("BROWSER_RUNTIME_MCP_SERVER_PATH")
+            or "stdio://playwright-runtime-wrapper"
+        ).strip(),
         client_type="stdio",
         params=params,
     )
 
 
-async def register_browser_runtime_mcp_server(agent: Any, *, tag: str = "agent.main") -> bool:
+async def register_browser_runtime_mcp_server(
+    agent: Any, *, tag: str = "agent.main"
+) -> bool:
     """Register browser runtime MCP server and add to agent abilities."""
     _ensure_browser_move_client_patch()
     cfg = build_browser_runtime_mcp_config()
