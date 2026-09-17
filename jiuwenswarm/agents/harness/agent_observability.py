@@ -202,6 +202,19 @@ def open_agent_run_span(
     *, session_id: str = "", request_id: str = "", channel_id: str = "", mode: str = ""
 ) -> _LegacyRunSpanHandle | None:
     """Open a run root for the retained dev-stable telemetry integration."""
+    try:
+        return _open_legacy_agent_run_span(
+            session_id=session_id, request_id=request_id, channel_id=channel_id, mode=mode
+        )
+    except Exception as exc:
+        logger.warning("[AgentObservability] open root span failed: %s", exc)
+        return None
+
+
+def _open_legacy_agent_run_span(
+    *, session_id: str, request_id: str, channel_id: str, mode: str
+) -> _LegacyRunSpanHandle | None:
+    """Build the legacy run span; clean up a started span on failure."""
     from opentelemetry.trace import SpanKind
 
     from openjiuwen.agent_teams.observability.span_context import set_team_span
@@ -246,60 +259,128 @@ def open_agent_run_span(
         else "agent.run"
     )
     span = tracer.start_span(name=name, kind=SpanKind.SERVER)
+    binding = None
     try:
-        identity = IdentityStore.get_identity()
-    except Exception:
-        identity = None
-    attributes = {
-        LANGFUSE_SESSION_ID: session_id or "",
-        GEN_AI_CONVERSATION_ID: session_id or "",
-        JIUWENCLAW_SESSION_ID: session_id or "",
-        JIUWENCLAW_REQUEST_ID: request_id or "",
-        JIUWENCLAW_CHANNEL_ID: channel_id or "",
-        "jiuwenswarm.mode": mode or "",
-    }
-    for primary, alias, value in (
-        (USER_ID, JIUWENCLAW_USER_ID, getattr(identity, "user_id", None)),
-        (DOMAIN_ID, JIUWENCLAW_DOMAIN_ID, getattr(identity, "domain_id", None)),
-        (APP_ID, JIUWENCLAW_APP_ID, getattr(identity, "app_id", None)),
-    ):
-        if value not in (None, ""):
-            attributes[primary] = value
-            attributes[alias] = value
-    for key, value in attributes.items():
-        span.set_attribute(key, value)
-    set_team_span(span, team_name="single-agent")
-    set_root_span(span, session_id=session_id)
-    set_current_session_id(session_id)
-    binding = runtime.trace_bindings.bind(session_id, request_id, span)
-    if unified and runtime.span_registry is not None:
-        runtime.span_registry.bind_trace_attributes(span.get_span_context().trace_id, attributes)
-    return _LegacyRunSpanHandle(span, binding, runtime.trace_bindings)
+        try:
+            identity = IdentityStore.get_identity()
+        except Exception:
+            identity = None
+        attributes = {
+            LANGFUSE_SESSION_ID: session_id or "",
+            GEN_AI_CONVERSATION_ID: session_id or "",
+            JIUWENCLAW_SESSION_ID: session_id or "",
+            JIUWENCLAW_REQUEST_ID: request_id or "",
+            JIUWENCLAW_CHANNEL_ID: channel_id or "",
+            "jiuwenswarm.mode": mode or "",
+        }
+        for primary, alias, value in (
+            (USER_ID, JIUWENCLAW_USER_ID, getattr(identity, "user_id", None)),
+            (DOMAIN_ID, JIUWENCLAW_DOMAIN_ID, getattr(identity, "domain_id", None)),
+            (APP_ID, JIUWENCLAW_APP_ID, getattr(identity, "app_id", None)),
+        ):
+            if value not in (None, ""):
+                attributes[primary] = value
+                attributes[alias] = value
+        for key, value in attributes.items():
+            try:
+                span.set_attribute(key, value)
+            except (TypeError, ValueError) as exc:
+                logger.debug("[AgentObservability] root attribute rejected: key=%s error=%s", key, exc)
+        set_team_span(span, team_name="single-agent")
+        set_root_span(span, session_id=session_id)
+        set_current_session_id(session_id)
+        try:
+            binding = runtime.trace_bindings.bind(session_id, request_id, span)
+        except Exception as exc:
+            logger.warning("[AgentObservability] root binding failed: %s", exc)
+        if unified and runtime.span_registry is not None:
+            try:
+                runtime.span_registry.bind_trace_attributes(span.get_span_context().trace_id, attributes)
+            except Exception as exc:
+                logger.debug("[AgentObservability] trace attribute binding failed: %s", exc)
+        return _LegacyRunSpanHandle(span, binding, runtime.trace_bindings)
+    except Exception as exc:
+        if binding is not None:
+            try:
+                runtime.trace_bindings.remove(binding)
+            except Exception as cleanup_error:
+                logger.debug("[AgentObservability] root binding cleanup failed: %s", cleanup_error)
+        try:
+            from openjiuwen.agent_teams.observability.span_context import clear_team_span, get_team_span
+
+            if get_team_span() is span:
+                clear_team_span()
+        except Exception as cleanup_error:
+            logger.debug("[AgentObservability] team span cleanup failed: %s", cleanup_error)
+        try:
+            from openjiuwen.extensions.observability.span_context import clear_root_span, clear_current_session_id
+
+            clear_root_span(session_id=session_id, expected_span=span)
+            clear_current_session_id()
+        except Exception as cleanup_error:
+            logger.debug("[AgentObservability] root context cleanup failed: %s", cleanup_error)
+        try:
+            span.end()
+        except Exception as cleanup_error:
+            logger.debug("[AgentObservability] failed root span end failed: %s", cleanup_error)
+        logger.warning("[AgentObservability] open root span failed: %s", exc)
+        return None
 
 
 def close_agent_run_span(handle: Any, *, session_id: str = "") -> None:
-    """Close only the legacy root owned by this handle."""
-    if handle is None or not handle.claim_close():
+    """End a legacy root handle or a raw span without disrupting the caller."""
+    if handle is None:
         return
-    from openjiuwen.agent_teams.observability.span_context import (
-        cascade_close_children,
-        clear_team_span,
-        flush_child_spans,
-        get_team_span,
-    )
-    from openjiuwen.extensions.observability.span_context import (
-        clear_current_session_id,
-        clear_root_span,
-    )
+    if isinstance(handle, _LegacyRunSpanHandle) and not handle.claim_close():
+        return
+    root_span = handle.root_span if isinstance(handle, _LegacyRunSpanHandle) else handle
+    if isinstance(handle, _LegacyRunSpanHandle) and handle.binding is not None:
+        try:
+            handle.trace_bindings.remove(handle.binding)
+        except Exception as exc:
+            logger.debug("[AgentObservability] trace binding remove failed: %s", exc)
+    try:
+        from openjiuwen.agent_teams.observability.span_context import (
+            cascade_close_children,
+            clear_team_span,
+            flush_child_spans,
+            get_team_span,
+        )
+    except Exception as exc:
+        logger.warning("[AgentObservability] close helpers unavailable: %s", exc)
+        try:
+            root_span.end()
+        except Exception as end_error:
+            logger.debug("[AgentObservability] fallback root span end failed: %s", end_error)
+        return
 
-    handle.trace_bindings.remove(handle.binding)
-    root_span = handle.root_span
-    owns_context = get_team_span() is root_span
+    try:
+        owns_context = get_team_span() is root_span
+    except Exception as exc:
+        logger.debug("[AgentObservability] current root lookup failed: %s", exc)
+        owns_context = False
     if owns_context:
-        cascade_close_children()
-    flush_child_spans(trace_id=root_span.get_span_context().trace_id)
-    root_span.end()
+        try:
+            cascade_close_children()
+        except Exception as exc:
+            logger.debug("[AgentObservability] cascade_close_children failed: %s", exc)
+    try:
+        flush_child_spans(trace_id=root_span.get_span_context().trace_id)
+    except Exception as exc:
+        logger.debug("[AgentObservability] flush_child_spans failed: %s", exc)
+    try:
+        root_span.end()
+    except Exception as exc:
+        logger.debug("[AgentObservability] end root span failed: %s", exc)
     if owns_context:
-        clear_team_span()
-    clear_root_span(session_id=session_id, expected_span=root_span)
-    clear_current_session_id()
+        try:
+            clear_team_span()
+        except Exception as exc:
+            logger.debug("[AgentObservability] clear team span failed: %s", exc)
+    try:
+        from openjiuwen.extensions.observability.span_context import clear_root_span, clear_current_session_id
+
+        clear_root_span(session_id=session_id, expected_span=root_span)
+        clear_current_session_id()
+    except Exception as exc:
+        logger.debug("[AgentObservability] clear root context failed: %s", exc)
