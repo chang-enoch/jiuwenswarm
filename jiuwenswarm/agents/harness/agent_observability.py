@@ -25,6 +25,9 @@ Shared-provider caveat (important):
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Any
 
 from openjiuwen.harness.observability import (
     acquire_observability,
@@ -166,3 +169,137 @@ def shutdown_agent_observability() -> None:
         logger.info("[AgentObservability] disabled")
     except Exception as exc:
         logger.warning("[AgentObservability] shutdown failed: %s", exc)
+
+
+# The dev-stable telemetry integration still exposes this legacy run-root API.
+# New Trace paths import open/close_agent_run_span from the AgentCore SDK instead.
+def _get_unified_runtime() -> Any:
+    from jiuwenswarm.telemetry import get_telemetry_runtime
+
+    return get_telemetry_runtime()
+
+
+@dataclass
+class _LegacyRunSpanHandle:
+    root_span: Any
+    binding: Any
+    trace_bindings: Any
+    _lock: Lock = field(default_factory=Lock, repr=False)
+    _closed: bool = False
+
+    def get_span_context(self) -> Any:
+        return self.root_span.get_span_context()
+
+    def claim_close(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+            return True
+
+
+def open_agent_run_span(
+    *, session_id: str = "", request_id: str = "", channel_id: str = "", mode: str = ""
+) -> _LegacyRunSpanHandle | None:
+    """Open a run root for the retained dev-stable telemetry integration."""
+    from opentelemetry.trace import SpanKind
+
+    from openjiuwen.agent_teams.observability.span_context import set_team_span
+    from openjiuwen.extensions.observability.setup import get_tracer, is_initialized
+    from openjiuwen.extensions.observability.semconv import LANGFUSE_SESSION_ID
+    from openjiuwen.extensions.observability.span_context import (
+        set_current_session_id,
+        set_root_span,
+    )
+
+    from jiuwenswarm.extensions.identity_provider import IdentityStore
+    from jiuwenswarm.telemetry.attributes import (
+        APP_ID,
+        DOMAIN_ID,
+        GEN_AI_CONVERSATION_ID,
+        JIUWENCLAW_APP_ID,
+        JIUWENCLAW_CHANNEL_ID,
+        JIUWENCLAW_DOMAIN_ID,
+        JIUWENCLAW_REQUEST_ID,
+        JIUWENCLAW_SESSION_ID,
+        JIUWENCLAW_USER_ID,
+        USER_ID,
+    )
+
+    runtime = _get_unified_runtime()
+    unified = bool(runtime.is_unified_active())
+    if unified:
+        if runtime.tracer_provider is None:
+            return None
+        tracer = runtime.tracer_provider.get_tracer("jiuwenswarm.agent")
+    else:
+        if not is_initialized() or not _agent_observability_active:
+            return None
+        tracer = get_tracer("jiuwenswarm.agent")
+    normalized_mode = (mode or "").strip()
+    normalized_session = (session_id or "").strip()
+    name = (
+        f"agent.{normalized_mode}.{normalized_session}"
+        if normalized_mode and normalized_session
+        else f"agent.{normalized_mode}.run" if normalized_mode
+        else f"agent.run.{normalized_session}" if normalized_session
+        else "agent.run"
+    )
+    span = tracer.start_span(name=name, kind=SpanKind.SERVER)
+    try:
+        identity = IdentityStore.get_identity()
+    except Exception:
+        identity = None
+    attributes = {
+        LANGFUSE_SESSION_ID: session_id or "",
+        GEN_AI_CONVERSATION_ID: session_id or "",
+        JIUWENCLAW_SESSION_ID: session_id or "",
+        JIUWENCLAW_REQUEST_ID: request_id or "",
+        JIUWENCLAW_CHANNEL_ID: channel_id or "",
+        "jiuwenswarm.mode": mode or "",
+    }
+    for primary, alias, value in (
+        (USER_ID, JIUWENCLAW_USER_ID, getattr(identity, "user_id", None)),
+        (DOMAIN_ID, JIUWENCLAW_DOMAIN_ID, getattr(identity, "domain_id", None)),
+        (APP_ID, JIUWENCLAW_APP_ID, getattr(identity, "app_id", None)),
+    ):
+        if value not in (None, ""):
+            attributes[primary] = value
+            attributes[alias] = value
+    for key, value in attributes.items():
+        span.set_attribute(key, value)
+    set_team_span(span, team_name="single-agent")
+    set_root_span(span, session_id=session_id)
+    set_current_session_id(session_id)
+    binding = runtime.trace_bindings.bind(session_id, request_id, span)
+    if unified and runtime.span_registry is not None:
+        runtime.span_registry.bind_trace_attributes(span.get_span_context().trace_id, attributes)
+    return _LegacyRunSpanHandle(span, binding, runtime.trace_bindings)
+
+
+def close_agent_run_span(handle: Any, *, session_id: str = "") -> None:
+    """Close only the legacy root owned by this handle."""
+    if handle is None or not handle.claim_close():
+        return
+    from openjiuwen.agent_teams.observability.span_context import (
+        cascade_close_children,
+        clear_team_span,
+        flush_child_spans,
+        get_team_span,
+    )
+    from openjiuwen.extensions.observability.span_context import (
+        clear_current_session_id,
+        clear_root_span,
+    )
+
+    handle.trace_bindings.remove(handle.binding)
+    root_span = handle.root_span
+    owns_context = get_team_span() is root_span
+    if owns_context:
+        cascade_close_children()
+    flush_child_spans(trace_id=root_span.get_span_context().trace_id)
+    root_span.end()
+    if owns_context:
+        clear_team_span()
+    clear_root_span(session_id=session_id, expected_span=root_span)
+    clear_current_session_id()
