@@ -789,3 +789,38 @@ def test_metadata_legacy_session_defaults_expert_type_agent(sessions_dir: Path) 
         json.dumps({"session_id": "legacy2", "title": "旧会话"}), encoding="utf-8"
     )
     assert sm.get_session_metadata("legacy2", cache_bust=True)["expert_type"] == "agent"
+
+
+# ---------------------------------------------------------------------------
+# get_expert_source 工厂：本地专家包目录源默认启用
+# ---------------------------------------------------------------------------
+
+
+def _source_chain_types(monkeypatch: pytest.MonkeyPatch, local_dirs_env):
+    """按 env 重置源工厂，返回链中各源类型；结束复位工厂缓存，避免泄漏到其他用例。"""
+    es.reset_expert_source()
+    try:
+        if local_dirs_env is None:
+            monkeypatch.delenv("JIUWEN_EXPERT_LOCAL_DIRS", raising=False)
+        else:
+            monkeypatch.setenv("JIUWEN_EXPERT_LOCAL_DIRS", local_dirs_env)
+        src = es.get_expert_source()
+        sources = getattr(src, "_sources", [src])
+        return [type(s) for s in sources]
+    finally:
+        es.reset_expert_source()
+
+
+def test_get_expert_source_enables_local_dir_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """未设 env 时默认启用本地专家包目录源（小艺Work/CLI 均可召唤本地创建的专家）。"""
+    assert es.LocalDirExpertPackageSource in _source_chain_types(monkeypatch, None)
+
+
+def test_get_expert_source_local_dir_enabled_by_env_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """env 显式设 1 时启用本地源。"""
+    assert es.LocalDirExpertPackageSource in _source_chain_types(monkeypatch, "1")
+
+
+def test_get_expert_source_local_dir_disabled_by_env_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """env 显式设 0 时关闭本地源（保留可关性）。"""
+    assert es.LocalDirExpertPackageSource not in _source_chain_types(monkeypatch, "0")
