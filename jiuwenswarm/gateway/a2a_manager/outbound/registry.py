@@ -204,40 +204,40 @@ class A2AOutboundRegistry:
             )
             return created.public_dict()
 
-    async def list_agents(self) -> dict[str, Any]:
+    async def list_agents(self, *, source_user_id: str | None = None) -> dict[str, Any]:
         list_projected = getattr(self._repository, "list_projected_agents", None)
         if callable(list_projected):
-            projected = await list_projected()
+            projected = await list_projected(source_user_id=source_user_id)
             items = [item.public_dict() for item in projected]
             return {"items": items, "total": len(items)}
         items = [item.public_dict() for item in await self._repository.list_agents()]
         return {"items": items, "total": len(items)}
 
-    async def get_agent(self, agent_id: str) -> dict[str, Any]:
+    async def get_agent(self, agent_id: str, *, source_user_id: str | None = None) -> dict[str, Any]:
         get_projected = getattr(self._repository, "get_projected_agent", None)
         if callable(get_projected):
-            projected = await get_projected(agent_id)
+            projected = await get_projected(agent_id, source_user_id=source_user_id)
             if projected is None:
                 raise A2AOutboundError(A2AOutboundErrorCode.AGENT_NOT_REGISTERED)
             return projected.public_dict()
         return (await self._require_agent(agent_id)).public_dict()
 
     async def set_user_enabled(
-        self, agent_id: str, user_enabled: bool
+        self, agent_id: str, user_enabled: bool, *, source_user_id: str | None = None
     ) -> dict[str, Any]:
         setter = getattr(self._repository, "set_user_enabled", None)
         if not callable(setter):
             raise A2AOutboundError(A2AOutboundErrorCode.STORE_INVALID)
-        projected = await setter(agent_id, user_enabled)
+        projected = await setter(agent_id, user_enabled, source_user_id=source_user_id)
         return projected.public_dict()
 
     async def resolve_effective_a2a_agent_ids(
-        self, resource_id: str
+        self, resource_id: str, *, source_user_id: str | None = None
     ) -> frozenset[str] | None:
         resolver = getattr(self._repository, "resolve_effective_a2a_agent_ids", None)
         if not callable(resolver):
             return None
-        return await resolver(resource_id)
+        return await resolver(resource_id, source_user_id=source_user_id)
 
     async def resolve_authorized_a2a_agent_ids(
         self, resource_id: str
