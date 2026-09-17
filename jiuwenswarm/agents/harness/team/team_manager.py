@@ -1829,7 +1829,8 @@ class TeamManager:
             logger.info("[TeamManager] all teams cleaned")
 
     def get_team_agent(self, session_id: str) -> TeamAgent | None:
-        return self._team_agents.get(session_id)
+        """Return the live Team leader for either supported runtime path."""
+        return self._team_agents.get(session_id) or self._runner_team_agents.get(session_id)
 
     def get_monitor_handler(self, session_id: str) -> TeamMonitorHandler | None:
         return self._team_monitors.get(session_id)
