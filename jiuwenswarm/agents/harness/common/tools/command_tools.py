@@ -172,12 +172,15 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "blocked pattern: xargs kill pipeline targeting jiuwenswarm",
     ),
     (
-        re.compile(r"Get-Process[\s\S]{0,400}Stop-Process", re.IGNORECASE),
-        "blocked pattern: Get-Process | Stop-Process (kills agent/host python)",
+        re.compile(
+            r"(?:Get-Process[\s\S]{0,400}Stop-Process|Stop-Process[\s\S]{0,400}Get-Process)",
+            re.IGNORECASE,
+        ),
+        "blocked pattern: Get-Process combined with Stop-Process",
     ),
     (
         re.compile(
-            r"\bStop-Process\b[\s\S]{0,200}-Name\s+['\"]?(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?"
+            r"\bStop-Process\b[\s\S]{0,200}-Name\s+['\"]?(?:pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?"
             r"|node(?:\.exe)?|jiuwenswarm|jiuwenclaw)\b",
             re.IGNORECASE,
         ),
@@ -185,7 +188,7 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\btaskkill\b[\s\S]*?/{1,2}im\b[\s\S]*?\b(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?"
+            r"\btaskkill\b[\s\S]*?/{1,2}im\b[\s\S]*?\b(?:pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?"
             r"|node(?:\.exe)?|jiuwenswarm|jiuwenclaw)\b",
             re.IGNORECASE,
         ),
@@ -193,7 +196,7 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\b(?:pkill|killall)\b[^\n\r;|&]*\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?\b",
+            r"\b(?:pkill|killall)\b[^\n\r;|&]*\bpythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?\b",
             re.IGNORECASE,
         ),
         "blocked pattern: pkill/killall targeting python runtime",
@@ -306,7 +309,7 @@ _TASKKILL_PID_RE = re.compile(
     re.IGNORECASE,
 )
 _STOP_PROCESS_ID_RE = re.compile(
-    r"\bStop-Process\b[\s\S]{0,300}-Id\s+(\d+)",
+    r"\bStop-Process\b[\s\S]{0,300}-Id\s*\(?([\d\s,]+)\)?",
     re.IGNORECASE,
 )
 
@@ -328,8 +331,9 @@ def _check_self_pid_kill(command: str) -> str | None:
         if match.group(1) in protected:
             return "blocked pattern: taskkill targeting current agent/host process"
     for match in _STOP_PROCESS_ID_RE.finditer(command):
-        if match.group(1) in protected:
-            return "blocked pattern: Stop-Process targeting current agent/host process"
+        for pid in re.findall(r"\d+", match.group(1)):
+            if pid in protected:
+                return "blocked pattern: Stop-Process targeting current agent/host process"
     return None
 
 
