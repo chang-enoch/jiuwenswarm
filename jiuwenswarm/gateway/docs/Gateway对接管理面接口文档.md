@@ -1,6 +1,8 @@
 # Gateway对接管理面接口文档
 
 > 范围：Manager（`applications/manager`）通过 HTTP 调用 Gateway **Config Receiver**（`jiuwenswarm/.../manager_config_receiver`）的全部接口。  
+> **本文不是**浏览器 / 前端使用的 Web HTTP（默认端口 **19002**，见 [Gateway Http接口文档.md](../../../docs/zh/Gateway%20Http接口文档.md)）。
+
 
 ---
 
@@ -10,11 +12,25 @@
 | 项           | 说明                                                                  |
 | ----------- | ------------------------------------------------------------------- |
 | Gateway 模块  | `packages/jiuwenclaw-ee/gateway/extensions/manager_config_receiver` |
-| Base URL    | 实例的 `gateway_config_host`（如 `http://gateway:8080`）                  |
+| 默认端口        | `GATEWAY_CONFIG_HTTP_PORT`，缺省 **8775**；企业部署 NodePort 暴露的是 **config-http**（非 Web HTTP） |
+| Base URL    | 实例的 `gateway_config_host`（如 `http://gateway:8775`；部署可覆盖 host/port） |
 | 路径前缀        | `/api/v1`                                                           |
+| 响应信封        | `{ "code": 200, "message": "success", "data": ... }`（**不是** Web HTTP 的 `{ request_id, ok, data }`） |
+| 交互 / OpenAPI | Receiver 侧 `/docs`、`/openapi.json`（勿与 Web HTTP `/doc` 混淆） |
 | Manager 客户端 | `manager_server.manager_config_push.client.gateway_request`         |
 | 探活客户端       | `manager_server.core.instance.config_host_probe`（直连 GET）            |
 
+
+**与 Web HTTP 对照**
+
+| 维度 | 本文：Config Receiver | Web HTTP（浏览器 / 前端） |
+|------|----------------------|-------------------------|
+| 用途 | Manager → Gateway 配置下发 / 模板写读 | 会话、聊天、运行时配置查询等 |
+| 默认端口 | **8775**（`GATEWAY_CONFIG_HTTP_PORT`） | **19002**（`GATEWAY_WEB_HTTP_PORT` / `WEB_PORT+2`） |
+| Base | `gateway_config_host` | `http://{host}:19002/api/v1` |
+| 信封 | `{ code, message, data }` | `{ request_id, ok, data\|error, metadata }` |
+| 流式 | 无 SSE 会话流 | 流式仅 SSE |
+| 身份 | HTTP 层无 Web 租户头模型；依赖内网 / TLS（见 §16.7） | 企业推荐 `X-User-Id` / `X-Group-Id` / `X-Bot-Id` 等 |
 
 **交互原则**
 
