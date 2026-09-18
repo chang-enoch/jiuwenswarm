@@ -62,6 +62,7 @@ from jiuwenswarm.common.config import (
     update_swarmflow_enabled_in_config,
     update_updater_in_config,
     update_proactive_recommendation_in_config,
+    update_trajectory_ui_in_config,
 )
 from jiuwenswarm.edition import is_enterprise
 from jiuwenswarm.common.request_identity import (
@@ -208,7 +209,7 @@ class _ConfigChangeSet:
                 scopes.add("proactive")
             elif key_text.startswith("symphony") or key_text.startswith("skill_retrieval"):
                 scopes.add("agent_runtime")
-            elif key_text.startswith("a2ui_") or key_text == "setup_guide_enabled":
+            elif key_text.startswith("a2ui_") or key_text in {"setup_guide_enabled", "trajectory_ui_enabled"}:
                 scopes.add("web_ui")
             else:
                 scopes.add("agent_runtime")
@@ -911,6 +912,7 @@ _CONFIG_YAML_KEYS = frozenset({
     "memory_forbidden_enabled",
     "memory_forbidden_description",
     "a2ui_enabled",
+    "trajectory_ui_enabled",
     "proactive_recommendation_enabled",
     "proactive_recommendation_max_recommend_per_day",
     "proactive_recommendation_max_rounds_per_tick",
@@ -2505,6 +2507,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                     await update_permissions_enabled_in_config(parsed)
                 elif param_key == "setup_guide_enabled":
                     update_setup_guide_enabled_in_config(parsed)
+                elif param_key == "trajectory_ui_enabled":
+                    update_trajectory_ui_in_config(parsed)
                 elif param_key == "memory_forbidden_enabled":
                     await update_memory_forbidden_enabled_in_config(parsed)
                 elif param_key == "memory_forbidden_description":

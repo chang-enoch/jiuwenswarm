@@ -1153,6 +1153,12 @@ function AppContent() {
       'config.set',
       updates
     );
+    if ('trajectory_ui_enabled' in updates) {
+      if (!payload?.updated?.includes('trajectory_ui_enabled')) {
+        throw new Error(t('config.errors.trajectoryUiUnsupported'));
+      }
+      setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(updates.trajectory_ui_enabled));
+    }
     setServerConfig((prev) => {
       if (!prev) return updates;
       const next: Record<string, unknown> = { ...prev, ...updates };
@@ -1188,7 +1194,7 @@ function AppContent() {
         }, 5000);
       }
     }
-  }, [clearRestartAutoCloseTimer, closeRestartModal, request]);
+  }, [clearRestartAutoCloseTimer, closeRestartModal, request, t]);
 
   const savePermissionSilent = useCallback(async (updates: Record<string, string>) => {
     try {
@@ -1284,6 +1290,12 @@ function AppContent() {
       'config.save_all',
       payload as unknown as Record<string, unknown>
     );
+    if (payload.config && 'trajectory_ui_enabled' in payload.config) {
+      if (!result?.updated?.includes('trajectory_ui_enabled')) {
+        throw new Error(t('config.errors.trajectoryUiUnsupported'));
+      }
+      setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(payload.config.trajectory_ui_enabled));
+    }
     setServerConfig((prev) => {
       const next: Record<string, unknown> = { ...(prev ?? {}) };
       if (payload.config) {
@@ -1325,7 +1337,7 @@ function AppContent() {
     } else {
       applyConfigSaveUiState(result?.applied_without_restart === true);
     }
-  }, [applyConfigSaveUiState, buildAgentsTeamsFlatConfig, i18n.language, request]);
+  }, [applyConfigSaveUiState, buildAgentsTeamsFlatConfig, i18n.language, request, t]);
 
   useEffect(() => {
     if (!restartModalOpen || restartSuccess) {
