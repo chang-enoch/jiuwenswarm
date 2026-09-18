@@ -550,6 +550,18 @@ def _safe_query_preview(query: Any, limit: int = DEFAULT_PREVIEW_MAX_CHARS) -> s
     return preview_text(query, limit)
 
 
+def _note_team_permission_resume_landing(query: Any, landed: bool) -> None:
+    """Record whether a Team InteractiveInput resume reached the runtime."""
+    from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+    from jiuwenswarm.server.runtime.session.permission_response_ledger import (
+        mark_team_permission_resume_landed,
+    )
+
+    if not isinstance(query, InteractiveInput):
+        return
+    mark_team_permission_resume_landed(bool(landed))
+
+
 # Parsed event types that carry text produced by a model, as opposed to the
 # framework control events (team.runtime_ready, tool.use, ...) that also travel
 # on the same stream.
@@ -1825,6 +1837,7 @@ async def process_team_message_stream(
             query=query,
         )
         if preparation.error_chunks is not None:
+            _note_team_permission_resume_landing(query, False)
             for chunk in preparation.error_chunks:
                 yield chunk
             return
@@ -2085,6 +2098,7 @@ async def process_team_message_stream(
                             query=query,
                         )
                         if preparation.error_chunks is not None:
+                            _note_team_permission_resume_landing(query, False)
                             for chunk in preparation.error_chunks:
                                 yield chunk
                             return
@@ -2107,6 +2121,7 @@ async def process_team_message_stream(
                     elif not success and _is_followup_delivery_boundary_reason(reason):
                         reason = reason or "gate_closed"
                     if not success and not is_first_request:
+                        _note_team_permission_resume_landing(query, False)
                         final_reason = reason or ""
                         # gate_closed 是 shutdown race（leader stream 正在收尾），静默结束流
                         if final_reason == "gate_closed":
@@ -2137,6 +2152,7 @@ async def process_team_message_stream(
                             is_complete=True,
                         )
                         return
+                _note_team_permission_resume_landing(query, bool(success))
 
             if not is_first_request:
                 if reuse_active_waiter:
