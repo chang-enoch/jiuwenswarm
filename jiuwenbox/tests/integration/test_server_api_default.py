@@ -3328,6 +3328,54 @@ class TestBwrapFilesystem:
         assert _has_mount(args, "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf")
         assert _has_arg_pair(args, "--remount-ro", "/etc")
 
+    @staticmethod
+    def test_parent_rw_overlay_does_not_hide_nested_workspace_bind():
+        """A later /home overlay must not cover /home/app/.jiuwenswarm/... .
+
+        process.py appends directory overlays after policy bind_mounts. If
+        to_args() emits them in list order, product-mode HOME=/home/app
+        writes land in the sandbox-private /home instead of the PVC.
+        """
+        policy = SecurityPolicy.model_validate({
+            "filesystem_policy": {
+                "bind_mounts": [
+                    {
+                        "host_path": (
+                            "/home/app/.jiuwenswarm/"
+                            "workspace_09f41d93d4bcdbefd8e0e7e13f4e63db"
+                        ),
+                        "sandbox_path": (
+                            "/home/app/.jiuwenswarm/"
+                            "workspace_09f41d93d4bcdbefd8e0e7e13f4e63db"
+                        ),
+                        "mode": "rw",
+                    },
+                    {
+                        "host_path": "/tmp/sandbox-home-overlay",
+                        "sandbox_path": "/home",
+                        "mode": "rw",
+                    },
+                ],
+            },
+        })
+
+        args = BwrapConfig.from_policy(policy, ["true"]).to_args()
+        args_again = BwrapConfig.from_policy(policy, ["true"]).to_args()
+
+        workspace = (
+            "/home/app/.jiuwenswarm/"
+            "workspace_09f41d93d4bcdbefd8e0e7e13f4e63db"
+        )
+        rw_binds = [
+            (args[index + 1], args[index + 2])
+            for index, value in enumerate(args[:-2])
+            if value == "--bind"
+        ]
+        home_pos = rw_binds.index(("/tmp/sandbox-home-overlay", "/home"))
+        workspace_pos = rw_binds.index((workspace, workspace))
+        assert home_pos < workspace_pos
+        assert args == args_again
+
 
 class TestNetworkUplink:
     @staticmethod
