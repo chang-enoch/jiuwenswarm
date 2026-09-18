@@ -41,7 +41,8 @@ from jiuwenswarm.common.schema.ask_user import (
 
 logger = logging.getLogger(__name__)
 
-MAX_STRUCTURED_QUESTIONS = 4
+# 上限 8：供再改改两轮卡一次发 5 题（不影响其它调用发更少题）。
+MAX_STRUCTURED_QUESTIONS = 8
 
 
 def _decode_questions_array(raw_questions: Any) -> tuple[Any, bool]:
