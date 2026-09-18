@@ -20,7 +20,10 @@ RUN uv pip install --system --break-system-packages \
 COPY docker/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
 
-RUN touch /etc/pip.conf && chmod 644 /etc/pip.conf
+RUN echo '[global]' > /etc/pip.conf && \
+    echo 'index-url = https://xxx/pypi/simple' >> /etc/pip.conf && \
+    echo 'trusted-host = xxx' >> /etc/pip.conf && \
+    chmod 644 /etc/pip.conf
 
 EXPOSE 8321
 EXPOSE 8322
