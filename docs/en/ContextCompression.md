@@ -246,9 +246,10 @@ Based on the actual data from the examples:
 
 Context compression is not a fixed preprocessing step, but an intelligent optimization dynamically triggered based on dialogue state:
 
-- **Based on Message Count**: Triggers when conversation rounds exceed `messages_threshold` (default 3)
-- **Based on Token Count**: Triggers when accumulated tokens exceed `tokens_threshold` (default 20,000)
-- **Configurable**: Users can adjust trigger thresholds as needed
+- **Based on Context Occupancy Ratio**: Triggers when the context (system prompt + tool definitions + messages) reaches the `trigger_context_ratio` fraction of the window capacity
+- **Based on Absolute Tokens**: When `trigger_token_threshold` is set, compression triggers once the context reaches that absolute token count (takes precedence over the ratio)
+- **Recent-Message Retention**: Each compressor keeps recent raw messages via `keep_recent_messages` for context continuity
+- **Configurable**: Users can adjust trigger thresholds as needed (see Section 6)
 
 ### 4.2 Intelligent Recognition and Compression
 
@@ -265,8 +266,8 @@ The system uses advanced natural language processing technology to:
 
 Context compression does not lose important information; the system:
 
-- **Preserves Recent Messages**: Retains a specified number of latest messages through `messages_to_keep` parameter
-- **Preserves Complete Rounds**: Enables `keep_last_round` to ensure the latest round of user-assistant dialogue is fully retained
+- **Preserves Recent Messages**: Retains a specified number of latest raw messages through `keep_recent_messages`
+- **Preserves Complete Rounds**: Compressors align boundaries to tool calls, avoiding splitting an in-progress tool-call round
 - **Identifies Key Content**: Automatically identifies and retains key information through semantic analysis
 
 ### 4.4 Retrieval Capability Preservation
@@ -298,20 +299,132 @@ Context compression technology is suitable for various scenarios requiring long 
 
 ## 6. Advanced Configuration
 
-The following is a typical configuration example for context compression:
+JiuwenSwarm's context compression is driven by openjiuwen's **forked (refactored) processors**, comprising 4 primary processors plus 1 optional loop-compaction processor. Configuration is passed through the `xxx_config` dictionaries under `react.context_engine_config`; the fields below match what the code actually honours.
+
+> ⚠️ Note: the legacy compressors used fields such as `tokens_threshold`, `compression_target_tokens`, `messages_to_keep`, and `first_pass_target_tokens`. These fields are **no longer effective** in the refactored version (they are silently ignored). Refer to this document and `config.yaml` for the effective fields.
+
+### 6.1 Complete Configuration Example (Effective Fields)
 
 ```yaml
-context_engine:
-  max_messages: 100        # Maximum number of messages
-  max_tokens: 100000      # Maximum number of tokens
-  compression:
-    enabled: true         # Enable context compression
-    messages_threshold: 3 # Message count trigger threshold
-    tokens_threshold: 20000 # Token count trigger threshold
-    large_message_threshold: 1000 # Large message definition
-    offload_message_type: ["tool"] # Only compress tool return results
-    messages_to_keep: 5   # Keep the last 5 messages
-    keep_last_round: true # Keep complete last round conversation
+context_engine_config:
+  # Global switches
+  enabled: true                    # Enable context compression (core switch)
+  enable_reload: true              # Enable reload
+  enable_openrouter_model_context_window_tokens: true # Resolve context window size per model
+
+  # 1. Message summary offloader - handles tool-call and other specific messages
+  message_summary_offloader_config:
+    add_message_threshold_ratio: 0.1   # Context occupancy ratio at which a new message is processed
+    ttl_seconds: 300                   # Idle seconds for TTL processing
+    ttl_context_occupancy_ratio: 0.5   # Context occupancy ratio above which TTL is eligible
+    ttl_message_threshold_ratio: 0.05  # Per-message ratio threshold for one TTL batch
+
+  # 2. Dialogue compressor - compresses the whole dialogue history
+  dialogue_compressor_config:
+    trigger_context_ratio: 0.8        # Trigger compression at this context occupancy ratio
+    min_target_context_ratio: 0.1     # Minimum fraction floor of the compressed content
+    trigger_token_threshold: 200000   # Optional: absolute token trigger (takes precedence over ratio)
+    target_retention_ratio: 0.3       # Optional: keep ~30% after compression
+
+  # 3. Current-round compressor - compresses the current dialogue round
+  current_round_compressor_config:
+    trigger_context_ratio: 0.8
+    min_target_context_ratio: 0.1
+    keep_recent_messages: 4           # Number of most-recent raw messages kept
+    trigger_token_threshold: 200000
+    target_retention_ratio: 0.3
+
+  # 4. Round-level compressor - advanced multi-round compression
+  round_level_compressor_config:
+    trigger_context_ratio: 0.8
+    min_target_context_ratio: 0.1
+    keep_recent_messages: 4
+    trigger_token_threshold: 200000
+    target_retention_ratio: 0.3
+
+  # 5. Reasoning/tool loop compaction (optional, disabled by default)
+  reasoning_tool_loop_compact_config:
+    enabled: false
 ```
+
+### 6.2 Parameter Reference
+
+#### Message Summary Offloader (`message_summary_offloader_config`)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `add_message_threshold_ratio` | Context occupancy ratio at which a newly added tool message is processed | 0.1 |
+| `ttl_seconds` | Idle seconds between context-window requests before TTL processing | 300 |
+| `ttl_context_occupancy_ratio` | Context occupancy ratio above which TTL processing is eligible | 0.5 |
+| `ttl_message_threshold_ratio` | Per-message ratio threshold for one TTL batch | 0.05 |
+
+#### Dialogue Compressor (`dialogue_compressor_config`)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `trigger_context_ratio` | Trigger ratio (used when `trigger_token_threshold` is unset) | 0.8 |
+| `min_target_context_ratio` | Minimum fraction floor of the compressed content | 0.1 |
+| `trigger_token_threshold` | Optional: absolute token trigger, takes precedence over `trigger_context_ratio` | unset |
+| `target_retention_ratio` | Optional: target retention ratio (summary ≈ compressed content tokens × ratio) | unset |
+
+#### Current-Round Compressor (`current_round_compressor_config`)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `trigger_context_ratio` | Trigger ratio (used when `trigger_token_threshold` is unset) | 0.8 |
+| `min_target_context_ratio` | Minimum fraction floor of the compressed content | 0.1 |
+| `keep_recent_messages` | Number of most-recent raw messages kept | 0 |
+| `trigger_token_threshold` | Optional: absolute token trigger, takes precedence over `trigger_context_ratio` | unset |
+| `target_retention_ratio` | Optional: target retention ratio | unset |
+
+#### Round-Level Compressor (`round_level_compressor_config`)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `trigger_context_ratio` | Trigger ratio (used when `trigger_token_threshold` is unset) | 0.8 |
+| `min_target_context_ratio` | Minimum fraction floor of the compressed content | 0.1 |
+| `keep_recent_messages` | Number of most-recent raw messages kept | 4 |
+| `trigger_token_threshold` | Optional: absolute token trigger, takes precedence over `trigger_context_ratio` | unset |
+| `target_retention_ratio` | Optional: target retention ratio | unset |
+
+#### Reasoning / Tool Loop Compaction (`reasoning_tool_loop_compact_config`)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `enabled` | Whether loop compaction is enabled | false |
+| `consecutive_threshold` | Consecutive identical reasoning + tool set rounds to trigger compaction | 3 |
+| `tool_args_consecutive_threshold` | Consecutive identical tool set + args rounds to trigger compaction | 5 |
+| `bailout_threshold` | Bail out after this many reasoning-rule compactions | 3 |
+| `tool_args_bailout_threshold` | Bail out after this many tool-args-rule compactions | 2 |
+
+### 6.3 Absolute-Token Trigger and Target Retention Ratio
+
+The three compressors (`dialogue_compressor_config`, `current_round_compressor_config`, `round_level_compressor_config`) support two optional parameters:
+
+- **`trigger_token_threshold`**: an absolute token trigger threshold. When set, compression only triggers once the context (system prompt + tool definitions + messages) reaches this many tokens, and it takes **precedence over** `trigger_context_ratio`. When omitted, compression falls back to the ratio-based trigger.
+- **`target_retention_ratio`**: a target retention ratio. When set, the compression summary aims for approximately `ratio × tokens(compressed content)` (e.g. `0.3` keeps ~30%), implemented by appending a length instruction to the compression prompt and setting a `max_tokens` cap. When omitted, no output-size control is applied (default behaviour).
+
+```yaml
+context_engine_config:
+  dialogue_compressor_config:
+    trigger_context_ratio: 0.8        # fallback ratio
+    trigger_token_threshold: 200000   # optional: compress only at 200k tokens
+    target_retention_ratio: 0.3       # optional: keep ~30% after compression
+  current_round_compressor_config:
+    trigger_token_threshold: 200000
+    target_retention_ratio: 0.3
+  round_level_compressor_config:
+    trigger_token_threshold: 200000
+    target_retention_ratio: 0.3
+```
+
+> Both parameters are optional and default to unset (`None`), so behaviour is identical to previous versions when they are omitted.
+
+### 6.4 Configuration Notes
+
+1. **Processors work independently**: each processor triggers on its own, with no interdependency.
+2. **Trigger strategy**: by default, compression triggers by context occupancy ratio; to trigger by a fixed absolute token count, set `trigger_token_threshold` (e.g. `200000`).
+3. **Required types**: `trigger_context_ratio` / `min_target_context_ratio` are decimals in `(0, 1)`; `target_retention_ratio`, when set, must also be a decimal in `(0, 1)`.
+4. **Multi-level compression**: `round_level_compressor_config` and `current_round_compressor_config` keep recent raw messages via `keep_recent_messages`, balancing compression benefit with context continuity.
 
 By configuring context compression parameters reasonably, users can obtain the best dialogue experience according to their usage scenarios and needs.
