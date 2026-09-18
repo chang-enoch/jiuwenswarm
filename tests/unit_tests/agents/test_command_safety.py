@@ -59,6 +59,7 @@ def test_blocks_get_process_python_stop_process_pipeline() -> None:
     )
     assert reason is not None
     assert "Get-Process" in reason
+    assert "Stop-Process" in reason
 
 
 def test_allows_get_process_python_query() -> None:
@@ -106,6 +107,49 @@ def test_blocks_taskkill_self_pid(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert reason is not None
     assert "taskkill" in reason
+
+
+def test_blocks_stop_process_inputobject_get_process_pipeline() -> None:
+    reason = _check_command_safety(
+        "Stop-Process -InputObject (Get-Process python) -Force"
+    )
+    assert reason is not None
+    assert "Get-Process" in reason
+
+
+def test_blocks_taskkill_im_pythonw() -> None:
+    reason = _check_command_safety("taskkill /F /IM pythonw.exe")
+    assert reason is not None
+    assert "taskkill /im" in reason
+
+
+def test_blocks_stop_process_self_pid_in_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jiuwenswarm.agents.harness.common.tools import command_tools
+
+    monkeypatch.setattr(command_tools.os, "getpid", lambda: 5678)
+    monkeypatch.setattr(command_tools.os, "getppid", lambda: 1)
+    reason = _check_command_safety("Stop-Process -Id 1234,5678 -Force")
+    assert reason is not None
+    assert "Stop-Process" in reason
+
+
+def test_blocks_stop_process_self_pid_in_parens(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jiuwenswarm.agents.harness.common.tools import command_tools
+
+    monkeypatch.setattr(command_tools.os, "getpid", lambda: 5678)
+    monkeypatch.setattr(command_tools.os, "getppid", lambda: 1)
+    reason = _check_command_safety("Stop-Process -Id (5678) -Force")
+    assert reason is not None
+    assert "Stop-Process" in reason
+
+
+def test_allows_stop_process_other_pid_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jiuwenswarm.agents.harness.common.tools import command_tools
+
+    monkeypatch.setattr(command_tools.os, "getpid", lambda: 100)
+    monkeypatch.setattr(command_tools.os, "getppid", lambda: 1)
+    assert _check_command_safety("Stop-Process -Id 1234,5678 -Force") is None
+    assert _check_command_safety("Stop-Process -Id (26448)") is None
 
 
 # ── jiuwenswarm-tui spawn 护栏 ────────────────────────────────
