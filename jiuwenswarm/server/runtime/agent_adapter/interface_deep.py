@@ -979,17 +979,33 @@ def _build_context_processor_rail(config: dict[str, Any]) -> ContextProcessorRai
         if isinstance(offloader_cfg, dict) and offloader_cfg:
             user_processors.append(("MessageSummaryOffloader", offloader_cfg))
 
+        auto_compression_cfg = context_engine_cfg.get("auto_compression")
+        if not isinstance(auto_compression_cfg, dict):
+            auto_compression_cfg = None
+
         compressor_cfg = context_engine_cfg.get("dialogue_compressor_config", {})
-        if isinstance(compressor_cfg, dict) and compressor_cfg:
-            user_processors.append(("DialogueCompressor", compressor_cfg))
+        if isinstance(compressor_cfg, dict) and (compressor_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "DialogueCompressor",
+                {**compressor_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else compressor_cfg,
+            ))
 
         current_round_cfg = context_engine_cfg.get("current_round_compressor_config", {})
-        if isinstance(current_round_cfg, dict) and current_round_cfg:
-            user_processors.append(("CurrentRoundCompressor", current_round_cfg))
+        if isinstance(current_round_cfg, dict) and (current_round_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "CurrentRoundCompressor",
+                {**current_round_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else current_round_cfg,
+            ))
 
         round_level_cfg = context_engine_cfg.get("round_level_compressor_config", {})
-        if isinstance(round_level_cfg, dict) and round_level_cfg:
-            user_processors.append(("RoundLevelCompressor", round_level_cfg))
+        if isinstance(round_level_cfg, dict) and (round_level_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "RoundLevelCompressor",
+                {**round_level_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else round_level_cfg,
+            ))
 
         reasoning_loop_cfg = context_engine_cfg.get("reasoning_tool_loop_compact_config", {})
         if isinstance(reasoning_loop_cfg, dict) and reasoning_loop_cfg:
