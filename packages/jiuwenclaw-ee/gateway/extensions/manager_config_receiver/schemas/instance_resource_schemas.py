@@ -5,7 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
-from ..core.enterprise_config.expressions import validate_match_expr
+from jiuwenswarm.gateway.config.enterprise.expressions import validate_match_expr
 
 
 def _validate_match_expr(value: Any) -> Any:
