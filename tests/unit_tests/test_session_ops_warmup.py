@@ -123,6 +123,20 @@ def test_history_tail_skips_the_in_flight_request():
     )
 
 
+def test_slice_history_after_fingerprint_returns_delta_or_none():
+    records = [
+        {"request_id": "pc-1", "role": "user"},
+        {"request_id": "phone-2", "role": "user"},
+        {"request_id": "current", "role": "user"},
+    ]
+    assert [
+        record["request_id"]
+        for record in session_ops_service._slice_history_after_fingerprint(records, "pc-1")
+    ] == ["phone-2", "current"]
+    assert session_ops_service._slice_history_after_fingerprint(records, "missing") is None
+    assert session_ops_service._slice_history_after_fingerprint(records, None) is None
+
+
 def _refresh_agent(context_engine):
     return SimpleNamespace(
         react_agent=SimpleNamespace(context_engine=context_engine, _config=None),
@@ -139,6 +153,23 @@ def _live_session():
     return session
 
 
+def _patch_refresh_history(monkeypatch, records, tail):
+    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
+    monkeypatch.setattr(
+        session_ops_service,
+        "load_history_tail_request_id",
+        lambda _session_id, exclude_request_id=None: tail,
+    )
+    loaded: list[str] = []
+
+    def load_history_records(_session_id):
+        loaded.append(_session_id)
+        return records
+
+    monkeypatch.setattr(session_ops_service, "load_history_records", load_history_records)
+    return loaded
+
+
 @pytest.mark.asyncio
 async def test_refresh_skips_rebuild_when_disk_tail_matches_fingerprint(monkeypatch):
     context_engine = SimpleNamespace(
@@ -150,8 +181,7 @@ async def test_refresh_skips_rebuild_when_disk_tail_matches_fingerprint(monkeypa
         {"request_id": "phone-2", "role": "user", "content": "phone turn"},
         {"request_id": "current", "role": "user", "content": "需要"},
     ]
-    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
-    monkeypatch.setattr(session_ops_service, "load_history_records", lambda _session_id: records)
+    loaded = _patch_refresh_history(monkeypatch, records, "phone-2")
 
     tail = await session_ops_service.refresh_session_context_if_stale(
         deep_agent=_refresh_agent(context_engine),
@@ -161,20 +191,18 @@ async def test_refresh_skips_rebuild_when_disk_tail_matches_fingerprint(monkeypa
     )
 
     assert tail == "phone-2"
+    assert loaded == []
     context_engine.clear_context.assert_not_awaited()
     context_engine.create_context.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_refresh_rebuilds_when_peer_channel_appended_history(monkeypatch):
-    restored_ctx = SimpleNamespace(
-        context_id=lambda: "default_context_id",
-        load_state=MagicMock(),
-    )
+async def test_refresh_appends_when_peer_channel_appended_history(monkeypatch):
+    live_ctx = SimpleNamespace(add_messages=AsyncMock())
     context_engine = SimpleNamespace(
-        get_context=MagicMock(return_value=object()),
+        get_context=MagicMock(return_value=live_ctx),
         clear_context=AsyncMock(),
-        create_context=AsyncMock(return_value=restored_ctx),
+        create_context=AsyncMock(),
         save_contexts=AsyncMock(),
     )
     records = [
@@ -184,16 +212,16 @@ async def test_refresh_rebuilds_when_peer_channel_appended_history(monkeypatch):
     ]
     restored: list[dict[str, object]] = []
     live_session = _live_session()
+    appended = [object()]
 
-    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
-    monkeypatch.setattr(session_ops_service, "load_history_records", lambda _session_id: records)
+    _patch_refresh_history(monkeypatch, records, "phone-2")
     monkeypatch.setattr(
         session_ops_service, "resolve_live_agent_session", lambda *_args: live_session
     )
 
     def build_context_messages(history_records):
         restored.extend(history_records)
-        return [object()], 0
+        return list(appended), 0
 
     monkeypatch.setattr(
         session_ops_service,
@@ -210,18 +238,15 @@ async def test_refresh_rebuilds_when_peer_channel_appended_history(monkeypatch):
     )
 
     assert tail == "phone-2"
-    context_engine.clear_context.assert_awaited_once()
-    context_engine.create_context.assert_awaited_once()
+    context_engine.clear_context.assert_not_awaited()
+    context_engine.create_context.assert_not_awaited()
+    live_ctx.add_messages.assert_awaited_once_with(appended[0])
     context_engine.save_contexts.assert_awaited_once_with(live_session)
     live_session.commit.assert_not_awaited()
     live_session.post_run.assert_not_awaited()
-    live_session.update_state.assert_called_with({"context": None})
-    for call in live_session.update_state.call_args_list:
-        payload = call.args[0] if call.args else {}
-        assert list(payload.keys()) == ["context"]
-    restored_ctx.load_state.assert_called_once()
+    live_session.update_state.assert_not_called()
     deep_agent.save_state.assert_not_called()
-    assert [record["request_id"] for record in restored] == ["pc-1", "phone-2"]
+    assert [record["request_id"] for record in restored] == ["phone-2"]
 
 
 @pytest.mark.asyncio
@@ -238,8 +263,7 @@ async def test_refresh_without_memory_context_uses_warmup(monkeypatch):
     ]
     restored: list[dict[str, object]] = []
 
-    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
-    monkeypatch.setattr(session_ops_service, "load_history_records", lambda _session_id: records)
+    loaded = _patch_refresh_history(monkeypatch, records, "phone-2")
     monkeypatch.setattr(session_ops_service, "resolve_live_agent_session", lambda *_args: object())
 
     def build_context_messages(history_records):
@@ -260,20 +284,18 @@ async def test_refresh_without_memory_context_uses_warmup(monkeypatch):
     )
 
     assert tail == "phone-2"
+    assert loaded == ["session-1"]
     _assert_checkpointer_miss_then_history_restore(context_engine)
     assert [record["request_id"] for record in restored] == ["phone-2"]
 
 
 @pytest.mark.asyncio
-async def test_refresh_persists_rebuilt_context_so_init_context_cannot_reload_stale(
+async def test_refresh_persists_appended_context_so_init_context_cannot_reload_stale(
     monkeypatch,
 ):
-    """Live Session.context must hold rebuilt history, not the pre-refresh snapshot."""
-    rebuilt_messages = [object()]
-    restored_ctx = SimpleNamespace(
-        context_id=lambda: "default_context_id",
-        load_state=MagicMock(),
-    )
+    """Live Session.context must hold the appended window, not the pre-refresh snapshot."""
+    appended_messages = [object()]
+    live_ctx = SimpleNamespace(add_messages=AsyncMock())
     session_state = {
         "context": {"default_context_id": {"messages": ["stale-pc"]}},
         "plan_mode": "keep-me",
@@ -295,15 +317,14 @@ async def test_refresh_persists_rebuilt_context_so_init_context_cannot_reload_st
     live_session = LiveSession()
 
     async def save_contexts(sess, context_ids=None):
-        sess.update_state({"context": None})
         sess.update_state(
-            {"context": {"default_context_id": {"messages": rebuilt_messages}}}
+            {"context": {"default_context_id": {"messages": ["stale-pc"] + appended_messages}}}
         )
 
     context_engine = SimpleNamespace(
-        get_context=MagicMock(return_value=object()),
+        get_context=MagicMock(return_value=live_ctx),
         clear_context=AsyncMock(),
-        create_context=AsyncMock(return_value=restored_ctx),
+        create_context=AsyncMock(),
         save_contexts=AsyncMock(side_effect=save_contexts),
     )
     records = [
@@ -312,15 +333,14 @@ async def test_refresh_persists_rebuilt_context_so_init_context_cannot_reload_st
         {"request_id": "current", "role": "user", "content": "需要"},
     ]
 
-    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
-    monkeypatch.setattr(session_ops_service, "load_history_records", lambda _session_id: records)
+    _patch_refresh_history(monkeypatch, records, "phone-2")
     monkeypatch.setattr(
         session_ops_service, "resolve_live_agent_session", lambda *_args: live_session
     )
     monkeypatch.setattr(
         session_ops_service,
         "_build_context_messages_from_history",
-        lambda _records: (rebuilt_messages, 0),
+        lambda _records: (appended_messages, 0),
     )
 
     tail = await session_ops_service.refresh_session_context_if_stale(
@@ -331,32 +351,23 @@ async def test_refresh_persists_rebuilt_context_so_init_context_cannot_reload_st
     )
 
     assert tail == "phone-2"
-    restored_ctx.load_state.assert_called_once_with(
-        {"default_context_id": {"messages": rebuilt_messages}}
-    )
+    live_ctx.add_messages.assert_awaited_once_with(appended_messages[0])
+    context_engine.clear_context.assert_not_awaited()
+    context_engine.create_context.assert_not_awaited()
     live_session.commit.assert_not_awaited()
     live_session.post_run.assert_not_awaited()
     loaded = live_session.get_state("context")
-    assert loaded["default_context_id"]["messages"] is rebuilt_messages
-    assert loaded["default_context_id"]["messages"] != ["stale-pc"]
+    assert loaded["default_context_id"]["messages"] == ["stale-pc"] + appended_messages
     assert session_state["plan_mode"] == "keep-me"
-    # Simulated _init_context: create_context(session) with no history would
-    # deepcopy this same Session.context — it must already be the rebuilt window.
-    init_loaded = live_session.get_state("context")
-    assert init_loaded is not None
-    assert init_loaded["default_context_id"]["messages"] is rebuilt_messages
 
 
 @pytest.mark.asyncio
 async def test_refresh_keeps_old_fingerprint_when_save_contexts_fails(monkeypatch):
-    restored_ctx = SimpleNamespace(
-        context_id=lambda: "default_context_id",
-        load_state=MagicMock(),
-    )
+    live_ctx = SimpleNamespace(add_messages=AsyncMock())
     context_engine = SimpleNamespace(
-        get_context=MagicMock(return_value=object()),
+        get_context=MagicMock(return_value=live_ctx),
         clear_context=AsyncMock(),
-        create_context=AsyncMock(return_value=restored_ctx),
+        create_context=AsyncMock(),
         save_contexts=AsyncMock(side_effect=OSError("disk full")),
     )
     records = [
@@ -366,8 +377,7 @@ async def test_refresh_keeps_old_fingerprint_when_save_contexts_fails(monkeypatc
     ]
     live_session = _live_session()
 
-    monkeypatch.setattr(session_ops_service, "history_exists", lambda _session_id: True)
-    monkeypatch.setattr(session_ops_service, "load_history_records", lambda _session_id: records)
+    _patch_refresh_history(monkeypatch, records, "phone-2")
     monkeypatch.setattr(
         session_ops_service, "resolve_live_agent_session", lambda *_args: live_session
     )
@@ -385,8 +395,86 @@ async def test_refresh_keeps_old_fingerprint_when_save_contexts_fails(monkeypatc
     )
 
     assert tail == "pc-1"
+    live_ctx.add_messages.assert_awaited_once()
+    context_engine.clear_context.assert_not_awaited()
+    context_engine.create_context.assert_not_awaited()
     context_engine.save_contexts.assert_awaited_once_with(live_session)
     live_session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_old_fingerprint_when_fingerprint_missing_from_history(monkeypatch):
+    live_ctx = SimpleNamespace(add_messages=AsyncMock())
+    context_engine = SimpleNamespace(
+        get_context=MagicMock(return_value=live_ctx),
+        clear_context=AsyncMock(),
+        create_context=AsyncMock(),
+        save_contexts=AsyncMock(),
+    )
+    records = [
+        {"request_id": "phone-2", "role": "user", "content": "什么时候去"},
+        {"request_id": "current", "role": "user", "content": "需要"},
+    ]
+    live_session = _live_session()
+
+    loaded = _patch_refresh_history(monkeypatch, records, "phone-2")
+    monkeypatch.setattr(
+        session_ops_service, "resolve_live_agent_session", lambda *_args: live_session
+    )
+
+    tail = await session_ops_service.refresh_session_context_if_stale(
+        deep_agent=_refresh_agent(context_engine),
+        session_id="session-1",
+        exclude_request_id="current",
+        synced_tail_request_id="pc-1",
+    )
+
+    assert tail == "pc-1"
+    assert loaded == ["session-1"]
+    live_ctx.add_messages.assert_not_awaited()
+    context_engine.clear_context.assert_not_awaited()
+    context_engine.create_context.assert_not_awaited()
+    context_engine.save_contexts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_old_fingerprint_when_add_messages_fails(monkeypatch):
+    live_ctx = SimpleNamespace(add_messages=AsyncMock(side_effect=RuntimeError("boom")))
+    context_engine = SimpleNamespace(
+        get_context=MagicMock(return_value=live_ctx),
+        clear_context=AsyncMock(),
+        create_context=AsyncMock(),
+        save_contexts=AsyncMock(),
+    )
+    records = [
+        {"request_id": "pc-1", "role": "user", "content": "赛里木湖"},
+        {"request_id": "phone-2", "role": "user", "content": "什么时候去"},
+        {"request_id": "current", "role": "user", "content": "需要"},
+    ]
+    live_session = _live_session()
+
+    _patch_refresh_history(monkeypatch, records, "phone-2")
+    monkeypatch.setattr(
+        session_ops_service, "resolve_live_agent_session", lambda *_args: live_session
+    )
+    monkeypatch.setattr(
+        session_ops_service,
+        "_build_context_messages_from_history",
+        lambda _records: ([object()], 0),
+    )
+
+    tail = await session_ops_service.refresh_session_context_if_stale(
+        deep_agent=_refresh_agent(context_engine),
+        session_id="session-1",
+        exclude_request_id="current",
+        synced_tail_request_id="pc-1",
+    )
+
+    assert tail == "pc-1"
+    live_ctx.add_messages.assert_awaited_once()
+    context_engine.clear_context.assert_not_awaited()
+    context_engine.create_context.assert_not_awaited()
+    context_engine.save_contexts.assert_not_awaited()
 
 
 @pytest.mark.asyncio

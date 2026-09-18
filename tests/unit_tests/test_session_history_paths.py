@@ -115,3 +115,56 @@ def test_load_history_records_keeps_independent_final_segments(tmp_path, monkeyp
     finals = [r["content"] for r in loaded if r.get("event_type") == "chat.final"]
     # 独立正文段全部保留（重试同稿去重一条），工具记录不受影响
     assert finals == ["第一步完成", "第二步完成", "最终报告"]
+
+
+def test_load_history_tail_request_id_scans_jsonl_from_eof(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_history, "get_agent_sessions_dir", lambda: tmp_path)
+    session_id = "sess_tail"
+    session_dir = tmp_path / session_id
+    session_dir.mkdir(parents=True)
+    records = [
+        {"request_id": "pc-1", "role": "user", "content": "赛里木湖"},
+        {"request_id": "phone-2", "role": "user", "content": "什么时候去"},
+        {"request_id": "current", "role": "user", "content": "需要"},
+    ]
+    (session_dir / "history.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+        encoding="utf-8",
+    )
+
+    assert session_history.load_history_tail_request_id(session_id) == "current"
+    assert (
+        session_history.load_history_tail_request_id(
+            session_id, exclude_request_id="current"
+        )
+        == "phone-2"
+    )
+    assert session_history.load_history_tail_request_id("missing") is None
+
+
+def test_load_history_tail_request_id_legacy_json(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_history, "get_agent_sessions_dir", lambda: tmp_path)
+    session_id = "sess_legacy_tail"
+    session_dir = tmp_path / session_id
+    session_dir.mkdir(parents=True)
+    records = [
+        {"request_id": "pc-1", "role": "user"},
+        {"request_id": "phone-2", "role": "user"},
+        {"request_id": "current", "role": "user"},
+    ]
+    (session_dir / "history.json").write_text(
+        json.dumps(records, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        session_history,
+        "get_read_history_path",
+        lambda _sid: session_dir / "history.json",
+    )
+
+    assert (
+        session_history.load_history_tail_request_id(
+            session_id, exclude_request_id="current"
+        )
+        == "phone-2"
+    )
