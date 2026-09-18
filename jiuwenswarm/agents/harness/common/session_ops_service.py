@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import re
@@ -14,6 +15,7 @@ from jiuwenswarm.server.runtime.session.session_history import (
     get_read_history_path,
     history_exists,
     load_history_records,
+    load_history_tail_request_id as read_history_tail_request_id,
     write_history_records,
     _write_records_to_path,
 )
@@ -965,24 +967,289 @@ def _build_context_messages_from_history(
     return filtered_messages, skipped
 
 
+async def _try_restore_from_checkpointer(
+    *,
+    context_engine: Any,
+    session: Any,
+    react_agent: Any,
+    session_id: str,
+) -> bool:
+    """恢复持久化 checkpointer 中压缩后的 context，避免重启后重复压缩。
+
+    上一轮 turn 结束时的 ``save_contexts(session)`` + ``session.commit()`` 已把
+    压缩后的 context 快照写进 session state，并由 checkpointer 持久化到 sqlite。
+    这里调用 ``create_context`` **不带** ``history_messages``，走
+    ``context_engine._load_state_from_session`` → ``context.load_state(states)``
+    恢复压缩快照；若带 ``history_messages`` 则会覆盖这些快照、触发再次压缩——
+    这正是本改造要消除的行为。
+
+    Returns:
+        恢复出非空 context 返回 True；checkpointer 无可用快照（或恢复失败）
+        返回 False，由调用方回退到 history.jsonl 全量重灌。
+    """
+    try:
+        await context_engine.create_context(
+            session=session,
+            processors=_get_context_processors(react_agent),
+        )
+    except Exception as exc:
+        logger.warning(
+            "warmup_session_context: checkpointer restore failed for %s (%s); "
+            "falling back to history rebuild",
+            session_id, exc,
+        )
+        return False
+
+    context = context_engine.get_context(session_id=session_id)
+    if context is not None and context.get_messages():
+        logger.info(
+            "warmup_session_context: session=%s restored %d messages from checkpointer "
+            "(compressed, no re-compression)",
+            session_id, len(context.get_messages()),
+        )
+        return True
+
+    # checkpointer 无可用快照（新会话 / 从未 commit）→ 清掉空 context，让
+    # history 重灌在干净的 buffer 上进行。
+    try:
+        await context_engine.clear_context(session_id=session_id)
+    except Exception as exc:
+        logger.warning("warmup_session_context: clear_context failed for %s: %s", session_id, exc)
+    return False
+
+
+def _exclude_history_request_id(
+    history_records: list[Any],
+    exclude_request_id: str | None,
+) -> list[Any]:
+    excluded = (exclude_request_id or "").strip()
+    if not excluded:
+        return list(history_records)
+    return [
+        record
+        for record in history_records
+        if not (
+            isinstance(record, dict)
+            and str(record.get("request_id") or "").strip() == excluded
+        )
+    ]
+
+
+def history_tail_request_id(
+    history_records: list[Any] | None,
+    *,
+    exclude_request_id: str | None = None,
+) -> str | None:
+    """Last non-empty ``request_id`` on disk, optionally skipping the in-flight turn."""
+    if not isinstance(history_records, list):
+        return None
+    excluded = (exclude_request_id or "").strip()
+    tail: str | None = None
+    for record in history_records:
+        if not isinstance(record, dict):
+            continue
+        rid = str(record.get("request_id") or "").strip()
+        if not rid or (excluded and rid == excluded):
+            continue
+        tail = rid
+    return tail
+
+
+def load_history_tail_request_id(
+    session_id: str,
+    *,
+    exclude_request_id: str | None = None,
+) -> str | None:
+    try:
+        return read_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
+    except OSError as exc:
+        logger.warning(
+            "load_history_tail_request_id: failed to read history for %s: %s",
+            session_id,
+            exc,
+        )
+        return None
+
+
+def _slice_history_after_fingerprint(
+    history_records: list[Any],
+    fingerprint: str | None,
+) -> list[Any] | None:
+    """Records after the last matching fingerprint. None if the cut point is missing."""
+    synced = str(fingerprint or "").strip()
+    if not synced:
+        return None
+    last_idx: int | None = None
+    for index, record in enumerate(history_records):
+        if not isinstance(record, dict):
+            continue
+        rid = str(record.get("request_id") or "").strip()
+        if rid == synced:
+            last_idx = index
+    if last_idx is None:
+        return None
+    return list(history_records[last_idx + 1 :])
+
+
+async def _add_messages_to_context(context: Any, messages: list[Any]) -> None:
+    adder = getattr(context, "add_messages", None)
+    if not callable(adder):
+        raise TypeError("context has no add_messages")
+    for message in messages:
+        result = adder(message)
+        if inspect.isawaitable(result):
+            await result
+
+
+async def _append_peer_history_to_context(
+    *,
+    deep_agent: "DeepAgent",
+    session_id: str,
+    delta_records: list[Any],
+    log_label: str,
+) -> bool:
+    """Append peer turns onto the live compressed window. Do not rebuild or persist."""
+    react_agent = getattr(deep_agent, "react_agent", None)
+    if react_agent is None:
+        logger.warning("%s: no react_agent for %s", log_label, session_id)
+        return False
+
+    context_engine = react_agent.context_engine
+    getter = getattr(context_engine, "get_context", None)
+    context = getter(session_id=session_id) if callable(getter) else None
+    if context is None:
+        return False
+
+    if not delta_records:
+        return True
+
+    context_messages, skipped = _build_context_messages_from_history(delta_records)
+    if not context_messages:
+        logger.info(
+            "%s: delta had no rebuildable messages session=%s skipped=%d",
+            log_label,
+            session_id,
+            skipped,
+        )
+        return True
+
+    try:
+        await _add_messages_to_context(context, context_messages)
+    except Exception as exc:
+        logger.warning(
+            "%s: add_messages failed session=%s: %s",
+            log_label,
+            session_id,
+            exc,
+        )
+        return False
+
+    logger.info(
+        "%s: session=%s appended %d peer messages from disk history "
+        "(skipped %d streaming/metadata records)",
+        log_label,
+        session_id,
+        len(context_messages),
+        skipped,
+    )
+    return True
+
+
+async def _persist_session_context(
+    *,
+    session: Any,
+    context_engine: Any,
+    session_id: str,
+    log_label: str,
+) -> bool:
+    """Write the live context window onto Session.context; do not touch agent state."""
+    try:
+        await context_engine.save_contexts(session)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "%s: save_contexts failed session=%s: %s",
+            log_label,
+            session_id,
+            exc,
+        )
+        return False
+
+
+async def _restore_session_context_from_history(
+    *,
+    deep_agent: "DeepAgent",
+    session_id: str,
+    history_records: list[Any],
+    log_label: str = "warmup_session_context",
+) -> bool:
+    """Cold-start restore: create_context from history records. Does not clear a live window."""
+    react_agent = getattr(deep_agent, "react_agent", None)
+    if react_agent is None:
+        logger.warning("%s: no react_agent for %s", log_label, session_id)
+        return False
+
+    if not isinstance(history_records, list) or not history_records:
+        return False
+
+    context_messages, skipped = _build_context_messages_from_history(history_records)
+    if not context_messages:
+        logger.info("%s: no rebuildable messages in history for %s", log_label, session_id)
+        return False
+
+    live_session = resolve_live_agent_session(deep_agent, session_id)
+    session = live_session
+    if session is None:
+        try:
+            from openjiuwen.core.single_agent import create_agent_session
+
+            session = create_agent_session(
+                session_id=session_id, card=getattr(deep_agent, "card", None)
+            )
+            await session.pre_run(inputs=None)
+        except Exception as exc:
+            logger.warning("%s: pre_run failed for %s: %s", log_label, session_id, exc)
+            return False
+
+    try:
+        await react_agent.context_engine.create_context(
+            session=session,
+            processors=_get_context_processors(react_agent),
+            history_messages=context_messages,
+        )
+    except Exception as exc:
+        logger.warning("%s: create_context failed for %s: %s", log_label, session_id, exc)
+        return False
+
+    logger.info(
+        "%s: session=%s restored context from disk history with %d messages "
+        "(skipped %d streaming/metadata records)",
+        log_label,
+        session_id,
+        len(context_messages),
+        skipped,
+    )
+    return True
+
+
 async def warmup_session_context(
     *,
     deep_agent: "DeepAgent",
     session_id: str,
     exclude_request_id: str | None = None,
 ) -> bool:
-    """Restart-safe restore of context_engine messages from on-disk history.
+    """Restart-safe restore of context_engine messages.
 
-    对话消息只存在于 context_engine 的进程内存（``_context_pool``），不落
-    checkpointer。server 重启或 session adapter 被空闲驱逐后重建时 pool 为
-    空，而 chat.send 主路径不会把磁盘 history.jsonl 回灌给模型，导致
-    "能看到历史列表但继续对话失忆"。
+    在新建 session adapter（``start_interaction`` 之后）调用。恢复顺序：
+    1. 优先从持久化 checkpointer 恢复压缩后的 context 快照（由上一轮
+       ``save_contexts``+``commit`` 写入），避免重启后用全量 history 重灌导致
+       再次压缩——这是「重启后不重复压缩」的核心。
+    2. 仅当 checkpointer 无可用快照时，才从磁盘 history.jsonl 全量重灌兜底
+       （历史上只有 history.jsonl 一种来源，故保留该分支）。
 
-    在新建 session adapter（``start_interaction`` 之后）调用：若内存 context
-    缺失且磁盘上有历史记录，则将全量 history 转换为 openjiuwen 消息并灌回
-    context_engine。与 ``rewind_session_context`` 的区别：不截断 history、
-    不清理 Session state（agent/workflow 状态已由 checkpointer 在 pre_run
-    恢复）、不强写 checkpointer（消息持久化本就由 history.jsonl 承担）。
+    与 ``rewind_session_context`` 的区别：不截断 history、不强写 checkpointer。
 
     ``chat.send`` 会在 adapter 冷启动前先把当前用户消息持久化。调用方可传入
     ``exclude_request_id``，使 warmup 仅恢复此前历史；当前轮仍由正常的 inputs
@@ -1002,35 +1269,6 @@ async def warmup_session_context(
         # 全新会话，磁盘无历史，静默跳过
         return False
 
-    try:
-        history_records = load_history_records(session_id)
-    except OSError as exc:
-        logger.warning("warmup_session_context: failed to read history for %s: %s", session_id, exc)
-        return False
-
-    if not isinstance(history_records, list) or not history_records:
-        return False
-
-    excluded_request_id = (exclude_request_id or "").strip()
-    if excluded_request_id:
-        history_records = [
-            record
-            for record in history_records
-            if not (
-                isinstance(record, dict)
-                and str(record.get("request_id") or "").strip() == excluded_request_id
-            )
-        ]
-        if not history_records:
-            return False
-
-    context_messages, skipped = _build_context_messages_from_history(history_records)
-    if not context_messages:
-        logger.info(
-            "warmup_session_context: no rebuildable messages in history for %s", session_id
-        )
-        return False
-
     session = resolve_live_agent_session(deep_agent, session_id)
     if session is None:
         # 正常调用点（start_interaction 之后）live session 必在；兜底临时 Session。
@@ -1045,22 +1283,147 @@ async def warmup_session_context(
             logger.warning("warmup_session_context: pre_run failed for %s: %s", session_id, exc)
             return False
 
+    # ── 优先：从持久化 checkpointer 恢复压缩后的 context ──
+    # create_context 不带 history_messages → _load_state_from_session 恢复压缩
+    # 快照，不覆盖已压好的内容，从而消掉重启后的重复压缩。
+    if await _try_restore_from_checkpointer(
+        context_engine=context_engine,
+        session=session,
+        react_agent=react_agent,
+        session_id=session_id,
+    ):
+        return True
+
+    # ── 兜底：checkpointer 无可用快照时，从磁盘 history.jsonl 全量重灌 ──
     try:
-        await context_engine.create_context(
-            session=session,
- 	        processors=_get_context_processors(react_agent),
-            history_messages=context_messages,
-        )
-    except Exception as exc:
-        logger.warning("warmup_session_context: create_context failed for %s: %s", session_id, exc)
+        history_records = load_history_records(session_id)
+    except OSError as exc:
+        logger.warning("warmup_session_context: failed to read history for %s: %s", session_id, exc)
         return False
 
-    logger.info(
-        "warmup_session_context: session=%s restored context from disk history with %d messages "
-        "(skipped %d streaming/metadata records)",
-        session_id, len(context_messages), skipped,
+    if not isinstance(history_records, list) or not history_records:
+        return False
+
+    history_records = _exclude_history_request_id(history_records, exclude_request_id)
+    if not history_records:
+        return False
+
+    return await _restore_session_context_from_history(
+        deep_agent=deep_agent,
+        session_id=session_id,
+        history_records=history_records,
+        log_label="warmup_session_context",
     )
-    return True
+
+
+async def refresh_session_context_if_stale(
+    *,
+    deep_agent: "DeepAgent | None",
+    session_id: str,
+    exclude_request_id: str | None = None,
+    synced_tail_request_id: str | None = None,
+) -> str | None:
+    """Append peer-channel turns when another adapter wrote newer history.
+
+    ``xiaoyi`` / ``desktop`` each hold a session adapter. Warmup only runs on
+    create, so a reused adapter can miss turns the other channel already
+    persisted to ``history.jsonl``. Compare the last on-disk ``request_id``
+    (excluding the in-flight turn) with ``synced_tail_request_id`` and, if they
+    differ, append the delta onto the live compressed window. Missing
+    fingerprint or append/persist failure keeps the old fingerprint.
+    HITL / plan session state is left untouched.
+
+    Returns the disk tail the caller should store as the new fingerprint.
+    """
+    synced = str(synced_tail_request_id or "").strip() or None
+    if deep_agent is None:
+        return synced
+
+    disk_tail: str | None = None
+    if history_exists(session_id):
+        disk_tail = load_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
+
+    react_agent = getattr(deep_agent, "react_agent", None)
+    if react_agent is None:
+        return disk_tail or synced
+
+    context_engine = react_agent.context_engine
+    if context_engine.get_context(session_id=session_id) is None:
+        await warmup_session_context(
+            deep_agent=deep_agent,
+            session_id=session_id,
+            exclude_request_id=exclude_request_id,
+        )
+        return disk_tail if disk_tail is not None else synced
+
+    if disk_tail is None or disk_tail == synced:
+        return disk_tail if disk_tail is not None else synced
+
+    try:
+        loaded = load_history_records(session_id)
+    except OSError as exc:
+        logger.warning(
+            "refresh_session_context_if_stale: failed to read history for %s: %s",
+            session_id,
+            exc,
+        )
+        return synced
+    history_records = loaded if isinstance(loaded, list) else []
+    filtered = _exclude_history_request_id(history_records, exclude_request_id)
+    delta = _slice_history_after_fingerprint(filtered, synced)
+    log_label = "refresh_session_context_if_stale"
+    if delta is None:
+        logger.warning(
+            "%s: fingerprint missing from history session=%s disk_tail=%s previous=%s",
+            log_label,
+            session_id,
+            disk_tail,
+            synced,
+        )
+        return synced
+
+    restored = await _append_peer_history_to_context(
+        deep_agent=deep_agent,
+        session_id=session_id,
+        delta_records=delta,
+        log_label=log_label,
+    )
+    if not restored:
+        logger.warning(
+            "%s: append failed session=%s disk_tail=%s previous=%s",
+            log_label,
+            session_id,
+            disk_tail,
+            synced,
+        )
+        return synced
+
+    session = resolve_live_agent_session(deep_agent, session_id)
+    if session is None:
+        logger.warning(
+            "%s: no live session to persist context for %s",
+            log_label,
+            session_id,
+        )
+        return synced
+    persist_ok = await _persist_session_context(
+        session=session,
+        context_engine=context_engine,
+        session_id=session_id,
+        log_label=log_label,
+    )
+    if not persist_ok:
+        return synced
+
+    logger.info(
+        "refresh_session_context_if_stale: session=%s synced context disk_tail=%s previous=%s",
+        session_id,
+        disk_tail,
+        synced,
+    )
+    return disk_tail
 
 
 async def rewind_session_context(

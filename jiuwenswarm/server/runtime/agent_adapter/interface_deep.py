@@ -779,6 +779,8 @@ class _RailBuildInfo:
         """Normalize the optional params mapping to an empty dict."""
         self.params = self.params or {}
 
+# 统一 cron 工具名为 "cron"；legacy cron_* 名称保留在集合里作为安全网，
+# 用于摘除旧版本注册残留 / 历史会话重放的工具卡片。
 _CRON_TOOL_NAMES = frozenset(
     {
         "cron",
@@ -977,17 +979,33 @@ def _build_context_processor_rail(config: dict[str, Any]) -> ContextProcessorRai
         if isinstance(offloader_cfg, dict) and offloader_cfg:
             user_processors.append(("MessageSummaryOffloader", offloader_cfg))
 
+        auto_compression_cfg = context_engine_cfg.get("auto_compression")
+        if not isinstance(auto_compression_cfg, dict):
+            auto_compression_cfg = None
+
         compressor_cfg = context_engine_cfg.get("dialogue_compressor_config", {})
-        if isinstance(compressor_cfg, dict) and compressor_cfg:
-            user_processors.append(("DialogueCompressor", compressor_cfg))
+        if isinstance(compressor_cfg, dict) and (compressor_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "DialogueCompressor",
+                {**compressor_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else compressor_cfg,
+            ))
 
         current_round_cfg = context_engine_cfg.get("current_round_compressor_config", {})
-        if isinstance(current_round_cfg, dict) and current_round_cfg:
-            user_processors.append(("CurrentRoundCompressor", current_round_cfg))
+        if isinstance(current_round_cfg, dict) and (current_round_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "CurrentRoundCompressor",
+                {**current_round_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else current_round_cfg,
+            ))
 
         round_level_cfg = context_engine_cfg.get("round_level_compressor_config", {})
-        if isinstance(round_level_cfg, dict) and round_level_cfg:
-            user_processors.append(("RoundLevelCompressor", round_level_cfg))
+        if isinstance(round_level_cfg, dict) and (round_level_cfg or auto_compression_cfg is not None):
+            user_processors.append((
+                "RoundLevelCompressor",
+                {**round_level_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None else round_level_cfg,
+            ))
 
         reasoning_loop_cfg = context_engine_cfg.get("reasoning_tool_loop_compact_config", {})
         if isinstance(reasoning_loop_cfg, dict) and reasoning_loop_cfg:
@@ -1266,6 +1284,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._audio_tools: list[Any] = []
         self._instance_overrides: dict[str, Any] = {}
         self._is_session_scoped_adapter: bool = False
+        self._synced_history_tail_request_id: str | None = None
         # Office (work) profile always uses English for system-prompt scaffolding
         # (identity / safety / skills / task_execution / runtime / env sections),
         # mirroring code mode. ``_runtime_language_override`` stays ``None`` in
@@ -1425,6 +1444,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def mark_as_session_scoped(self, session_id: str) -> None:
         self._is_session_scoped_adapter = True
         self._parent_session_id = session_id
+        self._synced_history_tail_request_id = None
+
+    def _mark_history_tail_synced(self, request_id: str | None) -> None:
+        rid = str(request_id or "").strip()
+        if rid:
+            self._synced_history_tail_request_id = rid
 
     def _get_cached_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter | None":
         sid = self._session_adapter_key(session_id)
@@ -1664,6 +1689,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             existing = self._session_adapters.get(sid)
             if existing is not None:
                 await self._reload_session_adapter_if_stale(sid, existing)
+                try:
+                    from jiuwenswarm.agents.harness.common.session_ops_service import (
+                        refresh_session_context_if_stale,
+                    )
+
+                    existing._synced_history_tail_request_id = (
+                        await refresh_session_context_if_stale(
+                            deep_agent=getattr(existing, "_instance", None),
+                            session_id=sid,
+                            exclude_request_id=warmup_exclude_request_id,
+                            synced_tail_request_id=getattr(
+                                existing, "_synced_history_tail_request_id", None
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] session context refresh failed: "
+                        "session_id=%s error=%s",
+                        sid,
+                        exc,
+                    )
                 self._touch_session_adapter(sid)
                 return existing
 
@@ -1702,12 +1749,17 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # （全新会话磁盘无历史，warmup 内部会静默跳过）。
             try:
                 from jiuwenswarm.agents.harness.common.session_ops_service import (
+                    load_history_tail_request_id,
                     warmup_session_context,
                 )
 
                 await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
+                    exclude_request_id=warmup_exclude_request_id,
+                )
+                adapter._synced_history_tail_request_id = load_history_tail_request_id(
+                    sid,
                     exclude_request_id=warmup_exclude_request_id,
                 )
             except Exception as exc:
@@ -6594,7 +6646,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # 单 agent 模式的 cron 执行会话 id 形如 "__cron___{ts}_{hex}"（warm pool
             # 以 channel_id="__cron__" 作前缀生成，见 agent_warm_pool._new_session_id），
             # 此前只判 "cron" 前缀会漏掉它。且 agent 实例跨会话共享：普通会话注册过的
-            # cron 工具须在此主动摘除，否则执行中的模型仍能调 cron_create_job，
+            # cron 工具须在此主动摘除，否则执行中的模型仍能调 cron 工具，
             # 把任务描述里"每天/每周…"等字样再建一遍定时任务。
             self._remove_registered_cron_tools()
             return
@@ -7188,6 +7240,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise RuntimeError("DeepAgent instance is not initialized")
         from openjiuwen.core.session.agent import create_agent_session
 
+        # 先保证进程默认 checkpointer 是持久化 sqlite：Session 在创建时会绑定
+        # 该默认实例，turn 结束的 save_contexts+commit 才真正落库。否则 Session
+        # 可能绑定 in-memory checkpointer，重启后无法从 checkpointer 恢复压缩态，
+        # warmup 只能回退到全量 history，触发重复压缩（本次闭环改造的写入侧保证）。
+        await ensure_persistent_checkpointer()
+
         session = create_agent_session(
             session_id=session_id,
             card=getattr(self._instance, "card", None),
@@ -7314,122 +7372,229 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def _resolve_interrupt_session_id(session_id: str | None) -> str:
         return (session_id or "default").strip() or "default"
 
+    @staticmethod
+    def _entry_index_after_request(records: list[dict], request_id: str) -> int:
+        """返回 records 中 request_id 最后一次出现之后的首条索引；未找到返回 -1。
+
+        一轮在 history 里可能有多条记录（user / chat.final / tool_call / tool_result），
+        全部属于同一次 commit 的基线；增量从它们之后开始。
+        """
+        last = -1
+        for i, rec in enumerate(records):
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("request_id") or "") == str(request_id):
+                last = i
+        return last + 1 if last >= 0 else -1
+
+    async def _rewind_history_fallback(
+        self, session_id: str, reason: str, _presess: Any,
+    ) -> None:
+        """全量 history 重放降级路径（保持改动前行为不变）。"""
+        flush_history_writes()
+        records = load_history_records(session_id)
+        rebuilt = self._build_rewind_messages_for_model(records)
+        _rebuilt_roles = [getattr(m, "role", "?") for m in rebuilt]
+        _rebuilt_tool_calls = sum(
+            len(getattr(m, "tool_calls", None) or []) for m in rebuilt
+        )
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] %s: rewind fallback full-history-replay "
+            "roles=%s tool_calls=%d records=%d session=%s",
+            reason, _rebuilt_roles, _rebuilt_tool_calls,
+            len(records), session_id,
+        )
+        if not rebuilt:
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] %s: no recapworthy records on disk, "
+                "skip reload session=%s disk_records=%d",
+                reason, session_id, len(records),
+            )
+            return
+        await self._write_rewind_context(
+            session_id=session_id,
+            reason=reason,
+            messages=rebuilt,
+            _presess=_presess,
+        )
+
+    async def _write_rewind_context(
+        self,
+        *,
+        session_id: str,
+        reason: str,
+        messages: list[Any],
+        _presess: Any,
+    ) -> None:
+        """把重建好的 messages 写入预置 session 并同步原始 session。
+
+        提取为独立函数供 checkpointer 拼接和全量回放两条路径共用。
+        """
+        ctx_eng = self._instance.react_agent.context_engine
+        from openjiuwen.harness.schema.state import _SESSION_STATE_KEY
+        try:
+            _presess.update_state({"context": None})
+            _presess.update_state({_SESSION_STATE_KEY: None})
+        except Exception:
+            pass
+        _rewind_ctx = await ctx_eng.create_context(
+            session=_presess, history_messages=messages,
+        )
+        if _rewind_ctx is not None and hasattr(_rewind_ctx, "load_state") and hasattr(_rewind_ctx, "context_id"):
+            try:
+                _rewind_ctx.load_state({_rewind_ctx.context_id(): {"messages": messages}})
+            except Exception as _load_err:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] %s: 兜底写入 rewind context 失败 session=%s: %s",
+                    reason, session_id, _load_err,
+                )
+        await ctx_eng.save_contexts(_presess)
+        _orig_session = (
+            getattr(self._instance, "_interaction_session", None)
+            or getattr(self._instance, "_loop_session", None)
+        )
+        if _orig_session is not None and _orig_session is not _presess:
+            try:
+                await ctx_eng.save_contexts(_orig_session)
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] %s: rewind 上下文同步到原始 session=%s orig_id=%s history=%d",
+                    reason, session_id, id(_orig_session), len(messages),
+                )
+            except Exception as _orig_err:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] %s: rewind 上下文同步原始 session 失败 session=%s: %s",
+                    reason, session_id, _orig_err,
+                )
+        try:
+            self._instance.save_state(_presess)
+        except Exception:
+            pass
+        _presess._pre_run_done = True
+        _rewind_key = self._resolve_interrupt_session_id(session_id)
+        self._rewind_session[_rewind_key] = _presess
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] %s: 预置 rewind session for next invoke "
+            "session=%s key=%s history=%d",
+            reason, session_id, _rewind_key, len(messages),
+        )
+
     async def _prepare_rewind_session_for_next_invoke(
             self, session_id: str, *, reason: str = "error",
     ) -> None:
-        """从 history.jsonl 重建对话上下文，预置 rewind session 供下一轮 invoke 使用。
+        """优先从 checkpointer 恢复压缩态 + history 尾部增量拼接，失败降级全量重放。
 
         当一轮对话因 cancel 或 model call failure（如 408 超时）中断时，
-        checkpointer state 停留在上一轮成功结束时的状态，当前轮次的用户
-        消息和工具调用结果未被保存。下一轮 invoke 会加载 stale checkpointer
-        state，导致上下文丢失。
-
-        本方法从磁盘上的 history.jsonl 重建完整上下文，写入预置 session，
-        供下一轮 invoke 通过 ``_rewind_session`` 机制复用，绕过 stale
-        checkpointer。
+        checkpointer state 停留在上一轮成功结束时的状态。本方法先尝试从
+        checkpointer 恢复压缩后的基线上下文，再用 request_id 指针从 history
+        中定位增量起点、拼接尾部增量，避免因全量重放 history.jsonl 导致
+        压缩回退。指针未命中或 checkpointer 无快照时，降级到全量重放。
 
         Args:
             session_id: 会话 ID。
             reason: 触发原因（用于日志），如 ``"cancel"`` 或 ``"error"``。
         """
         try:
-            if self._instance is not None and getattr(self._instance, "react_agent", None) is not None:
-                ctx_eng = self._instance.react_agent.context_engine
-                flush_history_writes()
-                records = load_history_records(session_id)
-                rebuilt = self._build_rewind_messages_for_model(records)
-                _rebuilt_roles = [getattr(m, "role", "?") for m in rebuilt]
-                _rebuilt_tool_calls = sum(
-                    len(getattr(m, "tool_calls", None) or []) for m in rebuilt
-                )
+            if self._instance is None or getattr(self._instance, "react_agent", None) is None:
+                return
+            ctx_eng = self._instance.react_agent.context_engine
+
+            # ── 第一步：从 checkpointer 恢复基线（压缩态）+ 取轮次指针 ──
+            from openjiuwen.core.single_agent import create_agent_session
+            _presess = create_agent_session(
+                session_id=session_id, card=self._instance.card
+            )
+            await _presess.pre_run(inputs=None)
+            last_rid = _presess.get_state("_last_committed_request_id")
+            await ctx_eng.create_context(
+                session=_presess,
+            )
+            baseline_ctx = ctx_eng.get_context(session_id=session_id)
+            baseline_msgs = (
+                list(baseline_ctx.get_messages()) if baseline_ctx is not None else []
+            )
+
+            if not baseline_msgs or not last_rid:
+                # 无基线 / 无指针（新会话或从未 commit）→ 降级全量重放
                 logger.info(
-                    "[JiuWenSwarmDeepAdapter] %s: rewind rebuilt messages roles=%s "
-                    "tool_calls=%d records=%d session=%s",
+                    "[JiuWenSwarmDeepAdapter] %s: no checkpointer baseline "
+                    "(msgs=%d last_rid=%s) → fallback to full history replay session=%s",
+                    reason, len(baseline_msgs),
+                    str(last_rid)[:60] if last_rid else "None", session_id,
+                )
+                return await self._rewind_history_fallback(
+                    session_id, reason, _presess,
+                )
+
+            # ── 第二步：用 request_id 定位历史中的增量起点 ──
+            flush_history_writes()
+            records = load_history_records(session_id)
+            cut = self._entry_index_after_request(records, str(last_rid))
+            if cut < 0:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] %s: request_id=%s not found in history "
+                    "→ fallback to full history replay session=%s",
+                    reason, str(last_rid)[:60], session_id,
+                )
+                return await self._rewind_history_fallback(
+                    session_id, reason, _presess,
+                )
+
+            increment_records = records[cut:]
+            if not increment_records:
+                # 无增量：history 尾部与基线对齐，用基线即可
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] %s: no increment (cut=%d/%d) "
+                    "→ using baseline only session=%s",
+                    reason, cut, len(records), session_id,
+                )
+                merged = list(baseline_msgs)
+            else:
+                increment_msgs = self._build_rewind_messages_for_model(increment_records)
+                merged = list(baseline_msgs) + increment_msgs
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] %s: checkpointer baseline %d + "
+                    "history increment %d (%d records cut=%d) → merged %d "
+                    "session=%s",
                     reason,
-                    _rebuilt_roles,
-                    _rebuilt_tool_calls,
-                    len(records),
+                    len(baseline_msgs),
+                    len(increment_msgs),
+                    len(increment_records),
+                    cut,
+                    len(merged),
                     session_id,
                 )
-                if rebuilt:
-                    try:
-                        from openjiuwen.core.single_agent import create_agent_session
-                        from openjiuwen.harness.schema.state import _SESSION_STATE_KEY
-                        _presess = create_agent_session(
-                            session_id=session_id, card=self._instance.card
-                        )
-                        await _presess.pre_run(inputs=None)
-                        try:
-                            _presess.update_state({"context": None})
-                            _presess.update_state({_SESSION_STATE_KEY: None})
-                        except Exception:
-                            pass
-                        _rewind_ctx = await ctx_eng.create_context(
-                            session=_presess, history_messages=rebuilt,
-                        )
-                        # ``create_context`` 命中 ``_context_pool`` 中同 session 的
-                        # 缓存 context 时，会走 ``_load_state_from_session``；但上面刚把
-                        # ``context`` state 清成 None，导致该函数提前 return，``history_messages``
-                        # 并没有真正写入缓存 context。这里显式兜底，把重建好的历史写入
-                        # context，否则下一轮模型拿到的仍是 stale 上下文（丢失失败轮的 query）。
-                        if _rewind_ctx is not None and hasattr(_rewind_ctx, "load_state") and hasattr(_rewind_ctx, "context_id"):
-                            try:
-                                _rewind_ctx.load_state({_rewind_ctx.context_id(): {"messages": rebuilt}})
-                            except Exception as _load_err:
-                                logger.warning(
-                                    "[JiuWenSwarmDeepAdapter] %s: 兜底写入 rewind context 失败 session=%s: %s",
-                                    reason, session_id, _load_err,
-                                )
-                        await ctx_eng.save_contexts(_presess)
-                        # 关键修复：DeepAgent 的 task-loop controller 是持久绑定到原始
-                        # session 的，rewind 预置的 ``_presess`` 并不会被 react_agent 真正
-                        # 使用（下一轮 invoke 仍复用 controller 绑定的原始 session）。所以必须
-                        # 把重建好的上下文也写回原始 session 的 state，否则下一轮 create_context
-                        # 从原始 session 的 stale state 重新加载，仍会丢失败轮 query。
-                        _orig_session = (
-                            getattr(self._instance, "_interaction_session", None)
-                            or getattr(self._instance, "_loop_session", None)
-                        )
-                        if _orig_session is not None and _orig_session is not _presess:
-                            try:
-                                await ctx_eng.save_contexts(_orig_session)
-                                logger.info(
-                                    "[JiuWenSwarmDeepAdapter] %s: rewind 上下文同步到原始 session=%s orig_id=%s history=%d",
-                                    reason, session_id, id(_orig_session), len(rebuilt),
-                                )
-                            except Exception as _orig_err:
-                                logger.warning(
-                                    "[JiuWenSwarmDeepAdapter] %s: rewind 上下文同步原始 session 失败 session=%s: %s",
-                                    reason, session_id, _orig_err,
-                                )
-                        try:
-                            self._instance.save_state(_presess)
-                        except Exception:
-                            pass
-                        _presess._pre_run_done = True
-                        _rewind_key = self._resolve_interrupt_session_id(session_id)
-                        self._rewind_session[_rewind_key] = _presess
-                        logger.info(
-                            "[JiuWenSwarmDeepAdapter] %s: 预置 rewind session for next invoke "
-                            "session=%s key=%s history=%d",
-                            reason, session_id, _rewind_key, len(rebuilt),
-                        )
-                    except Exception as _pre_err:
-                        logger.warning(
-                            "[JiuWenSwarmDeepAdapter] %s: 构造预置 rewind session 失败 session=%s: %s",
-                            reason, session_id, _pre_err,
-                        )
-                else:
-                    logger.info(
-                        "[JiuWenSwarmDeepAdapter] %s: no recapworthy records on disk, "
-                        "skip reload session=%s disk_records=%d",
-                        reason, session_id, len(records),
-                    )
+
+            await self._write_rewind_context(
+                session_id=session_id,
+                reason=reason,
+                messages=merged,
+                _presess=_presess,
+            )
         except Exception as exc:
             logger.warning(
-                "[JiuWenSwarmDeepAdapter] %s: 预置 rewind session 构造失败: %s",
-                reason, exc,
+                "[JiuWenSwarmDeepAdapter] %s: checkpointer rewind 构造失败 "
+                "→ 降级全量重放 session=%s: %s",
+                reason, session_id, exc,
             )
+            try:
+                _fallback_session = (
+                    _presess if '_presess' in locals() else None
+                )
+                if _fallback_session is None:
+                    from openjiuwen.core.single_agent import create_agent_session
+                    _fallback_session = create_agent_session(
+                        session_id=session_id, card=self._instance.card,
+                    )
+                    await _fallback_session.pre_run(inputs=None)
+                return await self._rewind_history_fallback(
+                    session_id, reason, _fallback_session,
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] %s: fallback 全量重放也失败 "
+                    "session=%s: %s",
+                    reason, session_id, fallback_exc,
+                )
 
     async def _stop_session_interrupt_work(
         self,
@@ -9713,6 +9878,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 metadata=request.metadata,
             )
 
+        self._mark_history_tail_synced(request.request_id)
         return AgentResponse(
             request_id=request.request_id,
             channel_id=request.channel_id,
@@ -10767,6 +10933,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 else:
                     _debug_logger.end_run(status="ok")
             interaction_stream_abort = False
+            if run_failure is None:
+                self._mark_history_tail_synced(rid)
         except asyncio.CancelledError:
             stream_consumer_cancelled = True
             logger.info(

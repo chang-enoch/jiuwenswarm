@@ -562,6 +562,10 @@ react:
     enable_kv_cache_affinity: false
   context_engine_config:
     enable_openrouter_model_context_window_tokens: true
+    # 仅用于自动上下文压缩；模型名使用桌面端模型列表的 modelValue。
+    auto_compression:
+      model_name: "LLM_DeepSeekV4"           # 留空：跟随桌面端当轮选中的模型
+      fallback_model_name: "Auto-Model"  # 留空：不启用备模型
     # 显式覆盖上下文窗口 token 上限（正整数）；注释掉或留空则按模型自动解析
     # context_window_tokens: 131072
     enable_reload: true
@@ -572,15 +576,25 @@ react:
       ttl_context_occupancy_ratio: 0.5
       ttl_message_threshold_ratio: 0.05
     dialogue_compressor_config:
-      trigger_context_ratio: 0.8
+      # 绝对值触发：上下文（含 system + tools + 消息）达到该 token 数才压缩。
+      # 填写后优先于 trigger_context_ratio；留空/注释则回退到比例标准。
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      # 压缩目标保留率：压缩摘要 token ≈ 被压缩内容 token × 该比例（0.3 = 保留 30%）。
+      # 留空/注释则不控制输出长度，按默认行为。
+      target_retention_ratio: 0.3
     current_round_compressor_config:
-      trigger_context_ratio: 0.8
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      target_retention_ratio: 0.3
       keep_recent_messages: 4
     round_level_compressor_config:
-      trigger_context_ratio: 0.8
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      target_retention_ratio: 0.3
       keep_recent_messages: 4
     # 连续相同 reasoning+工具集 / 相同工具入参时，折叠重复轮次；超阈值后兜底中止
     reasoning_tool_loop_compact_config:
@@ -995,13 +1009,7 @@ permissions:
     mcp_free_search: allow
     mcp_paid_search: allow
     mcp_fetch_webpage: allow
-    cron_list_jobs: allow
-    cron_get_job: allow
-    cron_create_job: allow
-    cron_update_job: allow
-    cron_delete_job: allow
-    cron_toggle_job: allow
-    cron_preview_job: allow
+    cron: allow
     configure_channel: allow
     get_wechat_login_status: allow
     acp_chat: ask

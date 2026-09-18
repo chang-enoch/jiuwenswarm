@@ -10,7 +10,6 @@ import pytest
 from jiuwenswarm.agents.harness.common.tools.cron import cron_runtime as runtime_module
 from jiuwenswarm.agents.harness.common.tools.cron.cron_runtime import (
     _CronToolsCronBackend,
-    _add_xiaoyi_device_fields_to_cron_tools,
     _extract_legacy_params,
 )
 from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import CronToolRoute, CronTools
@@ -212,18 +211,16 @@ def test_extract_legacy_params_defaults_to_agent_without_context_mode() -> None:
     assert out["mode"] == "agent"
 
 
-def test_runtime_cron_schemas_keep_device_intents_internal() -> None:
+def test_runtime_cron_schema_keeps_device_intents_internal() -> None:
     tools = create_cron_tools(_FakeCronTools(), context=None)
 
-    _add_xiaoyi_device_fields_to_cron_tools(tools)
-
     cards = {tool.card.name: tool.card for tool in tools}
+    # 统一 cron 工具为扁平 schema，不暴露 required_device_intents（由 xiaoyi
+    # privilege planner 在 bridge 内部注入）。
+    assert list(cards.keys()) == ["cron"]
     assert (
         "required_device_intents"
-        not in cards["cron_create_job"].input_params["properties"]
-    )
-    assert "required_device_intents" not in (
-        cards["cron"].input_params["properties"]["job"]["properties"]
+        not in cards["cron"].input_params["properties"]
     )
 
 
@@ -259,6 +256,107 @@ async def test_ensure_scheduler_requires_message_handler() -> None:
     tools = CronTools(agent_client=object(), message_handler=None)
     scheduler = await tools.ensure_scheduler()
     assert scheduler is None
+
+
+# ── 扁平参数路径（统一 cron 工具新 schema：顶层 run_at / cron_expr / mode）──
+
+
+def test_flat_params_run_at_converts_to_one_shot_cron() -> None:
+    context = SimpleNamespace(channel_id="web", session_id="sess-1", mode=None)
+
+    out = _extract_legacy_params(
+        {
+            "name": "提醒喝水",
+            "description": "该喝水了",
+            "run_at": "2026-03-20T14:30",
+            "timezone": "Asia/Shanghai",
+        },
+        context=context,
+        require_schedule=True,
+    )
+
+    # run_at → 5 段 cron（分 时 日 月 周），并强制 delete_after_run=True（一次性）
+    assert out["cron_expr"] == "30 14 20 3 5"
+    assert out["delete_after_run"] is True
+
+
+def test_flat_params_cron_expr_clears_one_shot_semantics() -> None:
+    context = SimpleNamespace(channel_id="web", session_id="sess-1", mode=None)
+
+    out = _extract_legacy_params(
+        {
+            "name": "日报",
+            "description": "汇总团队进展",
+            "cron_expr": "0 9 * * *",
+            "timezone": "Asia/Shanghai",
+        },
+        context=context,
+        require_schedule=True,
+    )
+
+    assert out["delete_after_run"] is False
+
+
+def test_flat_params_inherits_context_team_mode() -> None:
+    context = SimpleNamespace(channel_id="web", session_id="sess-1", mode="team")
+
+    out = _extract_legacy_params(
+        {
+            "name": "晨会",
+            "description": "汇总团队进展",
+            "cron_expr": "0 9 * * *",
+            "timezone": "Asia/Shanghai",
+        },
+        context=context,
+        require_schedule=True,
+    )
+
+    assert out["mode"] == "team"
+
+
+@pytest.mark.parametrize("enabled_arg", [False, None, True, "omit"], ids=["false", "none", "true", "omit"])
+def test_flat_params_create_always_enables_job(enabled_arg) -> None:
+    """create（require_schedule=True）一律建启用任务。
+
+    显式 false / null 都不再产生禁用任务（bool(None) 静默变 False 的坑）；
+    停用只走 update/toggle 显式路径。
+    """
+    context = SimpleNamespace(channel_id="web", session_id="sess-1", mode=None)
+    payload = {
+        "name": "晨报",
+        "description": "汇总资讯",
+        "cron_expr": "0 9 * * *",
+        "timezone": "Asia/Shanghai",
+    }
+    if enabled_arg != "omit":
+        payload["enabled"] = enabled_arg
+
+    out = _extract_legacy_params(payload, context=context, require_schedule=True)
+
+    assert out["enabled"] is True
+
+    # update 路径不受影响：enabled 仍可作为停用字段。
+    patch = _extract_legacy_params(
+        {"enabled": False}, context=context, require_schedule=False
+    )
+    assert patch["enabled"] is False
+
+
+def test_flat_params_profile_mode_falls_back_to_agent() -> None:
+    context = SimpleNamespace(channel_id="web", session_id="sess-1", mode="design")
+
+    out = _extract_legacy_params(
+        {
+            "name": "设计巡检",
+            "description": "巡检设计稿",
+            "cron_expr": "0 9 * * *",
+            "timezone": "Asia/Shanghai",
+        },
+        context=context,
+        require_schedule=True,
+    )
+
+    assert out["mode"] == "agent"
 
 
 @pytest.mark.asyncio
@@ -511,7 +609,7 @@ async def test_cron_tools_update_job_validates_model(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_cron_tools_create_job_tool_preserves_explicit_empty_project_dir(
+async def test_cron_tools_create_job_preserves_explicit_empty_project_dir(
     tmp_path, monkeypatch
 ) -> None:
     project_store = _setup_project_store(tmp_path, monkeypatch)
@@ -522,13 +620,15 @@ async def test_cron_tools_create_job_tool_preserves_explicit_empty_project_dir(
 
     token = tools.push_cron_route(CronToolRoute(project_dir=str(project_dir)))
     try:
-        job = await tools._create_job_tool(
-            name="daily",
-            cron_expr="0 9 * * *",
-            timezone="Asia/Shanghai",
-            description="hello",
-            targets="web",
-            project_dir="",
+        job = await tools.create_job(
+            {
+                "name": "daily",
+                "cron_expr": "0 9 * * *",
+                "timezone": "Asia/Shanghai",
+                "description": "hello",
+                "targets": "web",
+                "project_dir": "",
+            }
         )
     finally:
         tools.reset_cron_route(token)

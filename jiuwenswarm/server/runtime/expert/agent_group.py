@@ -140,7 +140,11 @@ def _agent_names(payload: dict[str, Any]) -> list[str]:
     return names
 
 
-def _shared_skills(package_dir: Path, payload: dict[str, Any]) -> list[SkillSpec]:
+def _shared_skills(
+        package_dir: Path,
+        payload: dict[str, Any],
+        warnings_out: list[str] | None = None,
+) -> list[SkillSpec]:
     raw_skills = payload.get("skills", [])
     if not isinstance(raw_skills, list):
         raise AgentGroupPackageError("顶层 manifest skills 必须是列表")
@@ -148,12 +152,19 @@ def _shared_skills(package_dir: Path, payload: dict[str, Any]) -> list[SkillSpec
     seen: set[str] = set()
     if not raw_skills:
         return specs
-    skills_root = _child_dir(package_dir, "skills", label="共享技能目录")
+    skills_root: Path | None = None  # 惰性解析：空值条目全跳过时不要求 skills/ 存在
+    skipped_empty = 0
     for raw_name in raw_skills:
+        # 空值条目（null / 空串）跳过；非空非法（非字符串/含分隔符/绝对路径）仍报错
+        if raw_name is None or (isinstance(raw_name, str) and not raw_name.strip()):
+            skipped_empty += 1
+            continue
         name = _safe_component(raw_name, label="共享技能名")
         if name in seen:
             raise AgentGroupPackageError(f"顶层 manifest skills 存在重复技能名: {name!r}")
         seen.add(name)
+        if skills_root is None:
+            skills_root = _child_dir(package_dir, "skills", label="共享技能目录")
         skill_dir = _child_dir(skills_root, name, label=f"共享技能 {name!r}")
         _package_file(
             skill_dir / "SKILL.md",
@@ -161,6 +172,8 @@ def _shared_skills(package_dir: Path, payload: dict[str, Any]) -> list[SkillSpec
             label=f"共享技能 {name!r} 的 SKILL.md",
         )
         specs.append(SkillSpec(dir=str(skill_dir), mode="all"))
+    if skipped_empty and warnings_out is not None:
+        warnings_out.append(f"共享 skills 忽略 {skipped_empty} 个空值条目")
     return specs
 
 
@@ -214,12 +227,17 @@ def _load_member_template(package_dir: Path, agent_name: str) -> AgentTemplateSp
     return template
 
 
-def load_agent_group_package(path: Path) -> dict[str, AgentTemplateSpec]:
+def load_agent_group_package(
+        path: Path,
+        warnings_out: list[str] | None = None,
+) -> dict[str, AgentTemplateSpec]:
     """严格加载一个专家团包，返回按顶层 agents 顺序排列的成员模板字典。
 
     产物语义：instruction 已注入为 ``agent_group_instruction`` prompt section
     （priority 20，重名即报错）；共享 skills 以绝对路径 SkillSpec 去重合并进
     各成员 skills。成员模板经 agent-core loader 二次解析（双保险）。
+
+    ``warnings_out`` 非空时收集可跳过的宽容项（如空值 skills 条目）。
     """
     try:
         package_dir = Path(path).expanduser().resolve(strict=True)
@@ -244,7 +262,7 @@ def load_agent_group_package(path: Path) -> dict[str, AgentTemplateSpec]:
     if not isinstance(instruction, str):
         raise AgentGroupPackageError("顶层 manifest instruction 必须是字符串")
     instruction = instruction.strip()
-    shared_skills = _shared_skills(package_dir, payload)
+    shared_skills = _shared_skills(package_dir, payload, warnings_out)
 
     templates: dict[str, AgentTemplateSpec] = {}
     for agent_name in _agent_names(payload):
@@ -283,12 +301,12 @@ def validate_agent_group_package(package_dir: Path) -> list[str]:
     """
     from jiuwenswarm.server.runtime.expert.expert_store import InvalidExpertPackage
 
+    warnings: list[str] = []
     try:
-        load_agent_group_package(package_dir)
+        load_agent_group_package(package_dir, warnings_out=warnings)
     except (AgentGroupPackageError, OSError, ValueError) as exc:
         raise InvalidExpertPackage(str(exc)) from exc
 
-    warnings: list[str] = []
     agents_root = package_dir / "agents"
     if agents_root.is_dir():
         for member_dir in sorted(agents_root.iterdir()):

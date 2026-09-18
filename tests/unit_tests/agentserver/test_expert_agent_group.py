@@ -240,6 +240,33 @@ def test_reject_shared_skill_not_listed_dir_missing(tmp_path: Path) -> None:
         load_agent_group_package(pkg)
 
 
+def test_shared_skills_skip_empty_entries(tmp_path: Path) -> None:
+    """共享 skills 空值条目（null / 空串）跳过并记 warning，合法条目不受影响。"""
+    pkg = _copy_sample(tmp_path)
+    _break_top_manifest(pkg, skills=[None, "", "   ", "skill_name_1"])
+    warnings: list[str] = []
+    templates = load_agent_group_package(pkg, warnings_out=warnings)
+    assert list(templates.keys()) == ["leader", "member1", "member2"]
+    assert any("空值条目" in w for w in warnings)
+    # 合法共享 skill 仍去重合并进各成员
+    for name, template in templates.items():
+        skill_dirs = [s.dir for s in template.skills]
+        assert any(
+            d.replace("\\", "/").endswith("skills/skill_name_1") for d in skill_dirs
+        ), name
+
+
+def test_shared_skills_all_empty_no_skills_root_required(tmp_path: Path) -> None:
+    """skills 列表全为空值时不要求 skills/ 根目录存在（惰性解析）。"""
+    pkg = _copy_sample(tmp_path)
+    shutil.rmtree(pkg / "skills")
+    _break_top_manifest(pkg, skills=[None, ""])
+    warnings: list[str] = []
+    templates = load_agent_group_package(pkg, warnings_out=warnings)
+    assert list(templates.keys()) == ["leader", "member1", "member2"]
+    assert any("空值条目" in w for w in warnings)
+
+
 def test_validate_expert_package_dispatches_group(tmp_path: Path) -> None:
     pkg = _copy_sample(tmp_path)
     assert es.validate_expert_package(pkg) == []
@@ -324,7 +351,7 @@ def test_identity_extra_no_binding(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_identity_extra_agent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _clear_name_cache
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _clear_name_cache
 ) -> None:
     from jiuwenswarm.server.runtime.expert import expert_service as svc
 
@@ -351,7 +378,7 @@ def test_identity_extra_agent(
 
 
 def test_identity_extra_team_uses_lead_name(
-    monkeypatch: pytest.MonkeyPatch, _clear_name_cache
+        monkeypatch: pytest.MonkeyPatch, _clear_name_cache
 ) -> None:
     from jiuwenswarm.server.runtime.expert import expert_service as svc
 
@@ -373,7 +400,7 @@ def test_identity_extra_team_uses_lead_name(
 
 
 def test_identity_extra_package_missing_keeps_id(
-    monkeypatch: pytest.MonkeyPatch, _clear_name_cache
+        monkeypatch: pytest.MonkeyPatch, _clear_name_cache
 ) -> None:
     from jiuwenswarm.server.runtime.expert import expert_service as svc
 
@@ -387,7 +414,7 @@ def test_identity_extra_package_missing_keeps_id(
 
 
 def test_history_identity_extra_unbound_writes_explicit_default_marker(
-    monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """未绑定专家的会话：主应答落盘显式写 expert_id=""（区分默认角色作答与存量无字段）。"""
     from jiuwenswarm.server.runtime.expert import expert_service as svc
@@ -400,7 +427,7 @@ def test_history_identity_extra_unbound_writes_explicit_default_marker(
 
 
 def test_history_identity_extra_bound_delegates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _clear_name_cache
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _clear_name_cache
 ) -> None:
     """已绑定专家：与 current_expert_identity_extra 一致（含显示名快照）。"""
     from jiuwenswarm.server.runtime.expert import expert_service as svc

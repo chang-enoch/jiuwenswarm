@@ -328,6 +328,76 @@ def load_history_records(session_id: str) -> list[dict[str, Any]]:
     return _dedup_records_last_wins(_read_history(path))
 
 
+_JSONL_TAIL_CHUNK = 8192
+
+
+def _iter_jsonl_file_lines_reversed(path: Path):
+    """Yield non-empty jsonl lines from EOF backward as raw bytes."""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        position = fh.tell()
+        buffer = b""
+        while position > 0:
+            step = min(_JSONL_TAIL_CHUNK, position)
+            position -= step
+            fh.seek(position)
+            buffer = fh.read(step) + buffer
+            lines = buffer.split(b"\n")
+            buffer = lines[0]
+            for raw in reversed(lines[1:]):
+                stripped = raw.strip()
+                if stripped:
+                    yield stripped
+        stripped = buffer.strip()
+        if stripped:
+            yield stripped
+
+
+def _request_id_from_raw_history_line(raw: bytes, *, exclude_request_id: str) -> str | None:
+    try:
+        item = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(item, dict):
+        return None
+    rid = str(item.get("request_id") or "").strip()
+    if not rid or (exclude_request_id and rid == exclude_request_id):
+        return None
+    return rid
+
+
+def load_history_tail_request_id(
+    session_id: str,
+    *,
+    exclude_request_id: str | None = None,
+) -> str | None:
+    """Last non-empty ``request_id`` on disk, optionally skipping the in-flight turn.
+
+    ``history.jsonl`` is scanned from EOF so fingerprint compares do not load
+    the whole file. Legacy ``history.json`` is small and still read in full.
+    """
+    path = get_read_history_path(session_id)
+    if not path.exists():
+        return None
+    excluded = (exclude_request_id or "").strip()
+    if path.suffix.lower() == ".jsonl":
+        for raw in _iter_jsonl_file_lines_reversed(path):
+            rid = _request_id_from_raw_history_line(raw, exclude_request_id=excluded)
+            if rid:
+                return rid
+        return None
+    records = _dedup_records_last_wins(_read_history(path))
+    tail: str | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        rid = str(record.get("request_id") or "").strip()
+        if not rid or (excluded and rid == excluded):
+            continue
+        tail = rid
+    return tail
+
+
 def _write_records_to_path(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() == ".jsonl":

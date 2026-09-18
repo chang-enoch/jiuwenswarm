@@ -286,7 +286,7 @@ This section provides a quick index of Harness built-in capabilities. Whether a 
 | Skill / tool discovery | `skill_tool`, `list_skill`, `search_tools`, `load_tools` | Invoke skills, list skills, and progressively search/load tools | Registered by `SkillUseRail` and `ProgressiveToolRail`; depends on skill directories and progressive-tool config |
 | Memory / Coding Memory | `memory_*`, `coding_memory_*` | Read and write long-term memory, coding experience, and project knowledge | Registered by `MemoryRail`, `CodingMemoryRail`, and related memory rails |
 | Agent mode and user interaction | `switch_mode`, `enter_plan_mode`, `exit_plan_mode`, `ask_user` | Switch normal/plan modes and request user input at key decision points | Registered by `AgentModeRail`, `AskUserRail`, or host interaction rails |
-| Worktree / Cron | `enter_worktree`, `exit_worktree`, `cron`, `cron_list_jobs`, `cron_get_job`, `cron_create_job`, `cron_update_job`, `cron_delete_job`, `cron_toggle_job`, `cron_preview_job` | Enter isolated git worktrees and manage scheduled/periodic automation | Registered by `WorktreeRail` or a host cron backend; cron supports both unified and split tool forms |
+| Worktree / Cron | `enter_worktree`, `exit_worktree`, `cron` | Enter isolated git worktrees and manage scheduled/periodic automation | Registered by `WorktreeRail` or a host cron backend; `cron` is the unified action-dispatch tool (list/add/update/remove/run) |
 | Mobile GUI / browser runtime | Mobile coordinate/navigation tools, browser runtime tools | Mobile GUI actions, browser task execution, runtime health checks, and cancellation control | Registered by mobile GUI / browser runtime tool packages or host runtimes |
 
 #### Built-in Rail

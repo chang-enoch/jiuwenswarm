@@ -311,6 +311,86 @@ class TestCronLastSessionId:
         assert stored.last_session_id == "cron_agentserver_allocated"
 
 
+class TestSchedulerRunRecords:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("targets", ["xiaoyi", "web", "tui", "dingtalk"])
+    @pytest.mark.parametrize("failed", [False, True])
+    @pytest.mark.parametrize("one_shot", [False, True])
+    async def test_records_survive_cleanup_without_pc(self, tmp_path, targets, failed, one_shot):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets=targets)
+        job = await store.update_job(job.id, {"delete_after_run": one_shot})
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler, FailingAgentClient() if failed else FakeAgentClient())
+        await svc.reload()
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+        # 执行结束即落盘；推送尚未发生也能查询记录。
+        records = await store.list_run_records()
+        assert len(records) == 1
+        assert records[0]["status"] == ("failed" if failed else "success")
+        assert records[0]["taskName"] == job.name
+        assert records[0]["finishedAt"] >= records[0]["startedAt"]
+        assert await store.get_job(job.id) is not None
+        await svc.handle_event(_Event(time.time(), 1, "push_update", job.id, run_id))
+        assert bool(handler.published)
+        assert (await store.get_job(job.id) is None) == one_shot
+        # 重建存储实例模拟 PC 重连/进程重启，已删任务的记录仍在。
+        assert await CronJobStore(path=store.path).list_run_records() == records
+
+    @pytest.mark.asyncio
+    async def test_record_write_failure_keeps_one_shot(self, tmp_path):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets="xiaoyi")
+        job = await store.update_job(job.id, {"delete_after_run": True})
+        svc = _make_scheduler(store)
+        await svc.reload()
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+        with patch.object(store, "save_run_record", side_effect=OSError("disk full")):
+            await svc.handle_event(_Event(time.time(), 1, "push_update", job.id, run_id))
+        assert await store.get_job(job.id) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder_first", [False, True])
+    async def test_one_shot_deleted_only_after_final_push(self, tmp_path, placeholder_first):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets="xiaoyi")
+        job = await store.update_job(job.id, {"delete_after_run": True})
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler)
+        await svc.reload()
+        run_id = f"{job.id}:1234"
+        if placeholder_first:
+            await svc.handle_event(_Event(time.time(), 1, "push", job.id, run_id))
+            assert await store.get_job(job.id) is not None
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+        kind = "push_update" if placeholder_first else "push"
+        await svc.handle_event(_Event(time.time(), 2, kind, job.id, run_id))
+        assert await store.get_job(job.id) is None
+        assert len(handler.published) == (2 if placeholder_first else 1)
+        assert len(await store.list_run_records()) == 1
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_does_not_block_cleanup(self, tmp_path):
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store, targets="xiaoyi")
+        job = await store.update_job(job.id, {"delete_after_run": True})
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler)
+        await svc.reload()
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+        with patch.object(handler, "publish_robot_messages", side_effect=RuntimeError("offline")):
+            await svc.handle_event(_Event(time.time(), 1, "push_update", job.id, run_id))
+        assert await store.get_job(job.id) is None
+        assert (await store.list_run_records())[0]["status"] == "success"
+
+
 class TestWithWorkspaceDir:
     def test_appends_constraint_after_task_text(self, tmp_path):
         workspace = tmp_path / "定时任务-ws"

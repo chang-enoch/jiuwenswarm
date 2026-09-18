@@ -45,6 +45,38 @@ class FakeWebChannel:
         )
 
 
+@pytest.mark.asyncio
+async def test_cron_run_list_reads_persisted_records_after_job_deleted(tmp_path):
+    from jiuwenswarm.gateway.cron.controller import CronController
+    from jiuwenswarm.gateway.cron.store import CronJobStore
+
+    path = tmp_path / "cron_jobs.json"
+    store = CronJobStore(path=path)
+    job = await store.create_job(name="下班提醒", cron_expr="0 18 * * *",
+                                 timezone="Asia/Shanghai", description="下班",
+                                 targets="xiaoyi", delete_after_run=True)
+    record = {"id": "run-1", "taskId": job.id, "taskName": job.name,
+              "startedAt": 1000, "finishedAt": 2000, "status": "success",
+              "scope": "my-pc", "summary": "该下班了"}
+    await store.save_run_record(record)
+    await store.delete_job(job.id)
+    channel = FakeWebChannel()
+    controller = CronController(store=CronJobStore(path=path), scheduler=None)
+    _register_web_handlers(WebHandlersBindParams(channel=channel, cron_controller=controller))
+    await channel.methods["cron.run.list"](None, "records", {}, None)
+    assert channel.responses[-1]["ok"] is True
+    assert channel.responses[-1]["payload"] == {"runs": [record]}
+
+
+@pytest.mark.asyncio
+async def test_cron_run_list_reports_unavailable_controller():
+    channel = FakeWebChannel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+    await channel.methods["cron.run.list"](None, "records", {}, None)
+    assert channel.responses[-1]["ok"] is False
+    assert channel.responses[-1]["code"] == "INTERNAL_ERROR"
+
+
 class FakeAgentClient:
     def __init__(self):
         self.reload_started = asyncio.Event()

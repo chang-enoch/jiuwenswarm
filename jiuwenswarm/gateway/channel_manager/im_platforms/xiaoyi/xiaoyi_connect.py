@@ -43,6 +43,7 @@ from jiuwenswarm.gateway.routing.keys import XiaoyiDeliveryTarget
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
 from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.push import XiaoYiPushService, PushConfig
 from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.formatter import (
+    build_tool_call_part,
     get_status_state_for_event,
     get_status_text_for_event,
     is_retry_notice_text,
@@ -483,6 +484,12 @@ class XiaoyiChannel(BaseChannel):
         self.api_id = config.api_id
         self.push_id = config.push_id
         self._accumulated_texts: dict[str, str] = {}  # Accumulated text per session for push notification
+        # 正文流式输出分片状态（按 task 归集）。一次会话里模型每调用一轮就产出一段
+        # 正文，端侧把同一 task 的增量碎片前后直接拼接，段与段之间会粘成一行。
+        # 实现：每段正文「扣住最后一片」不发，等这段正文结束时把这一片补一个换行
+        # 再发出——帧数不变、不补空帧，段与段之间在端侧就出现换行。
+        self._text_stream_prefix: dict[Any, str] = {}  # 本段已作为增量发出的正文
+        self._text_stream_pending: dict[Any, tuple[str, str]] = {}  # (扣住的最后一片, part kind)
         # V2 Stream Routing: agent_id → (顶层 sessionId, task_id, push_id, ts) 活跃映射，出站判定 ws vs push 用
         self._active_push_sessions: dict[str, tuple[str, str, str, float]] = {}
         # V2: team 投递 ws 活跃窗口——最近 N 秒内有该 agent_id 的 inbound 视为手机端在线，走 ws；超窗走 push。
@@ -624,6 +631,8 @@ class XiaoyiChannel(BaseChannel):
         self._team_last_leader_finals.clear()
         self._sessions_marked_for_cleanup.clear()
         self._accumulated_texts.clear()
+        self._text_stream_prefix.clear()
+        self._text_stream_pending.clear()
         # V2: 清理 push 合并窗口任务
         for _aid in list(self._push_flush_tasks.keys()):
             if self._push_flush_tasks[_aid]:
@@ -1099,6 +1108,17 @@ class XiaoyiChannel(BaseChannel):
             return
 
         if should_send_as_status_update(msg.event_type):
+            if msg.event_type in {
+                EventType.CHAT_TOOL_CALL,
+                EventType.CHAT_TOOL_UPDATE,
+                EventType.CHAT_TOOL_RESULT,
+            }:
+                # 工具阶段开始 = 本轮模型调用的正文已经结束：先把扣住的最后一片
+                # 补一个换行发出去，再下发工具状态——端侧拼接时正文段之间就有换行，
+                # 且「本段正文」与「工具卡」的先后顺序保持不变。
+                await self._flush_text_stream_segment(
+                    session_id, task_id, team_task_key, reason="tool_phase"
+                )
             is_processing = (
                 msg.payload.get("is_processing", True)
                 if isinstance(msg.payload, dict)
@@ -1159,9 +1179,11 @@ class XiaoyiChannel(BaseChannel):
                 else get_status_text_for_event(msg.event_type, msg.payload)
             )
             status_state = get_status_state_for_event(msg.event_type, msg.payload)
+            # 工具事件：附带结构化 data part（status-update 的 message.parts 里）
+            _tool_part = build_tool_call_part(msg.event_type, msg.payload)
             for url_key in list(self._ws_connections.keys()):
                 await self._send_status_update_with_state(
-                    task_id, session_id, status_text, status_state, url_key
+                    task_id, session_id, status_text, status_state, url_key, extra_part=_tool_part
                 )
             if status_state in {"completed", "failed", "canceled"} and session_id:
                 await self._finalize_session(
@@ -1199,6 +1221,10 @@ class XiaoyiChannel(BaseChannel):
 
         # 处理错误消息：发送 failed 状态 + 错误文本 + 结束会话
         if msg.event_type == EventType.CHAT_ERROR:
+            # 先把扣住的正文片收尾发出，避免本段最后一片正文丢失
+            await self._flush_text_stream_segment(
+                session_id, task_id, team_task_key, reason="chat_error"
+            )
             error_text = get_status_text_for_event(msg.event_type, msg.payload)
             # 优先从 payload.error 提取详细错误信息
             if isinstance(msg.payload, dict):
@@ -1364,6 +1390,20 @@ class XiaoyiChannel(BaseChannel):
                 )
             return
 
+        # kind 按 event_type 选，与 formatter 分类对齐。只有 kind=text（正文）参与
+        # 「每段正文以 lastChunk=true 收尾」的分片处理；reasoning/subtask 保持原语义。
+        part_kind = (
+            "reasoningText"
+            if should_send_as_reasoning_text(msg.event_type)
+            else "text"
+        )
+
+        # 实际发给小艺的帧列表：(正文, append, lastChunk)。正文流式输出会拆成
+        # 「前面的增量帧 + 一片 lastChunk=True 的收尾帧」。split_frames=True 表示
+        # 已显式拆帧（即使结果为空也不再走单帧兜底，避免补多余空帧）。
+        frames_to_send: list[tuple[str, bool, bool]] = []
+        split_frames = False
+
         # 如果禁用流式，总是作为完整消息发送
         if not self.config.enable_streaming:
             append = False
@@ -1398,14 +1438,66 @@ class XiaoyiChannel(BaseChannel):
                 last_chunk = True
                 final = False
             elif is_chat_final:
-                append = False
-                last_chunk = True
+                if part_kind != "text":
+                    append = False
+                    last_chunk = True
+                else:
+                    # 本段正文结束（本轮模型调用的正文收尾）：把扣住的最后一片补一个
+                    # 换行后发出（端侧拼接时段间就有换行）；终稿若没被已发增量覆盖
+                    # （模型改写/压缩），只补发缺的那部分，不重发整段（防正文重复）。
+                    split_frames = True
+                    streamed = self._text_stream_prefix.pop(team_task_key, "")
+                    held_raw = self._text_stream_pending.pop(team_task_key, None)
+                    held = held_raw[0] if held_raw else ""
+                    covered = streamed + held
+                    if content and content not in covered:
+                        if held:
+                            frames_to_send.append((held, True, False))
+                        tail = (
+                            content[len(streamed):]
+                            if streamed and content.startswith(streamed)
+                            else content
+                        )
+                        if tail:
+                            frames_to_send.append((f"{tail}\n", True, True))
+                    elif held:
+                        frames_to_send.append((f"{held}\n", True, True))
+                    append = True
+                    last_chunk = True
+                    logger.info(
+                        "[GUI_AGENT_DIAG] phase=XIAOYI_TEXT_STREAM_END message_id=%s "
+                        "platform_task_id=%s streamed_len=%d held_len=%d final_len=%d "
+                        "frames=%r final_newline=True reason=stream_output_end",
+                        msg.id,
+                        task_id,
+                        len(streamed),
+                        len(held),
+                        len(content),
+                        [(len(t), last) for t, _, last in frames_to_send],
+                    )
                 # Agent streams finish via processing_status; local notices do not.
                 final = terminal_notice
             else:
                 append = True
                 last_chunk = is_final
                 final = is_final
+                if part_kind == "text":
+                    # 扣住最后一片：先把上一片（若存在）作为普通增量发出，再把本片
+                    # 挂起，供本段正文收尾时标 lastChunk=True。
+                    split_frames = True
+                    held_prev_raw = self._text_stream_pending.pop(team_task_key, None)
+                    held_prev = held_prev_raw[0] if held_prev_raw else ""
+                    if held_prev:
+                        frames_to_send.append((held_prev, True, False))
+                        self._text_stream_prefix[team_task_key] = (
+                            self._text_stream_prefix.get(team_task_key, "") + held_prev
+                        )
+                    if content:
+                        self._text_stream_pending[team_task_key] = (content, part_kind)
+
+        # 未显式拆帧的路径（非流式 / team / reasoning 等）：按原有单帧语义发送
+        if not split_frames:
+            frames_to_send.append((content, append, last_chunk))
 
         logger.info(
             "[GUI_AGENT_DIAG] phase=XIAOYI_TEXT_FLAGS message_id=%s "
@@ -1436,29 +1528,29 @@ class XiaoyiChannel(BaseChannel):
         # 且未被前置 status_update / ask_user_question 分流者。当前 reasoning 集合里
         # 能落到此处的只有 CHAT_SUBTASK_UPDATE（CHAT_REASONING 在 :640 前置分流、
         # CHAT_PROCESSING_STATUS 在 :724 status_update 分流）。
-        # kind 按 event_type 选，与 formatter 分类对齐。
-        part_kind = (
-            "reasoningText"
-            if should_send_as_reasoning_text(msg.event_type)
-            else "text"
-        )
         for url_key, ws in self._ws_connections.items():
             if ws:
                 try:
-                    await self._send_text_response(
-                        session_id,
-                        task_id,
-                        content,
-                        url_key,
-                        append=append,
-                        last_chunk=last_chunk,
-                        is_final=final,
-                        kind=part_kind,
-                    )
+                    for frame_text, frame_append, frame_last in frames_to_send:
+                        await self._send_text_response(
+                            session_id,
+                            task_id,
+                            frame_text,
+                            url_key,
+                            append=frame_append,
+                            last_chunk=frame_last,
+                            is_final=final,
+                            kind=part_kind,
+                        )
                 except Exception as e:
                     logger.warning(f"XiaoyiChannel 发送消息失败 ({url_key}): {e}")
 
         if final and session_id:
+            # 收尾兜底：本轮没有 chat.final 就结束时（例如只有 processing_status），
+            # 把扣住的正文片补一个换行补发。
+            await self._flush_text_stream_segment(
+                session_id, task_id, team_task_key, reason="turn_final", is_final=True
+            )
             await self._stop_session_heartbeat(session_id)
             # Clean up tasks and mark session as completed
             self._clear_task_timeout(session_id)
@@ -1472,6 +1564,11 @@ class XiaoyiChannel(BaseChannel):
 
             # Clear accumulated text
             self._accumulated_texts.pop(session_id, None)
+            # 清理正文分片状态（session 与 task 两个键都清，防串轮）
+            self._text_stream_prefix.pop(session_id, None)
+            self._text_stream_prefix.pop(team_task_key, None)
+            self._text_stream_pending.pop(session_id, None)
+            self._text_stream_pending.pop(team_task_key, None)
             # V2: 清理活跃映射（按 sessionId 反查 agent_id）
             _aid_to_clean = [
                 aid for aid, (sid, _, _, _) in self._active_push_sessions.items()
@@ -1534,9 +1631,10 @@ class XiaoyiChannel(BaseChannel):
             if ws_session and ws_task:
                 status_text = get_status_text_for_event(msg.event_type, msg.payload)
                 status_state = get_status_state_for_event(msg.event_type, msg.payload)
+                _team_tool_part = build_tool_call_part(msg.event_type, msg.payload)
                 for url_key in list(self._ws_connections.keys()):
                     await self._send_status_update_with_state(
-                        ws_task, ws_session, status_text, status_state, url_key
+                        ws_task, ws_session, status_text, status_state, url_key, extra_part=_team_tool_part
                     )
             return
         if msg.event_type == EventType.CHAT_FILE:
@@ -3088,10 +3186,21 @@ class XiaoyiChannel(BaseChannel):
             await self._send_agent_response(session_id, task_id, response, url_key)
 
     async def _send_status_update_with_state(
-            self, task_id: str, session_id: str, message: str, state: str, url_key: str
+            self,
+            task_id: str,
+            session_id: str,
+            message: str,
+            state: str,
+            url_key: str,
+            extra_part: dict | None = None,
     ) -> None:
         """发送状态更新消息（A2A 格式），支持自定义状态."""
         is_final = state in {"completed", "failed", "canceled"}
+        parts: list[dict] = [{"kind": "text", "text": message}]
+        # 工具事件附结构化 data part（kind:"data"，A2A 规范内），端侧据此渲染工具卡；
+        # 老客户端忽略未知 part，text 文案仍照常下发。
+        if extra_part:
+            parts.append(extra_part)
         response = {
             "jsonrpc": "2.0",
             "id": f"msg_{int(time.time() * 1000)}",
@@ -3102,7 +3211,7 @@ class XiaoyiChannel(BaseChannel):
                 "status": {
                     "message": {
                         "role": "agent",
-                        "parts": [{"kind": "text", "text": message}],
+                        "parts": parts,
                     },
                     "state": state,
                 },
@@ -3332,6 +3441,55 @@ class XiaoyiChannel(BaseChannel):
         # runtime. A later user turn will replace the latest task mapping.
         self._team_tasks.discard((session_id, task_id))
         self._team_last_leader_finals.pop((session_id, task_id), None)
+
+    async def _flush_text_stream_segment(
+        self,
+        session_id: str,
+        task_id: str,
+        task_key: Any,
+        *,
+        reason: str,
+        is_final: bool = False,
+    ) -> None:
+        """结束当前正文流式输出：把扣住的最后一片补一个换行后发出。
+
+        端侧把同一 task 的正文增量前后拼接，模型每轮调用产出的一段正文之间会粘在
+        一起。网关按「扣住最后一片」实现：增量帧只发到倒数第二片，最后一片等这段
+        正文结束（下一个工具阶段开始 / 本轮终帧 / 出错）时补一个换行再下发——帧数
+        不变、不补空帧，端侧拼接段落之间就有换行。
+        """
+        held_raw = self._text_stream_pending.pop(task_key, None)
+        self._text_stream_prefix.pop(task_key, None)
+        if not held_raw:
+            return
+        held, held_kind = held_raw
+        if not held:
+            return
+        text = f"{held}\n"
+        for url_key, ws in list(self._ws_connections.items()):
+            if not ws:
+                continue
+            try:
+                await self._send_text_response(
+                    session_id,
+                    task_id,
+                    text,
+                    url_key,
+                    append=True,
+                    last_chunk=is_final,
+                    is_final=is_final,
+                    kind=held_kind or "text",
+                )
+            except Exception as e:
+                logger.warning(f"XiaoyiChannel 正文分段收尾帧发送失败 ({url_key}): {e}")
+        logger.info(
+            "[GUI_AGENT_DIAG] phase=XIAOYI_TEXT_STREAM_SEGMENT_END "
+            "platform_task_id=%s held_len=%d is_final=%s reason=%s newline=True",
+            task_id,
+            len(held),
+            is_final,
+            reason,
+        )
 
     async def _send_text_response(
             self,

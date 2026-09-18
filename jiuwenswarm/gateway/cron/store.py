@@ -16,6 +16,7 @@ import portalocker
 from jiuwenswarm.gateway.cron.models import (
     CronJob,
     CronTarget,
+    CronTargetChannel,
     CRON_JOB_DEFAULT_MODE,
     normalize_cron_job_mode,
     normalize_cron_job_timeout_seconds,
@@ -136,6 +137,35 @@ class _ProactiveJobProtected(RuntimeError):
     """
 
 
+def normalize_cron_targets_for_pc(
+    targets: str, *, is_device_job: bool
+) -> str:
+    """手机（xiaoyi 渠道）建的 PC 任务投递渠道归一：非设备任务 xiaoyi → web。
+
+    手机端经 xiaoyi 渠道创建 PC 定时任务时，来源通道推断/A2A delivery 会落
+    ``targets=xiaoyi``：到点结果只推回手机渠道，PC 桌面 WebChannel 收不到
+    推送（侧栏无会话、历史不可见）。非设备任务在 PC 上执行，结果统一归
+    ``web`` 渠道，手机端仍可经 ws/link CronQuery 查询同一份任务与记录。
+
+    设备任务（``required_device_intents`` + ``xiaoyi_push_id``）不归一：
+    其结果必须回推手机设备，改成 web 会让手机端收不到执行结果。
+
+    Args:
+        targets: 规范化前的渠道 ID。
+        is_device_job: 是否为小艺设备任务。
+
+    Returns:
+        归一后的渠道 ID。
+    """
+    value = str(targets or "").strip()
+    if not is_device_job and value == CronTargetChannel.XIAOYI.value:
+        logger.info(
+            "[CronStore] normalize xiaoyi targets to web (phone-created PC job)"
+        )
+        return CronTargetChannel.WEB.value
+    return value
+
+
 class CronJobStore:
     """Persist cron jobs to ~/.jiuwenswarm/agent/home/cron_jobs.json.
 
@@ -158,6 +188,51 @@ class CronJobStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    async def list_run_records(self) -> list[dict[str, Any]]:
+        return await self._run_locked(self._read_run_records)
+
+    def _read_run_records(self) -> list[dict[str, Any]]:
+        path = self._path.with_name("cron_run_records.json")
+        def read(source: Path) -> list[dict[str, Any]]:
+            rows = json.loads(source.read_text(encoding="utf-8-sig")) if source.exists() else []
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                or not row["id"] or not isinstance(row.get("startedAt"), (int, float))
+                for row in rows
+            ):
+                raise ValueError(f"Invalid cron run records: {source}")
+            return rows
+
+        rows = read(path)
+        legacy = self._path.with_name("cron_desktop_runs.json")
+        if legacy.exists():
+            merged = {row["id"]: row for row in read(legacy)}
+            for row in rows:
+                merged[row["id"]] = {**merged.get(row["id"], {}), **row}
+            rows = sorted(merged.values(), key=lambda row: row["startedAt"])
+            self._write_run_records(rows)
+            # 写入或删除失败均保留旧文件；重试时按 ID 合并，不会产生重复记录。
+            legacy.unlink()
+        return rows
+
+    def _write_run_records(self, rows: list[dict[str, Any]]) -> None:
+        path = self._path.with_name("cron_run_records.json")
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(rows, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+
+    async def save_run_record(self, record: dict[str, Any]) -> None:
+        def write():
+            rows = [r for r in self._read_run_records() if r["id"] != record["id"]]
+            rows.append(record)
+            rows.sort(key=lambda r: r["startedAt"])
+            # 保留迁入的历史记录，后续写入也不截断为 500 条。
+            self._write_run_records(rows)
+        await self._run_locked(write)
 
     def _call_under_file_lock(self, fn: Callable[[], _T]) -> _T:
         """在伴生 ``cron_jobs.json.lock`` 上拿跨进程锁后执行 fn（不被原子 replace 覆盖）。
@@ -197,7 +272,6 @@ class CronJobStore:
 
             if needs_migration:
                 id_to_work_mode = _build_cron_project_lookup()
-                changed = False
                 for item in jobs_raw:
                     if not isinstance(item, dict):
                         continue
@@ -207,14 +281,34 @@ class CronJobStore:
                     item["work_mode"] = _resolve_cron_job_work_mode(
                         item, id_to_work_mode
                     )
-                    changed = True
-                if changed:
-                    try:
-                        self._write_json_unlocked(data)
-                    except (OSError, ValueError, TypeError) as exc:
-                        logger.warning(
-                            "Cron 惰性迁移写回 cron_jobs.json 失败: %s", exc
-                        )
+
+            # 存量迁移:手机建的 PC 任务落了 targets=xiaoyi,PC 桌面 WebChannel
+            # 收不到推送。非设备任务读时归一为 web 并写回(设备任务保持 xiaoyi)。
+            for item in jobs_raw:
+                if not isinstance(item, dict):
+                    continue
+                raw_targets = item.get("targets")
+                if not isinstance(raw_targets, str):
+                    continue
+                is_device = bool(
+                    normalize_required_device_intents(
+                        item.get("required_device_intents")
+                    )
+                )
+                normalized = normalize_cron_targets_for_pc(
+                    raw_targets, is_device_job=is_device
+                )
+                if normalized != raw_targets:
+                    item["targets"] = normalized
+                    needs_migration = True
+
+            if needs_migration:
+                try:
+                    self._write_json_unlocked(data)
+                except (OSError, ValueError, TypeError) as exc:
+                    logger.warning(
+                        "Cron 惰性迁移写回 cron_jobs.json 失败: %s", exc
+                    )
 
             jobs: list[CronJob] = []
             for item in jobs_raw:
@@ -285,10 +379,14 @@ class CronJobStore:
         push_id = str(xiaoyi_push_id or "").strip() or None
         if device_intents and not push_id:
             raise ValueError("xiaoyi_push_id is required for device cron jobs")
+        targets = normalize_cron_targets_for_pc(
+            targets, is_device_job=bool(device_intents)
+        )
         job = CronJob(
             id=str(job_id or "").strip() or uuid.uuid4().hex,
             name=str(name or "").strip(),
-            enabled=bool(enabled),
+            # 建好即启用：None 与缺省同等对待（bool(None) 会静默变 False）。
+            enabled=bool(enabled) if enabled is not None else True,
             cron_expr=str(cron_expr or "").strip(),
             timezone=str(timezone or "").strip(),
             wake_offset_seconds=int(wake_offset_seconds) if wake_offset_seconds is not None else 0,
@@ -361,7 +459,15 @@ class CronJobStore:
         if "description" in patch:
             updated = replace(updated, description=str(patch.get("description") or ""))
         if "targets" in patch:
-            updated = replace(updated, targets=str(patch.get("targets") or "").strip())
+            updated = replace(
+                updated,
+                targets=normalize_cron_targets_for_pc(
+                    str(patch.get("targets") or "").strip(),
+                    # 同 job 既有设备标记判定：设备任务 update 不可变三个内容字段，
+                    # 但 targets 字段本身仍可被尝试修改，按既有设备状态归一。
+                    is_device_job=bool(updated.required_device_intents),
+                ),
+            )
         if "session_id" in patch:
             raw_sid = patch.get("session_id")
             new_sid = str(raw_sid).strip() if isinstance(raw_sid, str) and str(raw_sid).strip() else None

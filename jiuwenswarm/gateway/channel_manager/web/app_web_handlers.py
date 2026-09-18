@@ -5696,6 +5696,13 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     def _get_cron():
         return _resolve(cron_controller)
 
+    async def _cron_run_list(ws, req_id, params, session_id):
+        cc = _get_cron()
+        if cc is None:
+            await channel.send_response(ws, req_id, ok=False, error="cron not available", code="INTERNAL_ERROR")
+            return
+        await channel.send_response(ws, req_id, ok=True, payload={"runs": await cc.list_run_records()})
+
     async def _cron_job_list(ws, req_id, params, session_id):
         cc = _get_cron()
         if cc is None:
@@ -6042,6 +6049,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("channel.wechat.get_login_ui", _channel_wechat_get_login_ui)
     channel.register_method("channel.wechat.unbind", _channel_wechat_unbind)
     channel.register_method("cron.job.list", _cron_job_list)
+    channel.register_method("cron.run.list", _cron_run_list)
     channel.register_method("cron.job.meta", _cron_job_meta)
     channel.register_method("cron.job.get", _cron_job_get)
     channel.register_method("cron.job.create", _cron_job_create)

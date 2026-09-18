@@ -448,6 +448,10 @@ class CronSchedulerService:
         # 可能超过 grace 窗口（初始化耗时长），此时崩溃重启后的首次 reload
         # 不应被误判为运行期而恢复原先要避免的重复执行风险。
         self._boot_time = self._now_fn()
+        try:
+            await self._store.list_run_records()
+        except Exception:
+            logger.exception("[Cron] 执行记录迁移失败，保留原文件，后续查询或启动重试")
         await self.reload()
         self._task = asyncio.create_task(self._loop(), name="cron-scheduler")
         logger.info("[Cron] scheduler started")
@@ -950,6 +954,8 @@ class CronSchedulerService:
         elif ev.kind == "push":
             await self._on_push(job, ev.run_id)
             if job.delete_after_run:
+                if await self._store.get_job(job.id) is None:
+                    return
                 # 不删除，改为标记过期（与自然过期的一次性任务行为一致）
                 logger.info("[Cron] delete_after_run job=%s, marking expired after push", job.id)
                 try:
@@ -1046,6 +1052,7 @@ class CronSchedulerService:
         async def _run_agent() -> None:
             state.status = "running"
             state.started_at = self._now_fn()
+            await self._persist_run(job, state)
             ok = False
             mode = CRON_JOB_DEFAULT_MODE
             channel_id = ""
@@ -1187,6 +1194,7 @@ class CronSchedulerService:
                 # a job the user has removed.
                 if not state.result_text and state.error and not is_cancelled_ghost:
                     state.result_text = f"[cron] 任务执行失败: {state.error}"
+                await self._persist_run(job, state)
                 if state.result_text and not ok and not is_cancelled_ghost:
                     append_history_record(
                         session_id=exec_session_id,
@@ -1466,6 +1474,27 @@ class CronSchedulerService:
             )
             raise
 
+    async def _persist_run(self, job: CronJob, state: CronRunState) -> bool:
+        try:
+            await self._store.save_run_record({
+                "id": state.run_id, "taskId": job.id, "taskName": job.name, "scope": "my-pc",
+                "startedAt": int((state.started_at or self._now_fn()) * 1000),
+                "status": "running" if state.status == "running" else (
+                    "success" if state.status == "succeeded" else "failed"),
+                **({"finishedAt": int(state.finished_at * 1000)} if state.finished_at else {}),
+                "summary": state.result_text or state.error or "",
+            })
+            return True
+        except Exception:
+            logger.exception("[Cron] 保存执行记录失败 run_id=%s", state.run_id)
+            return False
+
+    async def _finish_one_shot(self, job: CronJob, state: CronRunState) -> None:
+        # 放在最终通知尝试之后：消息携带完整结果，渠道投递失败也不阻塞收尾。
+        # 持久化失败时保留任务，绝不先删任务再丢失记录。
+        if job.delete_after_run and state.finished_at and await self._persist_run(job, state):
+            await self._store.delete_job(job.id)
+
     async def _on_push(self, job: CronJob, run_id: str) -> None:
         # proactive.tick 的结果在 wake 分支已同步产出：有推荐时由
         # trigger_main_agent → send_push 直接推送内容；无推荐时静默。
@@ -1499,8 +1528,11 @@ class CronSchedulerService:
             return
 
         if state.result_text:
-            await self._push_to_targets(job, state, text=state.result_text, is_placeholder=False)
-            state.pushed_final = True
+            try:
+                await self._push_to_targets(job, state, text=state.result_text, is_placeholder=False)
+                state.pushed_final = True
+            finally:
+                await self._finish_one_shot(job, state)
             return
 
         # Not ready: send placeholder
@@ -1533,8 +1565,11 @@ class CronSchedulerService:
             run_id,
             len(state.result_text or ""),
         )
-        await self._push_to_targets(job, state, text=state.result_text, is_placeholder=False)
-        state.pushed_final = True
+        try:
+            await self._push_to_targets(job, state, text=state.result_text, is_placeholder=False)
+            state.pushed_final = True
+        finally:
+            await self._finish_one_shot(job, state)
         logger.info("[Cron] push_update done job=%s run_id=%s", job.id, run_id)
 
     async def _push_to_targets(self, job: CronJob, state: CronRunState, *, text: str, is_placeholder: bool) -> None:
