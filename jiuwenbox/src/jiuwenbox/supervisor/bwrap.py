@@ -471,8 +471,11 @@ class BwrapConfig:
         for src, dst in ro_binds:
             args.extend(["--ro-bind", src, dst])
 
-        # read-write binds
-        for src, dst in rw_binds:
+        # read-write binds. Parents first so a later nested bind (e.g. PVC
+        # workspace under /home/app/...) is not hidden by a parent overlay
+        # such as the sandbox-private /home directory. sorted() is stable
+        # and does not mutate rw_binds, so to_args stays side-effect free.
+        for src, dst in sorted(rw_binds, key=lambda bind: _path_depth(bind[1])):
             args.extend(["--bind", src, dst])
 
         for src, dst in self.device_binds:
