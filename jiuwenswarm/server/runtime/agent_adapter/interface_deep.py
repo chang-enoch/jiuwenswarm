@@ -462,6 +462,8 @@ from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools import (
 )
 from jiuwenswarm.common.config import (
     _get_evolution_config,
+    agent_file_read_backend_is_local,
+    get_agent_file_read_backend,
     get_config,
     get_default_models,
     get_evolution_enabled,
@@ -2357,6 +2359,8 @@ class JiuWenSwarmDeepAdapter:
         self._evolution_watcher_tasks: set[asyncio.Task] = set()
         self._sys_operation = None
         self._sys_operation_card: SysOperationCard | None = None
+        # 专供 rail 使用的本地 sysop（忽略沙箱配置；与 self._sys_operation 可不同）
+        self._local_sys_operation: SysOperation | None = None
         # Ids of the sys operations this adapter currently holds a reference on,
         # in acquisition order. ``cleanup`` releases them so a disposed adapter
         # stops pinning its SysOperation (and the ~16 tools derived from it) in
@@ -5433,6 +5437,11 @@ class JiuWenSwarmDeepAdapter:
         if routing is None:
             return
         try:
+            from jiuwenswarm.server.runtime.enterprise_config import (
+                invalidate_enterprise_config_caches,
+            )
+
+            invalidate_enterprise_config_caches()
             request = AgentRequest(
                 request_id="enterprise-config-refresh",
                 channel_id="default",
@@ -6885,10 +6894,30 @@ class JiuWenSwarmDeepAdapter:
             The resolved SysOperation, or None when registration failed.
         """
         previously_retained = list(self._retained_sys_operation_ids)
+        # 读盘用的本地 sysop 与 agent 沙箱 sysop 可能是两份：重建 agent 时不能
+        # 把仍在用的 local 一并 release，否则 rail 会拿着已注销引用。
+        local_keep_id: str | None = None
+        if self._local_sys_operation is not None:
+            local_keep_id = str(self._local_sys_operation.id)
+
         sys_operation = self._resolve_sys_operation()
         if sys_operation is not None:
             self._retain_sys_operation(str(sys_operation.id))
-        self._release_sys_operations(previously_retained)
+
+        to_release = [sid for sid in previously_retained if sid != local_keep_id]
+        # agent 与 local 共用同一张卡时：新 retain 已加上，只丢掉上一轮那一票。
+        same_card_as_local = (
+            sys_operation is not None
+            and local_keep_id is not None
+            and str(sys_operation.id) == local_keep_id
+        )
+        prior_local_retain = (
+            local_keep_id is not None
+            and previously_retained.count(local_keep_id) >= 1
+        )
+        if same_card_as_local and prior_local_retain:
+            to_release.append(local_keep_id)
+        self._release_sys_operations(to_release)
         return sys_operation
 
     def _retain_sys_operation(self, sys_operation_id: str) -> None:
@@ -6968,6 +6997,14 @@ class JiuWenSwarmDeepAdapter:
                     exc,
                 )
 
+        # 本地读盘 sysop 若已不在本 adapter retain 列表里，清掉缓存，避免下次
+        # 误以为还能复用已注销实例。
+        local = self._local_sys_operation
+        if local is not None:
+            local_id = str(getattr(local, "id", "") or "")
+            if not local_id or local_id not in self._retained_sys_operation_ids:
+                self._local_sys_operation = None
+
     def _resolve_sys_operation(self) -> SysOperation | None:
         """Create a sys operation.
 
@@ -7040,6 +7077,357 @@ class JiuWenSwarmDeepAdapter:
         except Exception as exc:
             logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", exc)
             return None
+
+    def _create_local_sys_operation(self) -> SysOperation | None:
+        """只创建/复用本地 SysOperation，给读盘类 rail 用；与沙箱实例分离。"""
+        _t0 = time.monotonic()
+        cached = self._local_sys_operation
+        if cached is not None:
+            cached_id = str(getattr(cached, "id", "") or "")
+            still_held = bool(
+                cached_id and cached_id in self._retained_sys_operation_ids
+            )
+            still_registered = bool(
+                cached_id
+                and Runner.resource_mgr.get_sys_operation(cached_id) is not None
+            )
+            if still_held and still_registered:
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s reuse=1 "
+                    "elapsed_ms=%.1f",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return cached
+            # 上一轮 recreate 已 release/unregister：丢掉脏缓存，下面重建。
+            self._local_sys_operation = None
+        existing = self._sys_operation
+        if existing is not None and getattr(existing, "mode", None) == OperationMode.LOCAL:
+            existing_id = str(getattr(existing, "id", "") or "")
+            if existing_id and existing_id not in self._retained_sys_operation_ids:
+                self._retain_sys_operation(existing_id)
+            self._local_sys_operation = existing
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s reuse_agent=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return existing
+        try:
+            work_dir = self._workspace_dir or str(get_agent_root_dir())
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] create local-only sys_operation (work_dir=%s)",
+                work_dir,
+            )
+            sysop_card = create_local_sysop_card(work_dir=work_dir)
+            if sysop_card is None:
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                    "elapsed_ms=%.1f reason=card_none",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return None
+            isolation_key = self._sys_operation_isolation_key(sysop_card)
+            if isolation_key:
+                registered = self._get_registered_sys_operation_by_isolation_key(
+                    isolation_key
+                )
+                if registered is not None:
+                    self._retain_sys_operation(str(registered.id))
+                    self._local_sys_operation = registered
+                    logger.info(
+                        "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=1 "
+                        "reuse_registered=1 elapsed_ms=%.1f",
+                        self._agent_id,
+                        (time.monotonic() - _t0) * 1000,
+                    )
+                    return registered
+            result = Runner.resource_mgr.add_sys_operation(sysop_card)
+            if result.is_err():
+                registered = (
+                    self._get_registered_sys_operation_by_isolation_key(isolation_key)
+                    if isolation_key
+                    else None
+                )
+                if registered is not None:
+                    self._retain_sys_operation(str(registered.id))
+                    self._local_sys_operation = registered
+                    return registered
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] add local sys_operation failed: %s",
+                    result.msg(),
+                )
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                    "elapsed_ms=%.1f reason=add_err",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return None
+            sysop_obj = Runner.resource_mgr.get_sys_operation(sysop_card.id)
+            if sysop_obj is not None:
+                self._retain_sys_operation(str(sysop_obj.id))
+            self._local_sys_operation = sysop_obj
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=%s "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                1 if sysop_obj is not None else 0,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return sysop_obj
+        except Exception as exc:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] create local sys_operation failed: %s", exc
+            )
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                "elapsed_ms=%.1f reason=exc",
+                self._agent_id,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return None
+
+    def _iter_adapter_rails(self) -> list[Any]:
+        """收集 adapter 上持有的 rail 实例。"""
+        rail_attrs = (
+            "_filesystem_rail",
+            "_skill_rail",
+            "_stream_event_rail",
+            "_task_execution_rail",
+            "_task_planning_rail",
+            "_context_assemble_rail",
+            "_context_processor_rail",
+            "_runtime_prompt_rail",
+            "_response_prompt_rail",
+            "_skill_protocol_prompt_rail",
+            "_security_rail",
+            "_memory_rail",
+            "_external_memory_rail",
+            "_heartbeat_rail",
+            "_skill_evolution_rail",
+            "_subagent_rail",
+            "_disabled_tools_rail",
+            "_permission_rail",
+            "_avatar_rail",
+            "_progressive_tool_rail",
+            "_skill_authorization_rail",
+            "_skill_active_state_rail",
+            "_skill_credential_injection_rail",
+            "_llm_retry_rail",
+            "_skill_create_rail",
+            "_ask_user_rail",
+        )
+        rails: list[Any] = []
+        for attr in rail_attrs:
+            rail = getattr(self, attr, None)
+            if rail is not None:
+                rails.append(rail)
+        return rails
+
+    @staticmethod
+    def _is_sandbox_bound_rail(rail: Any) -> bool:
+        """动手类 rail：必须跟 deep_config / 沙箱 sysop，不能强制本地。"""
+        if isinstance(rail, (SysOperationRail, SkillUseRail)):
+            return True
+        try:
+            if isinstance(rail, ConcurrentSafeSysOperationRail):
+                return True
+        except Exception:
+            pass
+        return type(rail).__name__ in {
+            "SysOperationRail",
+            "FileSystemRail",
+            "ConcurrentSafeFileSystemRail",
+            "ConcurrentSafeSysOperationRail",
+            "SkillUseRail",
+        }
+
+    @staticmethod
+    def _set_rail_sys_operation(rail: Any, sysop: SysOperation) -> bool:
+        """给单个 rail 写入 sys_operation；成功返回 True。"""
+        setter = getattr(rail, "set_sys_operation", None)
+        if callable(setter):
+            setter(sysop)
+            return True
+        if hasattr(rail, "sys_operation"):
+            rail.sys_operation = sysop
+            return True
+        return False
+
+    def _apply_local_sysop_to_all_rails(self) -> None:
+        """按 ``AGENT_FILE_READ_BACKEND`` 把读文件类 rail 切到本地 sysop。"""
+        _t0 = time.monotonic()
+        backend = get_agent_file_read_backend()
+        if not agent_file_read_backend_is_local():
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] AGENT_FILE_READ_BACKEND=%s, skip local "
+                "sysop rail override (agent_id=%s)",
+                backend,
+                self._agent_id,
+            )
+            logger.info(
+                "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s skipped=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        local_sysop = self._create_local_sys_operation()
+        if local_sysop is None:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] skip applying local sysop to rails: "
+                "local sysop unavailable"
+            )
+            logger.info(
+                "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s skipped=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        agent_sysop = self._sys_operation
+        if self._instance is not None:
+            deep_cfg = getattr(self._instance, "deep_config", None)
+            if deep_cfg is not None and agent_sysop is not None:
+                deep_cfg.sys_operation = agent_sysop
+
+        rails: list[Any] = []
+        if self._instance is not None:
+            configured = getattr(self._instance, "configured_rails", None)
+            if callable(configured):
+                try:
+                    rails.extend(configured() or [])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] configured_rails() failed: %s", exc
+                    )
+        rails.extend(self._iter_adapter_rails())
+
+        seen: set[int] = set()
+        local_applied = 0
+        sandbox_kept = 0
+        for rail in rails:
+            rid = id(rail)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            if self._is_sandbox_bound_rail(rail):
+                if agent_sysop is not None and self._set_rail_sys_operation(
+                    rail, agent_sysop
+                ):
+                    sandbox_kept += 1
+                continue
+            if self._set_rail_sys_operation(rail, local_sysop):
+                local_applied += 1
+
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] rail sysop: backend=%s local=%d sandbox_bound=%d "
+            "(deep_config keeps agent sysop)",
+            backend,
+            local_applied,
+            sandbox_kept,
+        )
+        logger.info(
+            "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s local=%d "
+            "sandbox_bound=%d elapsed_ms=%.1f",
+            self._agent_id,
+            backend,
+            local_applied,
+            sandbox_kept,
+            (time.monotonic() - _t0) * 1000,
+        )
+
+    async def _init_workspace_on_host(self) -> None:
+        """在宿主机初始化工作区，避免沙箱 DirectoryBuilder 串行建目录。
+
+        仅当 ``AGENT_FILE_READ_BACKEND=local``（默认）时执行。
+        整段落盘丢 ``asyncio.to_thread``，避免堵事件循环。
+        """
+        _t0 = time.monotonic()
+        backend = get_agent_file_read_backend()
+        if not agent_file_read_backend_is_local():
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s "
+                "skipped=1 reason=backend_sandbox elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        instance = self._instance
+        if instance is None:
+            return
+        deep_cfg = getattr(instance, "deep_config", None)
+        if deep_cfg is None:
+            return
+        if not getattr(deep_cfg, "auto_create_workspace", True):
+            return
+        workspace = getattr(deep_cfg, "workspace", None)
+        if workspace is None:
+            return
+
+        root_path = getattr(workspace, "root_path", None) or self._workspace_dir
+        if not root_path:
+            return
+
+        directories = list(getattr(workspace, "directories", None) or [])
+        language = str(
+            getattr(workspace, "language", None)
+            or self._resolve_runtime_language()
+            or "cn"
+        )
+        try:
+            from jiuwenswarm.server.runtime.agent_adapter.workspace_host_init import (
+                host_init_workspace_sync,
+            )
+
+            result = await asyncio.to_thread(
+                host_init_workspace_sync,
+                str(root_path),
+                directories,
+                language=language,
+            )
+            status = str((result or {}).get("status") or "")
+            if status == "skipped_marker":
+                logger.info(
+                    "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s "
+                    "skipped=1 reason=marker_exists elapsed_ms=%.1f",
+                    self._agent_id,
+                    backend,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s ok=1 "
+                "mode=%s dirs=%d elapsed_ms=%.1f path=%s",
+                self._agent_id,
+                backend,
+                status,
+                int((result or {}).get("dirs") or len(directories)),
+                (time.monotonic() - _t0) * 1000,
+                root_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] init_workspace_on_host failed: %s",
+                exc,
+            )
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s ok=0 "
+                "elapsed_ms=%.1f reason=exc",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+
 
     async def apply_sandbox_runtime_patch(
         self, runtime: dict[str, Any], *, files_changed: bool
@@ -9778,6 +10166,11 @@ class JiuWenSwarmDeepAdapter:
         self._session_instance_mode = mode
         self._session_instance_sub_mode = sub_mode
 
+        bootstrap_request = None
+        if isinstance(config, dict):
+            bootstrap_request = config.get("request")
+        _rid = getattr(bootstrap_request, "request_id", None) or _LLM_TRACE_REQUEST_ID.get() or "?"
+
         await self.set_checkpoint()
         await asyncio.sleep(0)
 
@@ -9945,8 +10338,23 @@ class JiuWenSwarmDeepAdapter:
 
                 _apply_llm_io_trace_patch()
 
+                # AGENT_FILE_READ_BACKEND=local：读盘 rail 切本地 sysop；宿主机先建工作区
+                _t_sysop_apply0 = time.monotonic()
+                self._apply_local_sysop_to_all_rails()
+                await self._init_workspace_on_host()
+                self._apply_local_sysop_to_all_rails()
+
                 await asyncio.sleep(0)
                 await self._instance.ensure_initialized()
+                self._apply_local_sysop_to_all_rails()
+                logger.info(
+                    "[SandboxPerf] rail_sysop_bind+ensure_init: request_id=%s agent=%s "
+                    "backend=%s elapsed_ms=%.1f",
+                    _rid,
+                    self._agent_name,
+                    get_agent_file_read_backend(),
+                    (time.monotonic() - _t_sysop_apply0) * 1000,
+                )
                 initial_runtime_workspace = self._project_dir or str(
                     get_default_project_session_workspace_dir()
                 )
