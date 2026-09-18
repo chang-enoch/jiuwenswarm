@@ -17537,16 +17537,24 @@ class JiuWenSwarmDeepAdapter:
             session_adapter = await self._get_or_create_session_adapter(
                 request.session_id, request=request
             )
-            try:
-                request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
-            except McpRegistryChatError as mcp_err:
-                return AgentResponse(
-                    request_id=request.request_id,
-                    channel_id=request.channel_id,
-                    ok=False,
-                    payload={"error": str(mcp_err)},
-                    metadata=request.metadata,
-                )
+            # 同流式路径：team 模式控制续接跳过 request-scoped MCP 注册，
+            # 避免与持有生命周期锁的被中断原始请求死锁。
+            from jiuwenswarm.server.runtime.agent_adapter.team_helpers import (
+                is_team_control_continuation,
+            )
+
+            request_mcp = None
+            if not is_team_control_continuation(request, inputs.get("query")):
+                try:
+                    request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+                except McpRegistryChatError as mcp_err:
+                    return AgentResponse(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        ok=False,
+                        payload={"error": str(mcp_err)},
+                        metadata=request.metadata,
+                    )
             try:
                 with bind_active_office_claw_mcp_tools(
                     request_mcp.tool_ids if request_mcp is not None else ()
@@ -18229,17 +18237,27 @@ class JiuWenSwarmDeepAdapter:
             session_adapter = await self._get_or_create_session_adapter(
                 request.session_id, request=request
             )
-            try:
-                request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
-            except McpRegistryChatError as mcp_err:
-                yield AgentResponseChunk(
-                    request_id=request.request_id,
-                    channel_id=request.channel_id,
-                    payload={"event_type": "chat.error", "error": str(mcp_err)},
-                    is_complete=True,
-                    metadata=request.metadata or {},
-                )
-                return
+            # team 模式控制续接（ask_user/permission 作答）只负责把答案经
+            # interact() 投递给存活的 runtime，自身不执行工具；被中断的原始
+            # 请求仍持有 request-scoped MCP 生命周期锁，此处再注册会与其
+            # 互相等待形成死锁，故跳过注册、沿用原始请求的注册。
+            from jiuwenswarm.server.runtime.agent_adapter.team_helpers import (
+                is_team_control_continuation,
+            )
+
+            request_mcp = None
+            if not is_team_control_continuation(request, inputs.get("query")):
+                try:
+                    request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+                except McpRegistryChatError as mcp_err:
+                    yield AgentResponseChunk(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        payload={"event_type": "chat.error", "error": str(mcp_err)},
+                        is_complete=True,
+                        metadata=request.metadata or {},
+                    )
+                    return
             try:
                 with bind_active_office_claw_mcp_tools(
                     request_mcp.tool_ids if request_mcp is not None else ()
@@ -20218,6 +20236,27 @@ class JiuWenSwarmDeepAdapter:
                                 "任务执行失败",
                             )
                         return {"event_type": "chat.error", "error": error or "任务执行失败"}
+                    if inner_val == "task_interaction":
+                        # native-harness ask_user interrupts
+                        # surface here without __interaction__ payloads reaching
+                        # the stream. Parse the embedded interrupt result so the
+                        # question card still reaches the frontend.
+                        from jiuwenswarm.server.utils.stream_utils import (
+                            parse_task_interaction_payload,
+                        )
+                        try:
+                            interaction_event = parse_task_interaction_payload(payload)
+                        except Exception:
+                            logger.exception(
+                                "[interface_deep] failed to parse task_interaction payload"
+                            )
+                            interaction_event = None
+                        if interaction_event is not None:
+                            return interaction_event
+                        logger.warning(
+                            "[interface_deep] task_interaction without parsable ask_user payload;"
+                            " no question card could be built"
+                        )
                     # Close the controller_output enum: HITL cards are emitted via
                     # ``__interaction__``; remaining types are control-plane metadata.
                     # Never fall through to ``str(payload)`` → chat.delta (ISSUE #3892).
