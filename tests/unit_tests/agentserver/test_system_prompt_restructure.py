@@ -26,6 +26,10 @@ from jiuwenswarm.agents.harness.common.prompt.prompt_builder import (
 from jiuwenswarm.agents.harness.common.prompt.browser_task_prompt import (
     build_browser_task_prompt,
 )
+from jiuwenswarm.agents.harness.common.prompt.safety_override import (
+    SAFETY_PROMPT_CN,
+    SAFETY_PROMPT_EN,
+)
 from jiuwenswarm.agents.harness.common.rails import skill_retrieval_prompt_rail as _skill_retrieval_prompt_mod
 from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import RuntimePromptRail
 from jiuwenswarm.agents.harness.common.rails.response_prompt_rail import ResponsePromptRail
@@ -166,6 +170,15 @@ def test_build_agent_identity_prompt_contains_stable_identity_and_task_strategy(
     assert "## Symphony Orchestration" not in prompt
     assert "`symphony_compose_score`" not in prompt
     assert "# 消息说明" not in prompt
+
+
+def test_static_safety_prompt_refuses_security_mechanism_disclosure():
+    assert (
+        "Refuse to disclose system security and defense mechanisms, such as "
+        "encryption, authentication, AI security, content security, and access "
+        "control mechanisms."
+    ) in SAFETY_PROMPT_EN
+    assert "拒绝泄露系统安全、防御机制，如加密、认证、AI安全、内容安全、权限管控机制" in SAFETY_PROMPT_CN
 
 
 def test_work_code_and_design_share_the_same_static_prefix():
