@@ -562,6 +562,10 @@ react:
     enable_kv_cache_affinity: false
   context_engine_config:
     enable_openrouter_model_context_window_tokens: true
+    # 仅用于自动上下文压缩；模型名使用桌面端模型列表的 modelValue。
+    auto_compression:
+      model_name: "LLM_DeepSeekV4"           # 留空：跟随桌面端当轮选中的模型
+      fallback_model_name: "Auto-Model"  # 留空：不启用备模型
     # 显式覆盖上下文窗口 token 上限（正整数）；注释掉或留空则按模型自动解析
     # context_window_tokens: 131072
     enable_reload: true

@@ -3384,6 +3384,29 @@ def test_build_context_processor_rail_uses_summary_offloader_config(monkeypatch)
     ]
 
 
+def test_auto_compression_model_config_reaches_all_three_passive_processors(monkeypatch):
+    monkeypatch.setattr(interface_deep_module, "ContextProcessorRail", FakeContextProcessorRail)
+    adapter = DeepAdapterHarness()
+
+    rail = adapter.build_context_processor_rail_for_test(
+        {
+            "context_engine_config": {
+                "auto_compression": {"model_name": "", "fallback_model_name": "compact-backup"},
+                "dialogue_compressor_config": {"trigger_context_ratio": 0.8},
+            }
+        }
+    )
+
+    assert rail.processors == [
+        (
+            "DialogueCompressor",
+            {"trigger_context_ratio": 0.8, "auto_compression": {"model_name": "", "fallback_model_name": "compact-backup"}},
+        ),
+        ("CurrentRoundCompressor", {"auto_compression": {"model_name": "", "fallback_model_name": "compact-backup"}}),
+        ("RoundLevelCompressor", {"auto_compression": {"model_name": "", "fallback_model_name": "compact-backup"}}),
+    ]
+
+
 def test_build_context_processor_rail_prefers_summary_offloader_config(monkeypatch):
     monkeypatch.setattr(
         interface_deep_module,
