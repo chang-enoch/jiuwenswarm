@@ -9,32 +9,17 @@ from typing import Any
 CODE_TODO_CREATE_DESCRIPTION_EN = """
 Create a todo list for the current session. Scale the list to how complex the work actually is.
 
-## When to skip (do the work directly)
-
-- Single focused change: one bug, one function, one config tweak, or a short answer
-- A few related edits with no real phase boundaries (rename, small refactor)
-- You can finish in one continuous pass without losing track
-
-## How many items
-
-| Complexity | Items | Examples |
-|------------|-------|----------|
-| Medium | 2–3 | Greenfield app: backend, frontend/UI, verify end-to-end |
-| Complex | 4–6 max | Multi-service feature, large refactor, many deliverables, unclear order |
-| User asks for a plan | Match their structure | Still prefer outcomes over files |
-
 Do NOT mirror the user's spec headings (Section 1, Section 2…) or project file list as separate todos.
 Do NOT create one todo per file unless the user explicitly asks for file-level tracking.
 
 ## Granularity
 
 - Each item = one outcome or phase (e.g. "Implement Flask API and SQLite", "Build Canvas game UI", "Verify server and score flow").
-- Each task needs id, content, activeForm, and description; keep them brief.
 - Include verification in the last milestone — do not add separate todos per curl, test, or check.
 
 ## Usage
 
-Call once before substantive work. Prefer todo_create in parallel with the first write/bash when possible — avoid a todo-only first round.
+Each task requires id, content, activeForm, and description; keep values brief.
 
 {"tasks": [{"id": "backend", "content": "Implement Flask backend", "activeForm": "Implementing Flask backend", "description": "app.py, SQLite scores API, static routes"}, {"id": "verify", "content": "Verify end-to-end", "activeForm": "Verifying end-to-end", "description": "Run app, exercise APIs, confirm game loads"}]}
 """.strip()
@@ -43,7 +28,7 @@ CODE_TODO_LIST_DESCRIPTION_EN = """
 List all todos for the current session.
 
 Use rarely — only when the plan is unclear, after a long interruption, or the user asks.
-Do not call routinely between steps; use todo_modify to update progress instead.
+Use todo_modify to update progress instead.
 """.strip()
 
 CODE_TODO_GET_DESCRIPTION_EN = """
@@ -53,11 +38,6 @@ Get full details for one todo by id. Use only when you need fields not visible i
 CODE_TODO_MODIFY_DESCRIPTION_EN = """
 Update todo items for the current session.
 
-## Prefer efficiency
-
-- Mark a milestone completed and start the next in the same response as the next write/bash/edit — parallel tool calls when independent.
-- Avoid todo-only rounds: do not call todo_modify alone just to flip status unless wrapping up.
-- Batch multiple updates in one call (e.g. complete backend + set frontend in_progress).
 
 ## Actions
 
@@ -67,8 +47,6 @@ Update todo items for the current session.
 - insert_after / insert_before: only for mid-plan scope changes, not file-by-file progress
 
 To replace the entire plan, call todo_create instead of many inserts.
-
-Do not create a new todo for each file written or each verification command.
 """.strip()
 
 _CODE_TODO_ITEM_PROPERTIES_EN: dict[str, Any] = {

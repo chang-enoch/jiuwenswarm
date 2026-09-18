@@ -3,6 +3,8 @@
 from jiuwenswarm.agents.harness.code.prompt.code_prompt_builder import build_code_system_prompt
 from jiuwenswarm.agents.harness.code.prompt.code_todo_tool_prompts import (
     CODE_TODO_CREATE_DESCRIPTION_EN,
+    CODE_TODO_GET_DESCRIPTION_EN,
+    CODE_TODO_LIST_DESCRIPTION_EN,
     CODE_TODO_MODIFY_DESCRIPTION_EN,
     CODE_TODO_TOOL_PROMPTS,
     get_code_todo_create_input_params,
@@ -20,26 +22,37 @@ def _build_tools_content_en() -> str:
     return content
 
 
-def test_todo_create_prompt_scales_by_complexity():
-    assert "Scale the list" in CODE_TODO_CREATE_DESCRIPTION_EN
-    assert "2–3" in CODE_TODO_CREATE_DESCRIPTION_EN
-    assert "4–6 max" in CODE_TODO_CREATE_DESCRIPTION_EN
-    assert "When to skip" in CODE_TODO_CREATE_DESCRIPTION_EN
-    assert "Do NOT mirror the user's spec headings" in CODE_TODO_CREATE_DESCRIPTION_EN
+def test_todo_create_tool_prompt_is_usage_only():
+    assert "## Usage" in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "id, content, activeForm, and description" in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "replaces the current list" in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "todo_modify" in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "When to skip" not in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "2–3" not in CODE_TODO_CREATE_DESCRIPTION_EN
+    assert "4–6 max" not in CODE_TODO_CREATE_DESCRIPTION_EN
 
 
-def test_todo_modify_prompt_avoids_todo_only_rounds():
-    assert "Avoid todo-only rounds" in CODE_TODO_MODIFY_DESCRIPTION_EN
-    assert "Batch multiple updates" in CODE_TODO_MODIFY_DESCRIPTION_EN
-    assert "parallel" in CODE_TODO_MODIFY_DESCRIPTION_EN.lower()
+def test_todo_modify_tool_prompt_is_actions_only():
+    assert "## Actions" in CODE_TODO_MODIFY_DESCRIPTION_EN
+    assert "todo_create" in CODE_TODO_MODIFY_DESCRIPTION_EN
+    assert "Avoid todo-only rounds" not in CODE_TODO_MODIFY_DESCRIPTION_EN
+    assert "2–3" not in CODE_TODO_MODIFY_DESCRIPTION_EN
 
 
-def test_todo_create_schema_describes_outcome_milestones():
+def test_todo_list_and_get_tool_prompts_are_short():
+    assert "Prefer todo_modify" in CODE_TODO_LIST_DESCRIPTION_EN
+    assert "id" in CODE_TODO_GET_DESCRIPTION_EN.lower()
+    assert "Do not call routinely" not in CODE_TODO_LIST_DESCRIPTION_EN
+
+
+def test_todo_create_schema_describes_required_fields():
     params = get_code_todo_create_input_params()
     tasks_desc = params["properties"]["tasks"]["description"]
-    assert "2–3" in tasks_desc
-    assert "4–6 max" in tasks_desc
-    assert "Outcome-based" in tasks_desc
+    assert "id, content, activeForm, and description" in tasks_desc
+    assert "2–3" not in tasks_desc
+    assert "4–6 max" not in tasks_desc
+    item_required = params["properties"]["tasks"]["items"]["required"]
+    assert item_required == ["id", "content", "activeForm", "description"]
 
 
 def test_code_system_prompt_has_task_planning_section():
