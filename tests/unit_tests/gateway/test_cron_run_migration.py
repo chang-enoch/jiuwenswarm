@@ -86,3 +86,98 @@ async def test_no_legacy_file_needs_no_migration(tmp_path):
     store = CronJobStore(path=tmp_path / "cron_jobs.json")
     assert await store.list_run_records() == []
     assert not (tmp_path / "cron_run_records.json").exists()
+
+
+# ── 手机建 PC 任务 targets=xiaoyi → web 归一 ────────────────────────────────
+
+
+async def _create_job(store, **overrides):
+    params = dict(
+        name="手机建的提醒",
+        cron_expr="0 9 * * *",
+        timezone="Asia/Shanghai",
+        description="reminder",
+        targets="xiaoyi",
+    )
+    params.update(overrides)
+    return await store.create_job(**params)
+
+
+@pytest.mark.asyncio
+async def test_phone_created_job_targets_normalized_to_web(tmp_path):
+    store = CronJobStore(path=tmp_path / "cron_jobs.json")
+    job = await _create_job(store)
+    assert job.targets == "web"
+
+
+@pytest.mark.asyncio
+async def test_device_job_keeps_xiaoyi_targets(tmp_path):
+    store = CronJobStore(path=tmp_path / "cron_jobs.json")
+    job = await _create_job(
+        store,
+        required_device_intents=["alarm"],
+        xiaoyi_push_id="push-1",
+    )
+    assert job.targets == "xiaoyi"
+
+
+@pytest.mark.asyncio
+async def test_update_patch_xiaoyi_targets_normalized(tmp_path):
+    store = CronJobStore(path=tmp_path / "cron_jobs.json")
+    job = await _create_job(store)
+    updated = await store.update_job(job.id, {"targets": "xiaoyi"})
+    assert updated.targets == "web"
+    # 设备任务 update targets 不归一（结果必须回推手机）
+    device = await _create_job(
+        store,
+        required_device_intents=["alarm"],
+        xiaoyi_push_id="push-2",
+    )
+    device_updated = await store.update_job(device.id, {"targets": "web"})
+    assert device_updated.targets == "web"
+
+
+@pytest.mark.asyncio
+async def test_existing_xiaoyi_job_migrated_on_list(tmp_path):
+    """存量 targets=xiaoyi 任务：list_jobs 读时归一为 web 并写回文件。"""
+    path = tmp_path / "cron_jobs.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "jobs": [
+                    {
+                        "id": "legacy-1",
+                        "name": "旧手机任务",
+                        "enabled": True,
+                        "cron_expr": "0 9 * * *",
+                        "timezone": "Asia/Shanghai",
+                        "description": "legacy",
+                        "targets": "xiaoyi",
+                        "work_mode": "work",
+                    },
+                    {
+                        "id": "device-1",
+                        "name": "设备任务",
+                        "enabled": True,
+                        "cron_expr": "0 9 * * *",
+                        "timezone": "Asia/Shanghai",
+                        "description": "device",
+                        "targets": "xiaoyi",
+                        "work_mode": "work",
+                        "required_device_intents": ["alarm"],
+                        "xiaoyi_push_id": "push-3",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = CronJobStore(path=path)
+    jobs = {j.id: j for j in await store.list_jobs()}
+    assert jobs["legacy-1"].targets == "web"
+    assert jobs["device-1"].targets == "xiaoyi"
+    # 写回持久化：新实例读到的已是归一后的值
+    reloaded = {j.id: j for j in await CronJobStore(path=path).list_jobs()}
+    assert reloaded["legacy-1"].targets == "web"
+    assert reloaded["device-1"].targets == "xiaoyi"
