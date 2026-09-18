@@ -45,8 +45,7 @@ from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     plan_skip_feedback,
 )
 from jiuwenswarm.common.mode_matrix import (
-    is_web_composable_mode,
-    read_request_work_mode,
+    is_team_mode,
 )
 from jiuwenswarm.extensions.registry import ExtensionRegistry
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse, AgentResponseChunk
@@ -1055,21 +1054,15 @@ class JiuWenSwarm:
     def _adapter_mode_for_request(request: AgentRequest) -> str:
         """选择 Deep / Code adapter。
 
-        Web 请求（显式携带 ``work_mode``）由 ``work_mode`` 决定 profile：
-        ``code`` / ``design`` 走 CodeAdapter（design 派生自 code，复用其 rails/tools
-        装配与 CodeAdapter 实例化路径，仅 system prompt 按 design 切换），
-        ``work`` 走 DeepAdapter。TUI 等历史客户端不带 ``work_mode``，继续按
-        完整 mode 串判定，行为不变。
+        Web 单 agent 一律走 DeepAdapter（办公模式）：前端路由过来的 code /
+        创意设计 work_mode 不再掉入 CodeAdapter，相关代码保留仅不可达。
+        Web 团队与 TUI / CLI / IM / cron 等历史客户端行为不变。
         """
         params = request.params if isinstance(request.params, dict) else {}
-        work_mode = read_request_work_mode(params)
         raw_mode = params.get("mode", "")
         mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ""
-        if work_mode is not None and is_web_composable_mode(mode or "agent"):
-            if work_mode == "code":
-                return "code"
-            if work_mode == "design":
-                return "design"
+        # Web 单 agent 一律办公（DeepAdapter）；Web 团队与历史客户端走原逻辑
+        if request.channel_id == "web" and not is_team_mode(mode):
             return "agent"
         if mode == "team.plan":
             return "code"

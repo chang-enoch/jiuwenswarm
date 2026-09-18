@@ -7020,7 +7020,17 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 project_dir=runtime_config.project_dir or self._project_dir,
             )
             self._runtime_prompt_rail.set_model_name(self._resolve_model_name())
-            self._runtime_prompt_rail.set_mode(runtime_config.mode)
+            # Web 单 agent 一律显示办公（agent）：前端路由过来的 code/design canonical
+            # 不再泄露给 LLM。团队与 TUI/CLI/IM/cron 走原值（与 _adapter_mode_for_request
+            # 改动一致）。仅影响 runtime_prompt_rail 显示标签，runtime_config.mode 本身
+            # 不变（计费 trace / 会话 metadata / 项目分桶保持原行为）。
+            from jiuwenswarm.common.mode_matrix import is_team_mode as _is_team_canonical
+            _display_mode = (
+                "agent" if runtime_config.channel_id == "web"
+                and not _is_team_canonical(runtime_config.mode)
+                else runtime_config.mode
+            )
+            self._runtime_prompt_rail.set_mode(_display_mode)
             self._runtime_prompt_rail.set_session_id(runtime_config.session_id)
             # user_message_context 仅在 bind_request 时透传；session-stable 配置
             # 不应携带每请求的 source/timestamp/skills_to_use 等字段。
