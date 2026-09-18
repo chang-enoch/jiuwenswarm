@@ -1116,7 +1116,36 @@ async def _enter_remote_mcp_session(
         _MCP_CONNECTOR_DISCOVERY_TIMEOUT_S,
         call_timeout_s,
     )
-    connected = await client.connect(timeout=discovery_timeout)
+    # remote transport（sse/streamable-http）的 client.connect 内部 enter async
+    # context manager（streamable-http 尤其用 anyio TaskGroup + cancel scope）。
+    # connect 失败时 anyio cancel()+uncancel() 本 task，抛出 CancelledError；它是
+    # BaseException（Py3.8+），外层 ``except Exception`` 抓不住，会一路泄漏杀死流式
+    # 任务。用 asyncio.wait_for 套住防卡死，再显式 except CancelledError + cancelling()
+    # 区分：anyio 内部取消（cancelling()==0）→ 当连接失败跳过；外层真取消 → re-raise。
+    try:
+        connected = await asyncio.wait_for(
+            client.connect(timeout=discovery_timeout),
+            timeout=discovery_timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(  # pylint: disable=raise-missing-from
+            f"remote MCP client connect timed out after {discovery_timeout}s: "
+            f"{rebuild_cfg.server_path}"
+        )
+    except asyncio.CancelledError:
+        if is_asyncio_outer_cancellation():
+            raise
+        logger.warning(
+            "request-scoped MCP worker init cancelled (anyio internal), "
+            "isolating as connect failure: server=%s transport=%s path=%s",
+            rebuild_cfg.server_name,
+            client_type,
+            rebuild_cfg.server_path,
+        )
+        raise RuntimeError(  # pylint: disable=raise-missing-from
+            f"remote MCP client connect cancelled (anyio internal): "
+            f"{rebuild_cfg.server_path}"
+        )
     if not connected:
         raise RuntimeError(
             f"remote MCP client connect returned false: {rebuild_cfg.server_path}"
@@ -1992,6 +2021,21 @@ async def _list_remote_mcp_connector_tools(
                 discovery_timeout,
             )
             return [], {}
+        except asyncio.CancelledError:
+            # connect 失败时 anyio TaskGroup cancel()+uncancel() 本 task 抛
+            # CancelledError（BaseException，Py3.8+）；``except Exception`` 在下方
+            # 抓不住，会泄漏杀死流式任务。cancelling()==0 → anyio 内部取消 → 当
+            # 该连接器连接失败跳过（返回空）；cancelling()>0 → 外层真取消 → re-raise。
+            if is_asyncio_outer_cancellation():
+                raise
+            logger.warning(
+                "request-scoped MCP connector '%s' connect cancelled (anyio "
+                "internal), isolating as connect failure: transport=%s path=%s",
+                server_name,
+                client_type,
+                connect_params["server_path"],
+            )
+            return [], {}
         if not connected:
             logger.warning(
                 "request-scoped MCP connector '%s' (%s) connect failed: %s",
@@ -2013,6 +2057,20 @@ async def _list_remote_mcp_connector_tools(
                 "request-scoped MCP connector '%s' list_tools timed out after %.0fs",
                 server_name,
                 discovery_timeout,
+            )
+            return [], {}
+        except asyncio.CancelledError:
+            # list_tools 与 connect 共用 anyio TaskGroup，失败时同样 cancel() 本
+            # task 抛 CancelledError。隔离语义同 connect：内部取消跳过该连接器，
+            # 外层真取消 re-raise。
+            if is_asyncio_outer_cancellation():
+                raise
+            logger.warning(
+                "request-scoped MCP connector '%s' list_tools cancelled (anyio "
+                "internal), isolating as discovery failure: transport=%s path=%s",
+                server_name,
+                client_type,
+                connect_params["server_path"],
             )
             return [], {}
         tool_defs = [
