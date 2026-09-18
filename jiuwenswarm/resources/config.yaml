@@ -576,15 +576,25 @@ react:
       ttl_context_occupancy_ratio: 0.5
       ttl_message_threshold_ratio: 0.05
     dialogue_compressor_config:
-      trigger_context_ratio: 0.8
+      # 绝对值触发：上下文（含 system + tools + 消息）达到该 token 数才压缩。
+      # 填写后优先于 trigger_context_ratio；留空/注释则回退到比例标准。
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      # 压缩目标保留率：压缩摘要 token ≈ 被压缩内容 token × 该比例（0.3 = 保留 30%）。
+      # 留空/注释则不控制输出长度，按默认行为。
+      target_retention_ratio: 0.3
     current_round_compressor_config:
-      trigger_context_ratio: 0.8
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      target_retention_ratio: 0.3
       keep_recent_messages: 4
     round_level_compressor_config:
-      trigger_context_ratio: 0.8
+      trigger_token_threshold: 200000
+      # trigger_context_ratio: 0.8
       min_target_context_ratio: 0.1
+      target_retention_ratio: 0.3
       keep_recent_messages: 4
     # 连续相同 reasoning+工具集 / 相同工具入参时，折叠重复轮次；超阈值后兜底中止
     reasoning_tool_loop_compact_config:

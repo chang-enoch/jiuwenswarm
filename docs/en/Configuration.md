@@ -451,6 +451,8 @@ These are **conceptual** paths in the main configuration for cross-reference wit
 | `heartbeat.every` | Heartbeat interval (seconds) | `3600` |
 | `react.context_engine_config.dialogue_compressor_config.tokens_threshold` | Dialogue compression token threshold | `100000` |
 | `react.context_engine_config.round_level_compressor_config.trigger_context_ratio` | Round-level compression trigger ratio of the effective context budget | `0.9` |
+| `react.context_engine_config.dialogue_compressor_config.trigger_token_threshold` | Dialogue compression absolute token trigger (takes precedence over the ratio) | unset |
+| `react.context_engine_config.dialogue_compressor_config.target_retention_ratio` | Dialogue compression target retention ratio (summary ≈ compressed content × ratio) | unset |
 
 <a id="dotenv-configuration"></a>
 
