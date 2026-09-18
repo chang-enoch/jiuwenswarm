@@ -293,7 +293,7 @@ class A2AOutboundDispatcher:
         session_id = str(source_session_id or "").strip()
         if not session_id:
             raise A2AOutboundError(A2AOutboundErrorCode.DISPATCH_REJECTED)
-        agent = await self._require_callable_agent(agent_id)
+        agent = await self._require_callable_agent(agent_id, source_user_id=source_user_id)
         self._schedule_cleanup_dispatches()
 
         dispatch_id = f"disp_{uuid.uuid4().hex}"
@@ -823,8 +823,16 @@ class A2AOutboundDispatcher:
                 return headers, params, cookies
         raise A2AOutboundError(A2AOutboundErrorCode.AUTH_REQUIRED)
 
-    async def _require_callable_agent(self, agent_id: str) -> A2AOutboundAgent:
-        agent = await self._repository.get_agent(str(agent_id or "").strip())
+    async def _require_callable_agent(
+        self, agent_id: str, *, source_user_id: str | None = None
+    ) -> A2AOutboundAgent:
+        normalized = str(agent_id or "").strip()
+        get_projected = getattr(self._repository, "get_projected_agent", None)
+        if callable(get_projected):
+            projected = await get_projected(normalized, source_user_id=source_user_id)
+            agent = projected.agent if projected is not None else None
+        else:
+            agent = await self._repository.get_agent(normalized)
         if agent is None:
             raise A2AOutboundError(A2AOutboundErrorCode.AGENT_NOT_REGISTERED)
         if not agent.enabled:

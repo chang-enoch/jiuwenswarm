@@ -164,10 +164,11 @@ class A2AManager:
         return await self._require_outbound().register(params)
 
     async def outbound_list(
-        self, *, source_resource_id: str | None = None
+        self, *, source_resource_id: str | None = None, source_user_id: str | None = None
     ) -> dict[str, Any]:
+        source_user_id = self._history_user_id(source_user_id)
         outbound = self._require_outbound()
-        result = await outbound.list_agents()
+        result = await outbound.list_agents(source_user_id=source_user_id)
         allowed = await self._resolve_authorized_a2a_agent_ids(source_resource_id)
         if allowed is None:
             return result
@@ -187,11 +188,15 @@ class A2AManager:
         *,
         enabled: bool,
         source_resource_id: str | None = None,
+        source_user_id: str | None = None,
     ) -> dict[str, Any]:
+        source_user_id = self._history_user_id(source_user_id)
         allowed = await self._resolve_authorized_a2a_agent_ids(source_resource_id)
         if allowed is not None and str(agent_id or "").strip() not in allowed:
             raise A2AOutboundError(A2AOutboundErrorCode.AGENT_NOT_AUTHORIZED)
-        return await self._require_outbound().set_user_enabled(agent_id, enabled)
+        return await self._require_outbound().set_user_enabled(
+            agent_id, enabled, source_user_id=source_user_id
+        )
 
     async def outbound_edit(self, agent_id: str) -> dict[str, Any]:
         return await self._require_outbound().edit_agent(agent_id)
@@ -259,8 +264,10 @@ class A2AManager:
         required_skills: list[str] | None = None,
         limit: int = 5,
         source_resource_id: str | None = None,
+        source_user_id: str | None = None,
     ) -> dict[str, Any]:
-        allowed = await self._resolve_effective_a2a_agent_ids(source_resource_id)
+        source_user_id = self._history_user_id(source_user_id)
+        allowed = await self._resolve_effective_a2a_agent_ids(source_resource_id, source_user_id)
         return await self._require_outbound_dispatcher().find_agents(
             query=query,
             required_skills=required_skills,
@@ -280,7 +287,7 @@ class A2AManager:
         reason: str | None = None,
     ) -> dict[str, Any]:
         source_user_id = self._history_user_id(source_user_id)
-        await self._require_a2a_agent_authorized(source_resource_id, agent_id)
+        await self._require_a2a_agent_authorized(source_resource_id, agent_id, source_user_id)
         return await self._require_outbound_dispatcher().dispatch(
             agent_id=agent_id,
             task=task,
@@ -310,13 +317,13 @@ class A2AManager:
         )
 
     async def _resolve_effective_a2a_agent_ids(
-        self, resource_id: str | None
+        self, resource_id: str | None, source_user_id: str | None = None
     ) -> frozenset[str] | None:
         outbound = self._outbound
         if outbound is None:
             return None
         return await outbound.resolve_effective_a2a_agent_ids(
-            str(resource_id or "").strip()
+            str(resource_id or "").strip(), source_user_id=source_user_id
         )
 
     async def _resolve_authorized_a2a_agent_ids(
@@ -331,16 +338,18 @@ class A2AManager:
         return await resolver(str(resource_id or "").strip())
 
     async def _require_a2a_agent_authorized(
-        self, resource_id: str | None, agent_id: str
+        self, resource_id: str | None, agent_id: str, source_user_id: str | None = None
     ) -> None:
-        allowed = await self._resolve_effective_a2a_agent_ids(resource_id)
+        allowed = await self._resolve_effective_a2a_agent_ids(resource_id, source_user_id)
         normalized_agent_id = str(agent_id or "").strip()
         if allowed is None or normalized_agent_id in allowed:
             return
         authorized = await self._resolve_authorized_a2a_agent_ids(resource_id)
         if authorized is not None and normalized_agent_id not in authorized:
             raise A2AOutboundError(A2AOutboundErrorCode.AGENT_NOT_AUTHORIZED)
-        projected = await self._require_outbound().get_agent(normalized_agent_id)
+        projected = await self._require_outbound().get_agent(
+            normalized_agent_id, source_user_id=source_user_id
+        )
         if projected.get("manager_enabled") is False:
             raise A2AOutboundError(A2AOutboundErrorCode.AGENT_MANAGER_DISABLED)
         if projected.get("user_enabled") is False:

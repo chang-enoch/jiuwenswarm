@@ -929,7 +929,7 @@ async def test_enterprise_outbound_tools_enforce_resource_policy(
     monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
 
     class _Registry:
-        async def resolve_effective_a2a_agent_ids(self, resource_id):
+        async def resolve_effective_a2a_agent_ids(self, resource_id, *, source_user_id=None):
             assert resource_id == "resource-1"
             return frozenset({"agent-1"})
 
@@ -937,20 +937,20 @@ async def test_enterprise_outbound_tools_enforce_resource_policy(
             assert resource_id == "resource-1"
             return frozenset({"agent-1", "agent-manager", "agent-user"})
 
-        async def list_agents(self):
+        async def list_agents(self, *, source_user_id=None):
             return {
                 "items": [{"agent_id": "agent-1"}, {"agent_id": "agent-2"}],
                 "total": 2,
             }
 
-        async def get_agent(self, agent_id):
+        async def get_agent(self, agent_id, *, source_user_id=None):
             return {
                 "agent_id": agent_id,
                 "manager_enabled": agent_id != "agent-manager",
                 "user_enabled": agent_id != "agent-user",
             }
 
-        async def set_user_enabled(self, agent_id, enabled):
+        async def set_user_enabled(self, agent_id, enabled, *, source_user_id=None):
             return {"agent_id": agent_id, "user_enabled": enabled}
 
     class _Dispatcher:
@@ -967,9 +967,9 @@ async def test_enterprise_outbound_tools_enforce_resource_policy(
     manager._outbound = _Registry()
     manager._outbound_dispatcher = _Dispatcher()
 
-    found = await manager.outbound_find_agents(source_resource_id="resource-1")
+    found = await manager.outbound_find_agents(source_resource_id="resource-1", source_user_id="user-1")
     assert found["allowed_agent_ids"] == frozenset({"agent-1"})
-    listed = await manager.outbound_list(source_resource_id="resource-1")
+    listed = await manager.outbound_list(source_resource_id="resource-1", source_user_id="user-1")
     assert listed == {"items": [{"agent_id": "agent-1"}], "total": 1}
     dispatched = await manager.outbound_dispatch_task(
         agent_id="agent-1",
@@ -1034,6 +1034,6 @@ async def test_enterprise_outbound_tools_enforce_resource_policy(
 
     with pytest.raises(A2AOutboundError) as exc_info:
         await manager.outbound_set_user_enabled(
-            "agent-2", enabled=True, source_resource_id="resource-1"
+            "agent-2", enabled=True, source_resource_id="resource-1", source_user_id="user-1"
         )
     assert exc_info.value.code is A2AOutboundErrorCode.AGENT_NOT_AUTHORIZED

@@ -976,7 +976,7 @@ async def test_enterprise_dispatch_requires_user_and_hides_other_and_legacy_reco
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", [A2A_TOOL_DISPATCH_TASK, A2A_TOOL_GET_DISPATCH])
+@pytest.mark.parametrize("method", [A2A_TOOL_FIND_AGENTS, A2A_TOOL_DISPATCH_TASK, A2A_TOOL_GET_DISPATCH])
 @pytest.mark.parametrize("fallback", [False, True])
 async def test_enterprise_reverse_rpc_uses_context_user_not_tool_params(
     monkeypatch, method, fallback
@@ -990,6 +990,7 @@ async def test_enterprise_reverse_rpc_uses_context_user_not_tool_params(
             return {}
 
         outbound_get_dispatch = outbound_dispatch_task
+        outbound_find_agents = outbound_dispatch_task
 
     handler = object.__new__(MessageHandler)
     handler._a2a_outbound_tool_manager = Manager()
@@ -1232,7 +1233,7 @@ async def test_toolkit_missing_route_is_not_reported_as_remote_rejection() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", [A2A_TOOL_DISPATCH_TASK, A2A_TOOL_GET_DISPATCH])
+@pytest.mark.parametrize("method", [A2A_TOOL_FIND_AGENTS, A2A_TOOL_DISPATCH_TASK, A2A_TOOL_GET_DISPATCH])
 async def test_gateway_backend_leaves_operation_timeout_to_manager(
     monkeypatch, method
 ) -> None:
@@ -1437,10 +1438,11 @@ async def test_enterprise_gateway_bridge_binds_trusted_resource_id(monkeypatch) 
     await handler._handle_a2a_outbound_tool_push(
         chunk=chunk,
         session_id="session-1",
-        request_metadata={"routing": {"bot_id": "resource-1"}},
+        request_metadata={"user_id": "user-1", "routing": {"bot_id": "resource-1"}},
     )
 
     assert calls[0]["source_resource_id"] == "resource-1"
+    assert calls[0]["source_user_id"] == "user-1"
     assert replies[0].params["response"]["result"]["total"] == 0
 
 

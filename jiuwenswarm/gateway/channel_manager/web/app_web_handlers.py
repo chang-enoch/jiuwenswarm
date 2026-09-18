@@ -1985,11 +1985,12 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             ws, req_id, lambda: a2a_manager.outbound_register(dict(params))
         )
 
-    async def _a2a_outbound_list(ws, req_id, params, session_id):
+    async def _a2a_outbound_list(ws, req_id, params, session_id, user_id=None):
         await _send_a2a_outbound(
             ws,
             req_id,
             lambda: a2a_manager.outbound_list(
+                source_user_id=user_id,
                 source_resource_id=(
                     str(params.get("bot_id") or "") if is_enterprise() else None
                 )
@@ -2013,7 +2014,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             ws, req_id, lambda: a2a_manager.outbound_update(agent_id, payload)
         )
 
-    async def _a2a_outbound_enabled_update(ws, req_id, params, session_id):
+    async def _a2a_outbound_enabled_update(ws, req_id, params, session_id, user_id=None):
         user_enabled = params.get("user_enabled")
         if not isinstance(user_enabled, bool):
             await channel.send_response(
@@ -2030,6 +2031,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             lambda: a2a_manager.outbound_set_user_enabled(
                 str(params.get("agent_id") or ""),
                 enabled=user_enabled,
+                source_user_id=user_id,
                 source_resource_id=(
                     str(params.get("bot_id") or "") if is_enterprise() else None
                 ),
