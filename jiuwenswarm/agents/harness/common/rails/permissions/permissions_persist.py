@@ -41,6 +41,21 @@ def _dump_config_yaml_round_trip(yaml_path: Any, data: Any) -> None:
     _dump_yaml_round_trip(yaml_path, data)
 
 
+def _clear_permissions_config_cache() -> None:
+    """Drop the in-process permissions cache after a yaml persist."""
+    try:
+        from jiuwenswarm.agents.harness.common.rails.permissions.config_loader import (
+            clear_permissions_config_cache,
+        )
+
+        clear_permissions_config_cache()
+    except Exception:
+        logger.debug(
+            "[PermissionPersist] clear permissions config cache failed",
+            exc_info=True,
+        )
+
+
 def _ensure_permissions_dict(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -190,6 +205,7 @@ def persist_permission_allow_rule(tool_name: str, tool_args: dict | str) -> bool
         get_effective_permissions_config,
         persist_permissions_mutate,
     )
+    from jiuwenswarm.edition import is_enterprise
 
     permissions = get_effective_permissions_config()
     if not isinstance(permissions, dict):
@@ -207,7 +223,10 @@ def persist_permission_allow_rule(tool_name: str, tool_args: dict | str) -> bool
         perms.clear()
         perms.update(merged)
 
-    persist_permissions_mutate(mutate)
+    persist_permissions_mutate(
+        mutate,
+        persist_scope="session" if is_enterprise() else "base",
+    )
     return True
 
 
@@ -238,11 +257,19 @@ def persist_external_directory_allow(
             access_list.append((path_str, act))
         merged, wrote = merge_file_guard_access_allows(permissions, access_list)
         if wrote:
+            agents_table = permissions.get("agents")
+            if isinstance(agents_table, dict) and "agents" not in merged:
+                merged = dict(merged)
+                merged["agents"] = agents_table
             data["permissions"] = merged
             _dump_config_yaml_round_trip(yaml_path, data)
+            _clear_permissions_config_cache()
         return
     except ImportError:
-        pass
+        logger.debug(
+            "[PermissionPersist] merge_file_guard_access_allows unavailable, using local merge",
+            exc_info=True,
+        )
 
     data, yaml_path = _load_config_yaml_round_trip()
     permissions = _ensure_permissions_dict(data)
@@ -266,6 +293,7 @@ def persist_external_directory_allow(
             wrote = True
     if wrote:
         _dump_config_yaml_round_trip(yaml_path, data)
+        _clear_permissions_config_cache()
 
 
 def persist_cli_trusted_directory(raw_path: str) -> dict[str, Any]:
@@ -291,6 +319,7 @@ def persist_cli_trusted_directory(raw_path: str) -> dict[str, Any]:
         permissions, dir_norm, read="allow", write="allow", exec_="ask",
     )
     _dump_config_yaml_round_trip(yaml_path, data)
+    _clear_permissions_config_cache()
     logger.info(
         "[PermissionPersist] cli_add_dir.file_guard path=%s read=allow write=allow exec=ask",
         dir_norm,
@@ -350,6 +379,7 @@ def persist_cli_trusted_directory_with_overrides(raw_path: str) -> dict[str, Any
         )
 
     _dump_config_yaml_round_trip(yaml_path, data)
+    _clear_permissions_config_cache()
     return {
         "ok": True,
         "normalized": dir_norm,

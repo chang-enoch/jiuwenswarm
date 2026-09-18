@@ -56,6 +56,21 @@ _FORBIDDEN_DUPLICATE_NAMES = {
 }
 
 
+def _release_asyncio_default_executor() -> None:
+    """Drop the loop default executor so pytest-asyncio Runner.close() cannot hang."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    executor = getattr(loop, "_default_executor", None)
+    if executor is None:
+        return
+    # Python 3.11 rejects set_default_executor(None); clear the private slot
+    # so Runner.close() skips shutdown_default_executor on a hung pool.
+    loop._default_executor = None
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
 @pytest.fixture
 async def fusion_env() -> AsyncIterator[SimpleNamespace]:
     shutdown_observability()
@@ -104,12 +119,17 @@ async def fusion_env() -> AsyncIterator[SimpleNamespace]:
             span_registry=span_registry,
         )
     finally:
-        await callbacks.unregister(Runner.callback_framework)
-        shutdown_observability()
-        provider.force_flush()
-        meter_provider.shutdown()
-        provider.shutdown()
-        IdentityStore.clear(identity_token)
+        try:
+            await callbacks.unregister(Runner.callback_framework)
+            shutdown_observability()
+            provider.force_flush(timeout_millis=5_000)
+            meter_provider.force_flush(timeout_millis=5_000)
+            meter_provider.shutdown(timeout_millis=5_000)
+            provider.shutdown()
+        finally:
+            IdentityStore.clear(identity_token)
+            _release_asyncio_default_executor()
+            await asyncio.sleep(0)
 
 
 def _assert_parent_chain(spans: list[object]) -> None:

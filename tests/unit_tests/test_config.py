@@ -540,6 +540,43 @@ symphony:
         assert migrated["symphony"]["fingerprint"]["normalization"]["workers"] == 1
 
     @staticmethod
+    def test_migrate_config_preserves_permissions_agents_table(tmp_path: Path):
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+        template_path.write_text(
+            """
+permissions:
+  enabled: false
+  schema: tiered_policy
+  tools:
+    bash: allow
+  agents: {}
+""",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            """
+permissions:
+  enabled: true
+  tools:
+    bash: ask
+  agents:
+    default:
+      enabled: true
+      tools:
+        bash: deny
+""",
+            encoding="utf-8",
+        )
+
+        assert migrate_config_from_template(template_path, user_config_path) is True
+
+        migrated = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+        assert migrated["permissions"]["enabled"] is True
+        assert migrated["permissions"]["tools"]["bash"] == "ask"
+        assert migrated["permissions"]["agents"]["default"]["tools"]["bash"] == "deny"
+
+    @staticmethod
     def test_migrate_config_preserves_legacy_evolution_settings(
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,

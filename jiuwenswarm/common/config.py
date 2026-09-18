@@ -1319,6 +1319,7 @@ def get_permissions_defaults_level() -> str:
 
 def build_permissions_tools_list_view(
     catalog_by_name: dict[str, dict[str, str]] | None = None,
+    permissions_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the permissions list from runtime and explicitly configured tools."""
     from jiuwenswarm.server.runtime.tool_catalog import (
@@ -1327,10 +1328,17 @@ def build_permissions_tools_list_view(
     )
 
     runtime_catalog = dict(catalog_by_name or {})
-    configured_tools = get_permissions_tools().get("tools")
+    if isinstance(permissions_body, dict):
+        configured_tools = permissions_body.get("tools")
+        default_level = (
+            normalize_permissions_tool_level(permissions_body.get("defaults", "guard"))
+            or "ask"
+        )
+    else:
+        configured_tools = get_permissions_tools().get("tools")
+        default_level = get_permissions_defaults_level()
     if not isinstance(configured_tools, dict):
         configured_tools = {}
-    default_level = get_permissions_defaults_level()
     preferred_language = str(
         (get_config() or {}).get("preferred_language", "")
     ).lower()
@@ -2415,7 +2423,10 @@ def _deep_merge(
         if key not in user:
             result[key] = template_value
         elif isinstance(template_value, dict) and isinstance(user.get(key), dict):
-            result[key] = _deep_merge(template_value, user[key], depth + 1)
+            if not template_value:
+                result[key] = user[key]
+            else:
+                result[key] = _deep_merge(template_value, user[key], depth + 1)
         else:
             result[key] = user[key]
 
@@ -2525,7 +2536,10 @@ def _prune_override_keys(template: dict[str, Any], override: dict[str, Any], dep
             continue
         tmpl_val = template[key]
         if isinstance(tmpl_val, dict) and isinstance(over_val, dict):
-            result[key] = _prune_override_keys(tmpl_val, over_val, depth + 1)
+            if not tmpl_val:
+                result[key] = over_val
+            else:
+                result[key] = _prune_override_keys(tmpl_val, over_val, depth + 1)
         else:
             result[key] = over_val
     return result
