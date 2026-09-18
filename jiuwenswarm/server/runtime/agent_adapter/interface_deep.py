@@ -1268,6 +1268,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._audio_tools: list[Any] = []
         self._instance_overrides: dict[str, Any] = {}
         self._is_session_scoped_adapter: bool = False
+        self._synced_history_tail_request_id: str | None = None
         # Office (work) profile always uses English for system-prompt scaffolding
         # (identity / safety / skills / task_execution / runtime / env sections),
         # mirroring code mode. ``_runtime_language_override`` stays ``None`` in
@@ -1427,6 +1428,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def mark_as_session_scoped(self, session_id: str) -> None:
         self._is_session_scoped_adapter = True
         self._parent_session_id = session_id
+        self._synced_history_tail_request_id = None
+
+    def _mark_history_tail_synced(self, request_id: str | None) -> None:
+        rid = str(request_id or "").strip()
+        if rid:
+            self._synced_history_tail_request_id = rid
 
     def _get_cached_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter | None":
         sid = self._session_adapter_key(session_id)
@@ -1666,6 +1673,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             existing = self._session_adapters.get(sid)
             if existing is not None:
                 await self._reload_session_adapter_if_stale(sid, existing)
+                try:
+                    from jiuwenswarm.agents.harness.common.session_ops_service import (
+                        refresh_session_context_if_stale,
+                    )
+
+                    existing._synced_history_tail_request_id = (
+                        await refresh_session_context_if_stale(
+                            deep_agent=getattr(existing, "_instance", None),
+                            session_id=sid,
+                            exclude_request_id=warmup_exclude_request_id,
+                            synced_tail_request_id=getattr(
+                                existing, "_synced_history_tail_request_id", None
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] session context refresh failed: "
+                        "session_id=%s error=%s",
+                        sid,
+                        exc,
+                    )
                 self._touch_session_adapter(sid)
                 return existing
 
@@ -1704,12 +1733,17 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # （全新会话磁盘无历史，warmup 内部会静默跳过）。
             try:
                 from jiuwenswarm.agents.harness.common.session_ops_service import (
+                    load_history_tail_request_id,
                     warmup_session_context,
                 )
 
                 await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
+                    exclude_request_id=warmup_exclude_request_id,
+                )
+                adapter._synced_history_tail_request_id = load_history_tail_request_id(
+                    sid,
                     exclude_request_id=warmup_exclude_request_id,
                 )
             except Exception as exc:
@@ -9828,6 +9862,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 metadata=request.metadata,
             )
 
+        self._mark_history_tail_synced(request.request_id)
         return AgentResponse(
             request_id=request.request_id,
             channel_id=request.channel_id,
@@ -10882,6 +10917,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 else:
                     _debug_logger.end_run(status="ok")
             interaction_stream_abort = False
+            if run_failure is None:
+                self._mark_history_tail_synced(rid)
         except asyncio.CancelledError:
             stream_consumer_cancelled = True
             logger.info(
