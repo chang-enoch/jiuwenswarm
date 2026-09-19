@@ -151,8 +151,6 @@ def _tool_routing_prompt(
 - 文件读取、搜索和编辑优先使用 `read_file`、`grep`、`glob`、`edit_file`、`write_file` 等专用工具，不要为了这些操作调用 Shell。
 {posix_rule}
 {windows_rule}
-- 只有在需要显式参数化 Shell、后台启动或当前没有合适的专用 Shell 工具时，才使用 `mcp_exec_command`。
-- 调用 `mcp_exec_command` 时必须同时提供 `command` 和 `shell_type`；`shell_type` 只能是 `bash`、`powershell`、`cmd`、`sh`，禁止省略，也禁止使用 `auto`。
 - 不要在 Bash 中包裹 PowerShell，也不要在 PowerShell 中拼接 Bash 语法。"""
 
     if bash_available:
@@ -171,8 +169,6 @@ def _tool_routing_prompt(
 - Prefer dedicated tools such as `read_file`, `grep`, `glob`, `edit_file`, and `write_file` for file reads, searches, and edits instead of invoking a Shell.
 {posix_rule}
 {windows_rule}
-- Use `mcp_exec_command` only when explicit Shell parameterization, background execution, or a dedicated Shell tool is unavailable.
-- Every `mcp_exec_command` call must provide both `command` and `shell_type`; `shell_type` must be `bash`, `powershell`, `cmd`, or `sh`. Do not omit it or use `auto`.
 - Do not wrap PowerShell in Bash or mix Bash syntax into PowerShell."""
 
 
