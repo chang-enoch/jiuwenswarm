@@ -638,7 +638,7 @@ class TestStructuredAskUserRailResolveInterrupt:
 
         from openjiuwen.harness.rails.interrupt.interrupt_base import RejectResult
         assert isinstance(decision, RejectResult)
-        assert "at most 4 questions" in decision.tool_result
+        assert f"at most {MAX_STRUCTURED_QUESTIONS} questions" in decision.tool_result
 
     @staticmethod
     @pytest.mark.parametrize(
