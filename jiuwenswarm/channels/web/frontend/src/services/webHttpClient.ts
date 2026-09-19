@@ -12,6 +12,7 @@ import {
 import { getGatewayHttpBase } from '../utils/env';
 import { isEnterprise } from '../edition';
 import {
+  getManagerAccessToken,
   hasManagerSessionCredentials,
   managerAuthenticatedFetch,
 } from '../auth/manager/authSession';
@@ -999,6 +1000,13 @@ export class WebHttpClient {
 
   private authenticatedFetch(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
     if (isEnterprise() && hasManagerSessionCredentials()) {
+      // 保留外部透传的 Authorization；只有 Manager 自己的 token 才走刷新包装器。
+      const headers = new Headers(init.headers);
+      const authorization = headers.get('Authorization');
+      const managerAccessToken = getManagerAccessToken();
+      if (authorization && authorization !== (managerAccessToken ? `Bearer ${managerAccessToken}` : null)) {
+        return fetch(input, init);
+      }
       return managerAuthenticatedFetch(input, init);
     }
     return fetch(input, init);
