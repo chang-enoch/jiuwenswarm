@@ -41,6 +41,11 @@ _DESKTOP_SECRET_FALLBACKS: dict[str, str] = {
     "CLAW_XIAOYI_AGENT_ID": "localAuth.agentId",
     "CLAW_XIAOYI_UID": "uid",
     "CLAW_XIAOYI_API_KEY": "apiKey",
+    # GaussPD 记忆令牌（2026-09-18 起经密钥包下发替代 env；桌面侧胶水
+    # extension.py 加载早期也会自注回 env，本映射是 config.yaml ${GSPD_*}
+    # 占位符在扩展加载前被解析时的兜底）
+    "GSPD_SERVICE_TOKEN": "gausspd.serviceToken",
+    "GSPD_MODEL_PROXY_KEY": "gausspd.modelProxyKey",
 }
 
 _CONFIG_MODULE_DIR = Path(__file__).parent
