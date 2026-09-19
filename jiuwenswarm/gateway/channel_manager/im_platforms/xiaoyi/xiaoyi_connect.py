@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 import httpx
@@ -1945,18 +1945,10 @@ class XiaoyiChannel(BaseChannel):
         import websockets
 
         headers = _generate_auth_headers(self.config)
-        parsed = urlparse(url)
-        is_ip = bool(parsed.hostname and parsed.hostname.replace(".", "").isdigit())
-
-        ssl_context = ssl.create_default_context()
-        if is_ip:
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
 
         async with websockets.connect(
                 url,
                 additional_headers=headers,
-                # ssl=ssl_context,
                 ping_interval=15,
                 ping_timeout=15,
                 close_timeout=5,

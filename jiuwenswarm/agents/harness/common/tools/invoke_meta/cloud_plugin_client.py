@@ -27,36 +27,6 @@ CLOUD_PLUGIN_ERRORS = {
 }
 
 
-def _needs_insecure_ssl(url: str) -> bool:
-    """Skip TLS verify for test-domain WSS and raw IP.
-
-    Same host rules as desktop isInsecureHost. mcp/run is a direct Python
-    websockets connection (not via Electron), so this process must decide again.
-    """
-    import re
-    from urllib.parse import urlparse
-
-    if not (url or "").startswith("wss://"):
-        return False
-    host = (urlparse(url).hostname or "").lower()
-    if not host:
-        return False
-    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
-        return True
-    if ":" in host.strip("[]"):
-        return True
-    return host == "hwcloudtest.cn" or host.endswith(".hwcloudtest.cn")
-
-
-def _insecure_ssl():
-    import ssl
-
-    ctx = ssl._create_unverified_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
 @dataclass
 class CloudPluginContext:
     """设备/会话上下文（桌面 env 或 invocation；缺省 PC）。"""
@@ -569,8 +539,8 @@ class CloudPluginClient(AgentRuntimeClient):
                 connect_kwargs["additional_headers"] = headers
             else:
                 connect_kwargs["extra_headers"] = headers
-        if _needs_insecure_ssl(self._base_url):
-            connect_kwargs["ssl"] = _insecure_ssl()
+        # TLS 收口（2026-09-18）：mcp/run 目标是本机 ws://127.0.0.1 插件代理（非 wss，
+        # ssl 参数本不生效）；删除原 hwcloudtest/IP 自签名豁免休眠代码（纯扫描噪音）。
         return connect_kwargs
 
     async def _connect_with_retry(
