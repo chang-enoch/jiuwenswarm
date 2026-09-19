@@ -19,7 +19,7 @@ import { buildQaSummaryContent, type QaSummaryData, type QaSummaryItem } from '.
 const CUSTOM_OPTION_LABEL = 'Other';
 
 /** 多轮上限（产品约定：多轮确认最多不超过 4 轮）。 */
-const MAX_PAGES = 4;
+const MAX_PAGES = 8;
 
 interface InteractionPromptProps {
   pending: AskUserQuestionPayload;
