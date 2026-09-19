@@ -489,6 +489,53 @@ def test_sessions_list_create_delete(app_with_mock):
     assert r.json()["ok"] is True
 
 
+@pytest.mark.parametrize("path", [
+    "/api/v1/chat/completions", "/api/v1/chat/send", "/api/v1/chat/resume",
+    "/api/v1/chat/sess_1/actions/user_answer", "/api/v1/chat/sess_1/actions/answer",
+])
+@pytest.mark.parametrize("stream,accept", [(True, "application/json"), (False, "application/json"), (False, "text/event-stream")])
+@pytest.mark.parametrize("field", ["user_id", "group_id", "bot_id", "gateway_id"])
+def test_chat_rejects_conflicting_identity_before_dispatch(app_with_mock, path, stream, accept, field):
+    app, dispatch = app_with_mock
+    response = TestClient(app).post(
+        path,
+        json={"session_id": "sess_1", "query": "probe", "user_id": "A", field: "B", "enable_streaming": stream},
+        headers={"X-" + field.replace("_", "-"): "A", "X-Request-Id": "conflict", "Accept": accept},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "IDENTITY_CONFLICT"
+    assert response.headers["x-request-id"] == "conflict"
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize("path", [
+    "/api/v1/chat/completions", "/api/v1/chat/resume",
+    "/api/v1/chat/sess_1/actions/user_answer",
+])
+@pytest.mark.parametrize("body_identity", [
+    {}, {"bot_id": "A"}, {"bot_id": " A "}, {"bot_id": None},
+    {"bot_id": ""}, {"bot_id": "  "},
+    {"user_id": "A", "user": "B"},  # user is not a routing identity field.
+])
+def test_chat_accepts_matching_or_header_only_identity(app_with_mock, body_identity, path):
+    app, dispatch = app_with_mock
+
+    async def _disp(*args, **kwargs):
+        rid = kwargs["request_id"]
+        return _FakePeer([
+            {"type": "res", "id": rid, "ok": True, "payload": {"accepted": True}},
+        ]), rid, "sess_1"
+
+    dispatch.side_effect = _disp
+    response = TestClient(app).post(
+        path,
+        json={"session_id": "sess_1", "query": "probe", "enable_streaming": False, **body_identity},
+        headers={"X-Bot-Id": "A", "X-User-Id": "A"},
+    )
+    assert response.status_code == 200
+    dispatch.assert_awaited_once()
+
+
 def test_chat_completions_sse(app_with_mock):
     app, dispatch = app_with_mock
 
