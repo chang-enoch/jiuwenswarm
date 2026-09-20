@@ -549,11 +549,16 @@ class WebWsTransport(BaseWsChannel):
         """解析 ws 连接身份,供 /ws 和 /ws/git 共用(设计文档 §5.3.7)。
 
         Args:
-            route_type: ``"ws"`` 主路由或 ``"git"`` /ws/git 路由,仅用于日志区分。
+            route_type: ``"ws"`` 主路由或 ``"git"`` /ws/git 路由（保留形参，兼容调用方）。
+
+        Note:
+            企业版默认 ``WEB_TRANSPORT=http``，浏览器刷新不会走本路径；
+            ``ws_resolve_identity`` 审计打点已移除，身份解析逻辑保留。
 
         Returns:
             ``(connection_user_id, routing_key_user_id)``
         """
+        _ = route_type
         connection_user_id = cls._resolve_connection_user_id(flat_query, ws)
         routing_key_user_id = cls._routing_key_user_id(connection_user_id, remote)
         return connection_user_id, routing_key_user_id
