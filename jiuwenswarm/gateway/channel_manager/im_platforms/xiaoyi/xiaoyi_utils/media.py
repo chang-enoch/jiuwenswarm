@@ -9,7 +9,11 @@ import base64
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
+import re
+import ssl
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -106,6 +110,25 @@ def _infer_placeholder(mime_type: str) -> str:
 
 
 # ==================== HTTP Download ====================
+def _proxy_for_url(url: str) -> str | None:
+    """按目标地址分流：环回/纯 IP 直连；公网域名经 CLAW_HTTP_PROXY 出网。
+
+    规则对齐 XYFileUploadService._smart_proxy_for，但不抽公共 helper。
+    """
+    try:
+        host = urlsplit(url).hostname or ""
+    except Exception:
+        return None
+    if not host:
+        return None
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return None
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+        return None
+    proxy = (os.environ.get("CLAW_HTTP_PROXY") or "").strip()
+    return proxy or None
+
+
 async def _fetch_from_url(
     url: str,
     max_bytes: int,
@@ -118,17 +141,22 @@ async def _fetch_from_url(
         tuple[bytes, str]: (buffer, mime_type)
     """
     timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
+    proxy = _proxy_for_url(url)
+    headers = {"User-Agent": "XiaoYi-Channel/1.0"}
 
-    try:
+    async def _read_once(*, ssl_opt: bool | None = None) -> tuple[bytes, str]:
+        get_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "headers": headers,
+        }
+        if proxy:
+            get_kwargs["proxy"] = proxy
+        if ssl_opt is False:
+            get_kwargs["ssl"] = False
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                timeout=timeout,
-                headers={"User-Agent": "XiaoYi-Channel/1.0"}
-            ) as response:
+            async with session.get(url, **get_kwargs) as response:
                 response.raise_for_status()
 
-                # 检查 content-length header (如果可用)
                 content_length = response.headers.get("content-length")
                 if content_length:
                     size = int(content_length)
@@ -140,11 +168,19 @@ async def _fetch_from_url(
                 if len(buffer) > max_bytes:
                     raise ValueError(f"File too large: {len(buffer)} bytes (limit: {max_bytes})")
 
-                # 检测 MIME 类型
                 content_type = response.headers.get("content-type", "application/octet-stream")
                 mime_type = content_type.split(";")[0].strip() if ";" in content_type else content_type
 
                 return buffer, mime_type
+
+    try:
+        try:
+            return await _read_once()
+        except (ssl.SSLError, aiohttp.ClientSSLError, aiohttp.ClientConnectorCertificateError) as exc:
+            if not proxy:
+                raise
+            logger.warning("[XiaoYi Media] 代理 TLS 拦截（%s），容忍拦截重试一次", exc)
+            return await _read_once(ssl_opt=False)
 
     except aiohttp.ClientResponseError as response:
         status = response.status
@@ -188,14 +224,12 @@ async def download_and_save_media(
 
         logger.info(f"[XiaoYi Media] Downloaded {len(buffer)} bytes, MIME: {final_mime_type}")
 
-        # 这里简化：由于 Python 版本没有直接访问 runtime.channel.media.saveMediaBuffer 的方式，
-        # 我们返回路径占位符，实际的保存由调用者处理
         placeholder = _infer_placeholder(final_mime_type)
-        
-        if not _TMP_MEDIA_PATH.exists():
-            _TMP_MEDIA_PATH.mkdir(parents=True, exist_ok=True)
 
-        file_path = _TMP_MEDIA_PATH / file_name
+        dest_dir = Path(save_dir) if save_dir else _TMP_MEDIA_PATH
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = dest_dir / file_name
         with open(file_path, "wb") as f:
             f.write(buffer)
 
@@ -219,7 +253,8 @@ async def download_and_save_media(
 
 async def download_and_save_media_list(
     files: list[MediaFile],
-    options: MediaDownloadOptions | None = None
+    options: MediaDownloadOptions | None = None,
+    save_dir: str | None = None,
 ) -> list[DownloadedMedia]:
     """
     下载并保存多个媒体文件。
@@ -227,6 +262,7 @@ async def download_and_save_media_list(
     Args:
         files: 待下载的文件列表
         options: 下载选项
+        save_dir: 保存目录（非空则写入该目录，否则临时目录）
 
     Returns:
         list[DownloadedMedia]: 已下载的媒体信息列表
@@ -242,7 +278,8 @@ async def download_and_save_media_list(
                 file.uri,
                 file.mime_type,
                 file.name,
-                options
+                options,
+                save_dir=save_dir,
             )
             results.append(downloaded)
         except Exception as e:
