@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -118,8 +119,13 @@ def test_provider_exception_falls_back_to_default(caplog):
             raise RuntimeError("unavailable")
 
     providers.register_path_provider(Provider())
-    assert utils.get_logs_dir() == expected
-    assert "fallback to default" in caplog.text
+    logger = logging.getLogger("jiuwenswarm.common.utils")
+    logger.addHandler(caplog.handler)
+    try:
+        assert utils.get_logs_dir() == expected
+        assert "fallback to default" in caplog.text
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 def test_bound_tenant_paths_are_context_not_implicit_overrides(tmp_path):

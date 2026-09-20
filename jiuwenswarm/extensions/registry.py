@@ -71,13 +71,15 @@ class ExtensionRegistry:
     def register_agent_server_client(self, extension: AgentServerClientExtension) -> None:
         self._agent_server_client = extension
 
-    def register_path_provider(self, extension: "PathProviderExtension") -> None:
+    @staticmethod
+    def register_path_provider(extension: "PathProviderExtension") -> None:
         from jiuwenswarm.common.path_provider import register_path_provider
 
         provider = extension.get_path_provider()
         register_path_provider(provider)
 
-    def register_config_provider(self, extension: "ConfigProviderExtension") -> None:
+    @staticmethod
+    def register_config_provider(extension: "ConfigProviderExtension") -> None:
         from jiuwenswarm.common.config_provider import register_config_provider
 
         provider = extension.get_config_provider()

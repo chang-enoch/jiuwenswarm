@@ -158,7 +158,8 @@ def _apply_enterprise_policy(base: dict, loaded: Any) -> dict:
 class DefaultConfigProvider:
     name = "default"
 
-    def get_process_config(self) -> dict | None:
+    @staticmethod
+    def get_process_config() -> dict | None:
         return None
 
     async def load_process_config(self) -> dict | None:
