@@ -385,6 +385,7 @@ async def test_deep_adapter_global_reload_marks_sessions_stale_without_fanout(mo
     # 合并 dev-stable（TTSE 接线）后 reload 尾部会 await register_rail 挂 TTSERail
     # （react.ttse.enabled 模板默认开启），同样需可 await。
     parent._instance.register_rail = AsyncMock()
+    parent._instance.unregister_rail = AsyncMock()
     session_a = FakeAgent()
     session_b = FakeAgent()
     parent._session_adapters = {
@@ -474,6 +475,7 @@ async def _reload_deep_adapter_config_for_test(previous_config, deep_config_fact
     # 合并 dev-stable（TTSE 接线）后 reload 尾部会 await register_rail 挂 TTSERail
     # （react.ttse.enabled 模板默认开启），同样需可 await。
     adapter._instance.register_rail = AsyncMock()
+    adapter._instance.unregister_rail = AsyncMock()
     adapter._instance._deep_config = previous_config
 
     def _configure(cfg):
