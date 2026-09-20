@@ -43,10 +43,6 @@ declare -A CONFIG=(
     ["SECRET_CM_TEMPLATE_FILE"]="${TEMPLATE_DIR}/configmap-secret.template.yaml"
     ["SECRET_CM_FILE"]="${CONFIG_DIR}/configmap-secret.yaml"
 
-    ["GATEWAY_CONFIG_TEMPLATE_FILE"]="${TEMPLATE_DIR}/gateway-config.template.yaml"
-    ["GATEWAY_CONFIG_FILE"]="${CONFIG_DIR}/gateway-config.yaml"
-    ["GATEWAY_CONFIG_YAML_FILE"]="${CONFIG_DIR}/gateway-config.configmap.yaml"
-
     ["GATEWAY_ENV_TEMPLATE_FILE"]="${TEMPLATE_DIR}/gateway.template.env"
     ["GATEWAY_ENV_FILE"]="${CONFIG_DIR}/gateway.env"
     ["GATEWAY_ENV_YAML_FILE"]="${CONFIG_DIR}/gateway-env.configmap.yaml"
@@ -137,15 +133,17 @@ declare -A DEPLOY_VARS=(
     ["TOOL_RESULT_DISPLAY_MAX_CHARS"]="500"
     ["GATEWAY_NAME"]="jiuwenclaw-gateway"
     ["GATEWAY_REPLICAS"]="1"
-    ["GATEWAY_CONFIG_MAP_NAME"]="jiuwenclaw-gateway-config"
     ["GATEWAY_DB_MAX_OVERFLOW"]="20"
     ["GATEWAY_DB_POOL_SIZE"]="2"
     ["GATEWAY_DB_POOL_TIMEOUT"]="30"
+    ["GATEWAY_AGENT_HTTP_MAX_CONNECTIONS"]="200"
+    ["GATEWAY_AGENT_HTTP_MAX_KEEPALIVE"]="20"
     ["GATEWAY_ENV_FILE_CM_NAME"]="jiuwenclaw-gateway-envfile"
     ["GATEWAY_INSTANCE_ID"]=""
     ["GATEWAY_SCHED_LABEL_ENABLED"]="false"
     ["GATEWAY_RUNTIME_MANAGER_URL"]="http://jiuwenclaw-agent-runtime:8091"
     ["GATEWAY_WEB_SESSION_STORAGE"]="remote"
+    ["GATEWAY_SESSION_MAP_SCOPE"]="per_chat_bot_user"
     ["LOG_MASK_ENABLED"]="true"
     ["LOG_TO_FILE_ENABLED"]="true"
     ["IDENTITY_NAME"]="jiuwenclaw-identity"
@@ -241,6 +239,7 @@ declare -A DEPLOY_VARS=(
     ["AGENT_RUNTIME_REQUEST_TIMEOUT"]="300"
     ["AGENT_RUNTIME_SCOPE_FULL_TIMEOUT"]="30"
     ["AGENT_RUNTIME_LOG_LEVEL"]="INFO"
+    ["AGENT_RUNTIME_WATCH_INTERVAL"]="10"
     ["WS_ALLOWED_ORIGINS"]=""
     ["WS_ORIGIN_CHECK_ENABLED"]="false"
     ["CLAW_HOME"]="/home/app"
@@ -260,6 +259,7 @@ declare -A DEPLOY_VARS=(
     ["JIUWENBOX_PORT"]="8321"
     ["APPLY_PATCH"]="false"
     ["LOGIN_AUTH_SIMULATE"]="false"
+    ["JIUWENSWARM_CONFIG_DIR"]="/app/config"
 )
 
 declare -A OYR_COMPONENTS=(

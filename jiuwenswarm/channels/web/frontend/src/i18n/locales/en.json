@@ -2699,5 +2699,17 @@
       "hideTasks": "Collapse tasks",
       "showTasks": "Show tasks"
     }
+  },
+  "longHorizon": {
+    "toastTitle": "Long-horizon reminder",
+    "dueLabel": "Due",
+    "actions": {
+      "start": "Do now",
+      "snooze": "Later",
+      "skip": "Skip"
+    },
+    "errors": {
+      "actionFailed": "Action failed"
+    }
   }
 }

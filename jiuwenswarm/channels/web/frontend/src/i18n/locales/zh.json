@@ -2689,5 +2689,17 @@
       "hideTasks": "收起任务栏",
       "showTasks": "展开任务栏"
     }
+  },
+  "longHorizon": {
+    "toastTitle": "长程提醒",
+    "dueLabel": "计划时间",
+    "actions": {
+      "start": "现在做",
+      "snooze": "稍后",
+      "skip": "跳过"
+    },
+    "errors": {
+      "actionFailed": "操作失败"
+    }
   }
 }
