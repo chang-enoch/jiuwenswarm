@@ -2418,6 +2418,7 @@ class SkillTurboExecutor:
             inputs=inputs,
             error=error,
             parent_session=_session_var.get(),
+            result_validator=node.validate_fallback_success,
         )
 
     async def fallback_stream(
@@ -2465,6 +2466,7 @@ class SkillTurboExecutor:
             inputs=inputs,
             error=error,
             parent_session=_session_var.get(),
+            result_validator=node.validate_fallback_success,
         ):
             yield chunk
 
