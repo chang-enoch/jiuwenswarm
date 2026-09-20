@@ -156,3 +156,89 @@ async def test_refresh_config_source_refreshes_enterprise_memory(monkeypatch):
     )
     await providers.refresh_config_source()
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_without_plugin_override_uses_enterprise_default(monkeypatch):
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("JIUWENSWARM_CONFIG_SOURCE", "enterprise")
+    events = []
+
+    class Provider(providers.ConfigProvider):
+        name = "no-refresh"
+
+    async def reload_memory():
+        events.append("memory")
+
+    monkeypatch.setattr(
+        enterprise_config,
+        "invalidate_enterprise_config_caches",
+        lambda: events.append("enterprise-cache"),
+    )
+    monkeypatch.setattr(
+        memory_config,
+        "reload_memory_config_from_gateway_db",
+        reload_memory,
+    )
+    providers.register_config_provider(Provider())
+
+    await providers.refresh_config_source()
+
+    assert events == ["enterprise-cache", "memory"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_refresh_takes_precedence_over_enterprise_default(monkeypatch):
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("JIUWENSWARM_CONFIG_SOURCE", "enterprise")
+    events = []
+
+    class Provider(providers.ConfigProvider):
+        name = "custom-refresh"
+
+        async def refresh(self):
+            events.append("plugin")
+
+    monkeypatch.setattr(
+        enterprise_config,
+        "invalidate_enterprise_config_caches",
+        lambda: events.append("enterprise-cache"),
+    )
+    providers.register_config_provider(Provider())
+
+    await providers.refresh_config_source()
+
+    assert events == ["plugin"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_refresh_failure_falls_back_to_enterprise_default(monkeypatch):
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("JIUWENSWARM_CONFIG_SOURCE", "enterprise")
+    events = []
+
+    class Provider(providers.ConfigProvider):
+        name = "broken-refresh"
+
+        async def refresh(self):
+            events.append("plugin")
+            raise RuntimeError("refresh failed")
+
+    async def reload_memory():
+        events.append("memory")
+
+    monkeypatch.setattr(
+        enterprise_config,
+        "invalidate_enterprise_config_caches",
+        lambda: events.append("enterprise-cache"),
+    )
+    monkeypatch.setattr(
+        memory_config,
+        "reload_memory_config_from_gateway_db",
+        reload_memory,
+    )
+    providers.register_config_provider(Provider())
+
+    await providers.refresh_config_source()
+
+    assert events == ["plugin", "enterprise-cache", "memory"]
