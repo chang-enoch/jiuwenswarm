@@ -1257,7 +1257,6 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                     }
                 if tool.parameters.get("type") is None:
                     tool.parameters["type"] = "object"
-            self._inject_tool_call_goal_schema(ctx)
             len_messages = len(messages)
             if len_messages == 0:
                 return
