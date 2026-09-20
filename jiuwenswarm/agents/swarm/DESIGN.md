@@ -287,7 +287,6 @@ harness_element(kind=RAIL, name=..., builder=SomeRailClass)              # 直�
 | name | 模式 | P（属性） | C（环境） |
 |---|---|---|---|
 | `swarm.skill_toolkit` | T+K | — | workspace_root |
-| `swarm.user_todos` | T+K | — | — |
 | `swarm.video` | T+K | — | config（models.video 门控） |
 | `swarm.image_gen` | T+K | — | config（IMAGE_GEN_API_KEY 门控） |
 | `swarm.xiaoyi_phone` | T+K | — | config（channels.xiaoyi 门控） |

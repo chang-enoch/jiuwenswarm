@@ -148,7 +148,6 @@ _COMMON_TOOL_NAMES: frozenset[str] = frozenset(
         # Skill retrieval is a separate self-gated tool provider.
         registry.SKILL_RETRIEVAL,
         registry.SYMPHONY_TOOLKIT,
-        registry.USER_TODOS,
         registry.VIDEO,
         registry.IMAGE_GEN,
         registry.XIAOYI_PHONE,
@@ -483,6 +482,45 @@ def test_member_skill_toolkit_carries_selected_skills() -> None:
 
     # Blank entries are stripped; order is preserved.
     assert toolkit.params == {"skills": ["alpha", "beta"]}
+
+
+@pytest.mark.parametrize("mode", ["team", "code.team"])
+def test_model_facing_builtin_tool_specs_force_english_language(mode: str) -> None:
+    """Model-facing generic tool metadata stays English for every member profile."""
+    _, tool_specs = build_member_capability_specs({}, mode, "leader")
+    by_name = {spec.type: spec for spec in tool_specs}
+
+    for name in (
+        registry.WEB_SEARCH,
+        registry.WEB_FETCH,
+        registry.WEB_PAID_SEARCH,
+        registry.VISION,
+        registry.AUDIO,
+    ):
+        assert by_name[name].params["language"] == "en"
+
+    fetch_tool = by_name[registry.WEB_FETCH].build(
+        language="cn",
+        context=SwarmBuildContext(language="cn", member_card_id="member-id"),
+    )
+    assert not any("\u4e00" <= char <= "\u9fff" for char in fetch_tool.card.description)
+
+
+@pytest.mark.parametrize("mode", ["team", "code.team"])
+def test_model_facing_builtin_tool_specs_keep_english_after_json_round_trip(
+    mode: str,
+) -> None:
+    """English model metadata survives the serialized team-member path."""
+    _, tool_specs = build_member_capability_specs({}, mode, "leader")
+    spec = DeepAgentSpec(tools=tool_specs)
+    restored = DeepAgentSpec.model_validate_json(spec.model_dump_json())
+    by_name = {tool.type: tool for tool in restored.tools or []}
+
+    fetch_tool = by_name[registry.WEB_FETCH].build(
+        language="cn",
+        context=SwarmBuildContext(language="cn", member_card_id="member-id"),
+    )
+    assert not any("\u4e00" <= char <= "\u9fff" for char in fetch_tool.card.description)
 
 
 def test_swarm_skill_retrieval_tools_use_global_skill_manager(
@@ -1512,7 +1550,6 @@ def test_code_capability_specs_rail_and_tool_names(mode: str) -> None:
         registry.AUDIO,
         # SKILL_TOOLKIT moved to the MEMBER_SKILL_TOOLKIT rail (see common set).
         registry.SKILL_RETRIEVAL,
-        registry.USER_TODOS,
         registry.VIDEO,
         registry.IMAGE_GEN,
         registry.XIAOYI_PHONE,
@@ -1822,7 +1859,7 @@ def test_non_interactive_team_omits_structured_ask_user_provider() -> None:
     assert code_rails.build_structured_ask_user({}, context) is None
 
 
-def test_structured_ask_user_language_uses_team_leader_preferred_language() -> None:
+def test_structured_ask_user_language_is_english_for_model_metadata() -> None:
     team_leader = SwarmBuildContext(
         mode="team",
         role="leader",
@@ -1834,7 +1871,7 @@ def test_structured_ask_user_language_uses_team_leader_preferred_language() -> N
         config={"preferred_language": "zh"},
     )
 
-    assert code_rails.structured_ask_user_language(team_leader) == "cn"
+    assert code_rails.structured_ask_user_language(team_leader) == "en"
     assert code_rails.structured_ask_user_language(team_teammate) == "en"
 
 

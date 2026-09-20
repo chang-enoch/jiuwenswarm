@@ -86,17 +86,14 @@ async def test_code_create_instance_does_not_set_runtime_language_override(
 # ---------------------------------------------------------------------------
 
 
-def test_deep_build_structured_ask_user_rail_uses_output_language() -> None:
-    """StructuredAskUserRail tool-card description + schema field text must
-    follow ``preferred_language`` so zh users get Chinese button labels /
-    form labels from the LLM."""
+def test_deep_build_structured_ask_user_rail_uses_english_model_language() -> None:
+    """StructuredAskUserRail metadata sent to the model stays English."""
     adapter = JiuWenSwarmDeepAdapter()
-    sentinel = "cn-test"
-    with patch.object(adapter, "_resolve_output_language", return_value=sentinel), \
+    with patch.object(adapter, "_resolve_output_language", return_value="cn-test"), \
          patch("jiuwenswarm.server.runtime.agent_adapter.interface_deep.StructuredAskUserRail") as mock_rail:
         adapter._build_structured_ask_user_rail()
 
-    mock_rail.assert_called_once_with(language=sentinel)
+    mock_rail.assert_called_once_with(language="en")
 
 
 def test_deep_build_work_agent_mode_rail_uses_output_language() -> None:
@@ -128,56 +125,48 @@ def test_deep_build_circuit_breaker_rail_uses_output_language(monkeypatch: pytes
     assert kwargs.get("language") == sentinel
 
 
-def test_code_build_structured_ask_user_rail_uses_output_language() -> None:
-    """Symmetric to deep adapter."""
+def test_code_build_structured_ask_user_rail_uses_english_model_language() -> None:
     adapter = JiuwenSwarmCodeAdapter()
-    sentinel = "cn-test"
-    with patch.object(adapter, "_resolve_output_language", return_value=sentinel), \
+    with patch.object(adapter, "_resolve_output_language", return_value="cn-test"), \
          patch("jiuwenswarm.server.runtime.agent_adapter.interface_code.StructuredAskUserRail") as mock_rail:
         adapter._build_structured_ask_user_rail()
 
-    mock_rail.assert_called_once_with(language=sentinel)
+    mock_rail.assert_called_once_with(language="en")
 
 
-def test_code_build_paid_search_tool_uses_output_language(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WebPaidSearchTool description is user-influencing (LLM sees Chinese
-    description → tends to produce Chinese search queries / results)."""
+def test_code_build_paid_search_tool_uses_english_model_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WebPaidSearchTool metadata sent to the model stays English."""
     monkeypatch.setenv("BOCHA_API_KEY", "test-key")
     adapter = JiuwenSwarmCodeAdapter()
-    sentinel = "cn-test"
-    with patch.object(adapter, "_resolve_output_language", return_value=sentinel), \
+    with patch.object(adapter, "_resolve_output_language", return_value="cn-test"), \
          patch("jiuwenswarm.server.runtime.agent_adapter.interface_code.WebPaidSearchTool") as mock_tool:
         adapter._build_paid_search_tool("agent-id")
 
     mock_tool.assert_called_once()
     _args, kwargs = mock_tool.call_args
-    assert kwargs.get("language") == sentinel
+    assert kwargs.get("language") == "en"
 
 
-def test_code_build_web_free_search_tool_uses_output_language() -> None:
-    """WebFreeSearchTool description is user-influencing; symmetric to paid search."""
+def test_code_build_web_free_search_tool_uses_english_model_language() -> None:
     adapter = JiuwenSwarmCodeAdapter()
-    sentinel = "cn-test"
-    with patch.object(adapter, "_resolve_output_language", return_value=sentinel), \
+    with patch.object(adapter, "_resolve_output_language", return_value="cn-test"), \
          patch("jiuwenswarm.server.runtime.agent_adapter.interface_code.WebFreeSearchTool") as mock_tool:
         adapter._build_web_free_search_tool("agent-id")
 
     mock_tool.assert_called_once()
     _args, kwargs = mock_tool.call_args
-    assert kwargs.get("language") == sentinel
+    assert kwargs.get("language") == "en"
 
 
-def test_code_build_web_fetch_webpage_tool_uses_output_language() -> None:
-    """WebFetchWebpageTool description is user-influencing; symmetric to paid search."""
+def test_code_build_web_fetch_webpage_tool_uses_english_model_language() -> None:
     adapter = JiuwenSwarmCodeAdapter()
-    sentinel = "cn-test"
-    with patch.object(adapter, "_resolve_output_language", return_value=sentinel), \
+    with patch.object(adapter, "_resolve_output_language", return_value="cn-test"), \
          patch("jiuwenswarm.server.runtime.agent_adapter.interface_code.WebFetchWebpageTool") as mock_tool:
         adapter._build_web_fetch_webpage_tool("agent-id")
 
     mock_tool.assert_called_once()
     _args, kwargs = mock_tool.call_args
-    assert kwargs.get("language") == sentinel
+    assert kwargs.get("language") == "en"
 
 
 # ---------------------------------------------------------------------------

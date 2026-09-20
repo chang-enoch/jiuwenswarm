@@ -89,10 +89,8 @@ def code_runtime_language(ctx: SwarmBuildContext) -> str:
 
 
 def structured_ask_user_language(ctx: SwarmBuildContext) -> str:
-    """Resolve the StructuredAskUserRail language for team/code profiles."""
-    if ctx.role == "leader" and ctx.mode in {"team", "team.plan"}:
-        return resolve_language((ctx.config or {}).get("preferred_language", "zh"))
-    return code_runtime_language(ctx)
+    """Use English for the model-facing structured ask-user metadata."""
+    return "en"
 
 
 def _project_dir(ctx: SwarmBuildContext) -> str:

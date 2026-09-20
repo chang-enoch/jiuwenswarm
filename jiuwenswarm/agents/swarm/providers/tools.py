@@ -8,7 +8,6 @@ elements, each self-gated by the config source and filtered against the swarm
 
 * ``swarm.skill_toolkit`` — skill discovery / install / uninstall tools.
 * ``swarm.skill_retrieval`` — agentic installed skill tree retrieval tools.
-* ``swarm.user_todos`` — the personal todo tool.
 * ``swarm.video`` — the video-understanding tool (``models.video`` gated).
 * ``swarm.image_gen`` — the image-generation tool (``IMAGE_GEN_API_KEY`` gated).
 * ``swarm.xiaoyi_phone`` — the xiaoyi phone tools (channel-switch gated).
@@ -53,7 +52,6 @@ from jiuwenswarm.agents.harness.common.tools.skill_retrieval_toolkits import (
 )
 from jiuwenswarm.agents.harness.common.tools.skill_toolkits import SkillToolkit
 from jiuwenswarm.agents.harness.common.tools.symphony_toolkits import SymphonyToolkit
-from jiuwenswarm.agents.harness.common.tools.user_todo_tool import get_decorated_tools
 from jiuwenswarm.agents.harness.common.tools.video_tools import video_understanding
 from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools import (
     add_collection,
@@ -95,7 +93,6 @@ logger = logging.getLogger(__name__)
 # Provider name constants; namespaced under the shared "swarm." prefix.
 SKILL_TOOLKIT = "swarm.skill_toolkit"
 SKILL_RETRIEVAL = "swarm.skill_retrieval"
-USER_TODOS = "swarm.user_todos"
 VIDEO = "swarm.video"
 IMAGE_GEN = "swarm.image_gen"
 XIAOYI_PHONE = "swarm.xiaoyi_phone"
@@ -359,15 +356,6 @@ def _build_skill_retrieval_tools(
         return []
 
 
-def _build_user_todo_tools() -> list[Any]:
-    """Build the user's personal todo tool."""
-    try:
-        return _mark_stateless(list(get_decorated_tools()))
-    except Exception as exc:
-        logger.warning("[swarm.user_todos] construction failed: %s", exc)
-        return []
-
-
 def _build_video_tools(ctx: SwarmBuildContext) -> list[Any]:
     """Build the video understanding tool when ``models.video`` is complete."""
     config = ctx.config or {}
@@ -459,16 +447,6 @@ def build_skill_retrieval(params: dict[str, Any], ctx: SwarmBuildContext) -> lis
 
 @harness_element(
     kind=ElementKind.TOOL,
-    name=USER_TODOS,
-    description="The user's personal todo tool.",
-)
-def build_user_todos(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any]:
-    """Build the whitelist-filtered user todo tools."""
-    return _filter_whitelist(_build_user_todo_tools())
-
-
-@harness_element(
-    kind=ElementKind.TOOL,
     name=VIDEO,
     description="Video-understanding tool (built only when models.video is configured).",
 )
@@ -539,7 +517,6 @@ def build_code_extra_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> li
 __all__ = [
     "SKILL_TOOLKIT",
     "SKILL_RETRIEVAL",
-    "USER_TODOS",
     "VIDEO",
     "IMAGE_GEN",
     "XIAOYI_PHONE",

@@ -131,6 +131,18 @@ def test_code_adapter_skips_invoke_when_disabled(monkeypatch):
     assert not getattr(adapter, "_invoke_tool_registered", False)
 
 
+def test_code_adapter_skips_removed_user_todos_tool(monkeypatch):
+    _patch_code_tool_runtime(
+        monkeypatch,
+        {
+            "agents": {"invoke_tool": {"enabled": False}},
+            "modes": {"code": {"tools": ["user_todos"]}},
+        },
+    )
+
+    assert JiuwenSwarmCodeAdapter().build_code_tool_cards("agent-id") == []
+
+
 def test_code_adapter_registers_invoke_in_design_mode(monkeypatch):
     _patch_code_tool_runtime(
         monkeypatch,

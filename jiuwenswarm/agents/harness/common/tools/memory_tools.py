@@ -166,7 +166,7 @@ async def _ensure_global_manager() -> bool:
 
 @tool(
     name="memory_search",
-    description="在长期记忆系统中搜索用户的记忆信息。在回答关于之前的工作内容、决策、日期、人物、偏好或待办事项的问题之前，必须先调用此工具。",
+    description="Search the user's long-term memory. Before answering questions about earlier work, decisions, dates, people, preferences, or todos, always call this tool first.",
 )
 async def memory_search(
     query: str,
@@ -174,16 +174,16 @@ async def memory_search(
     minScore: Optional[float] = None,
     sessionKey: Optional[str] = None
 ) -> Dict[str, Any]:
-    """在长期记忆系统中搜索用户的记忆信息。在回答关于之前的工作内容、决策、日期、人物、偏好或待办事项的问题之前，必须先调用此工具。
+    """Search the user's long-term memory. Before answering questions about earlier work, decisions, dates, people, preferences, or todos, always call this tool first.
 
     Args:
-        query: 搜索查询内容
-        maxResults: 最大返回结果数量 (1-50)
-        minScore: 最小相关性分数 (0-1)
-        sessionKey: 可选的会话键
+        query: Search query.
+        maxResults: Maximum number of results (1-50).
+        minScore: Minimum relevance score (0-1).
+        sessionKey: Optional session key.
 
     Returns:
-        搜索结果字典，包含 results 列表
+        A result dictionary containing a results list.
     """
     if not await _ensure_global_manager():
         return {
@@ -240,15 +240,15 @@ async def memory_get(
     from_line: Optional[int] = None,
     lines: Optional[int] = None
 ) -> Dict[str, Any]:
-    """安全地读取 memory/*.md 文件的指定行。在 memory_search 之后使用，只读取需要的行，保持上下文简洁。
+    """Safely read selected lines from a memory/*.md file. Use after memory_search and read only the needed lines to keep context concise.
 
     Args:
-        path: 文件路径 (相对于工作区)
-        from_line: 起始行号 (从1开始)
-        lines: 读取的行数
+        path: File path relative to the workspace.
+        from_line: Starting line number (1-based).
+        lines: Number of lines to read.
 
     Returns:
-        文件内容字典
+        A dictionary containing the file content.
     """
     if not await _ensure_global_manager():
         return {
@@ -293,16 +293,15 @@ async def write_memory(
     content: str,
     append: bool = False
 ) -> Dict[str, Any]:
-    """在 memory 目录下创建或更新记忆文件。仅用于写入记忆相关内容，如 memory/USER.md、memory/MEMORY.md 或 memory/*.md 文件。
-    禁止用于创建代码文件、配置文件或其他非记忆类文件。
+    """Create or update a memory file under the memory directory. Use only for memory content such as memory/USER.md, memory/MEMORY.md, or memory/*.md files. Never use it to create code, configuration, or other non-memory files.
 
     Args:
-        path: 文件路径，仅允许 memory/ 目录下的文件（如 "memory/xxx.md" 或 "memory/USER.md"）
-        content: 要写入的内容
-        append: 是否追加模式 (默认覆盖)
+        path: File path under memory/ (for example, "memory/xxx.md" or "memory/USER.md").
+        content: Content to write.
+        append: Whether to append instead of overwrite (default: overwrite).
 
     Returns:
-        操作结果字典
+        An operation result dictionary.
     """
     if is_group_chat_mode():
         return {"success": False, "error": "群聊模式下禁止写入记忆文件"}
@@ -364,16 +363,15 @@ async def edit_memory(
     oldText: str,
     newText: str
 ) -> Dict[str, Any]:
-    """精确编辑 memory 目录下的文件内容。仅用于更新记忆文件（如 memory/USER.md、memory/MEMORY.md）。
-    oldText 必须完全匹配文件中的内容。如果 oldText 出现多次，需要更具体地指定。
+    """Precisely edit file content under the memory directory. Use only to update memory files such as memory/USER.md or memory/MEMORY.md. oldText must exactly match the file content; if it occurs more than once, provide a more specific value.
 
     Args:
-        path: 文件路径，仅允许 memory/ 目录下的文件
-        oldText: 要查找的文本 (必须完全匹配)
-        newText: 替换的文本
+        path: File path under memory/.
+        oldText: Text to find (must match exactly).
+        newText: Replacement text.
 
     Returns:
-        操作结果字典
+        An operation result dictionary.
     """
     if is_group_chat_mode():
         return {"success": False, "error": "群聊模式下禁止编辑记忆文件"}
@@ -454,15 +452,15 @@ async def read_memory(
     offset: Optional[int] = None,
     limit: Optional[int] = None
 ) -> Dict[str, Any]:
-    """读取 memory 目录下的文件内容。仅用于读取记忆文件（如 memory/USER.md、memory/MEMORY.md 或 memory/*.md）。
+    """Read file content under the memory directory. Use only for memory files such as memory/USER.md, memory/MEMORY.md, or memory/*.md.
 
     Args:
-        path: 文件路径，仅允许 memory/ 目录下的文件
-        offset: 起始行号 (从1开始)
-        limit: 读取的行数
+        path: File path under memory/.
+        offset: Starting line number (1-based).
+        limit: Number of lines to read.
 
     Returns:
-        文件内容字典
+        A dictionary containing the file content.
     """
     try:
         is_valid, result = _validate_memory_path(path)

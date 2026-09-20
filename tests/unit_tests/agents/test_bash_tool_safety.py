@@ -7,7 +7,6 @@ import pytest
 from unittest.mock import MagicMock
 
 from jiuwenswarm.agents.harness.common.tools.bash_tool_safety import (
-    _bash_schema_exposes_run_in_background,
     _ensure_bash_background_card,
     _ensure_powershell_background_card,
     _patch_tool_class,
@@ -150,6 +149,7 @@ def test_install_patches_bash_card_with_run_in_background() -> None:
     properties = tool.card.input_params["properties"]
     assert "run_in_background" in properties
     assert properties["run_in_background"]["type"] == "boolean"
+    assert "description" not in properties
     assert "run_in_background" in tool.card.description
     assert "nohup" in tool.card.description
     assert "仅用于不会自行退出" in tool.card.description
@@ -185,6 +185,7 @@ def test_install_patches_powershell_card_against_start_process() -> None:
     install_shell_tool_safety_hooks()
     tool = PowerShellTool(MagicMock(), language="cn")
     assert "background" in tool.card.input_params["properties"]
+    assert "description" not in tool.card.input_params["properties"]
     assert "Start-Process" in tool.card.description
     assert "background=true" in tool.card.description
     assert "优先" in tool.card.description
@@ -271,32 +272,7 @@ def test_ensure_bash_background_card_skips_description_when_property_exists() ->
     assert Tool.card.description == original
 
 
-def test_bash_schema_exposes_run_in_background_when_present(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "openjiuwen.harness.prompts.tools.get_tool_input_params",
-        lambda name, language="cn": {
-            "properties": {"run_in_background": {"type": "boolean"}},
-        },
-    )
-    assert _bash_schema_exposes_run_in_background() is True
-
-
-def test_bash_schema_exposes_run_in_background_when_absent(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "openjiuwen.harness.prompts.tools.get_tool_input_params",
-        lambda name, language="cn": {
-            "properties": {"command": {"type": "string"}},
-        },
-    )
-    assert _bash_schema_exposes_run_in_background() is False
-
-
-def test_patch_skips_init_wrap_when_schema_already_exposes(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.bash_tool_safety._bash_schema_exposes_run_in_background",
-        lambda: True,
-    )
-
+def test_patch_always_wraps_bash_init() -> None:
     class Dummy:
         def __init__(self) -> None:
             pass
@@ -310,29 +286,9 @@ def test_patch_skips_init_wrap_when_schema_already_exposes(monkeypatch) -> None:
 
     original_init = Dummy.__init__
     _patch_tool_class(Dummy, "bash")
-    assert Dummy.__init__ is original_init
-    assert getattr(Dummy.invoke, "jiuwenswarm_safety_wrapped", False)
-
-
-def test_patch_wraps_init_when_schema_missing_field(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.bash_tool_safety._bash_schema_exposes_run_in_background",
-        lambda: False,
-    )
-
-    class Dummy:
-        def __init__(self) -> None:
-            pass
-
-        async def invoke(self, inputs):
-            return None
-
-        async def stream(self, inputs):
-            if False:
-                yield None
-
-    _patch_tool_class(Dummy, "bash")
+    assert Dummy.__init__ is not original_init
     assert getattr(Dummy.__init__, "jiuwenswarm_card_wrapped", False)
+    assert getattr(Dummy.invoke, "jiuwenswarm_safety_wrapped", False)
 
 
 def test_patch_always_wraps_powershell_init() -> None:
