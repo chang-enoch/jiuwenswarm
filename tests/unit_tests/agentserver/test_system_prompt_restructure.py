@@ -31,7 +31,12 @@ from jiuwenswarm.agents.harness.common.prompt.safety_override import (
     SAFETY_PROMPT_EN,
 )
 from jiuwenswarm.agents.harness.common.rails import skill_retrieval_prompt_rail as _skill_retrieval_prompt_mod
-from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import RuntimePromptRail
+from jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail import (
+    RuntimePromptRail,
+    _MODE_DISPLAY_MAP,
+    _canonical_mode_name,
+    _mode_display_name,
+)
 from jiuwenswarm.agents.harness.common.rails.response_prompt_rail import ResponsePromptRail
 from jiuwenswarm.agents.harness.common.rails.skill_retrieval_prompt_rail import SkillRetrievalPromptRail
 from jiuwenswarm.agents.harness.common.rails.symphony import (
@@ -1062,8 +1067,8 @@ async def test_runtime_attachment_tracks_live_code_agent_mode(tmp_path, monkeypa
     await runtime_rail.before_model_call(ctx)
     items = await agent.prompt_attachment_manager.collect_for_session("sess1")
     rendered = agent.prompt_attachment_manager.render(items)
-    assert "Current mode: code.plan" in rendered
-    assert "Current mode: code.normal" not in rendered
+    assert "- Current mode: Code Plan Mode\n" in rendered
+    assert "- Current mode: Code Mode\n" not in rendered
 
     await runtime_rail.before_model_call(ctx)
     items = await agent.prompt_attachment_manager.collect_for_session("sess1")
@@ -1074,8 +1079,8 @@ async def test_runtime_attachment_tracks_live_code_agent_mode(tmp_path, monkeypa
     await runtime_rail.before_model_call(ctx)
     items = await agent.prompt_attachment_manager.collect_for_session("sess1")
     rendered = agent.prompt_attachment_manager.render(items)
-    assert "Current mode: code.normal" in rendered
-    assert "Current mode: code.plan" not in rendered
+    assert "- Current mode: Code Mode\n" in rendered
+    assert "- Current mode: Code Plan Mode\n" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1105,6 +1110,70 @@ async def test_runtime_attachment_localizes_mode_in_chinese(tmp_path, monkeypatc
     items = await agent.prompt_attachment_manager.collect_for_session("sess1")
     rendered = agent.prompt_attachment_manager.render(items)
     assert "当前模式：" not in rendered
+
+
+def test_mode_display_map_is_minimal_live_canonical_set():
+    assert set(_MODE_DISPLAY_MAP) == {
+        "agent",
+        "agent.plan",
+        "team",
+        "team.plan",
+        "code.normal",
+        "code.plan",
+        "code.team",
+        "design",
+        "design.team",
+    }
+    cn_names = [names["cn"] for names in _MODE_DISPLAY_MAP.values()]
+    en_names = [names["en"] for names in _MODE_DISPLAY_MAP.values()]
+    assert len(cn_names) == len(set(cn_names))
+    assert len(en_names) == len(set(en_names))
+    assert _mode_display_name("code.normal", "cn") == "代码模式"
+    assert _mode_display_name("code.normal", "en") == "Code Mode"
+    assert _mode_display_name("design", "cn") == "设计模式"
+    assert _mode_display_name("design", "en") == "Design Mode"
+    assert _mode_display_name("design.team", "cn") == "设计集群模式"
+    assert _mode_display_name("design.team", "en") == "Design Team Mode"
+    assert _canonical_mode_name("代码模式") == "code.normal"
+    assert _canonical_mode_name("设计模式") == "design"
+    assert _canonical_mode_name("设计集群模式") == "design.team"
+    assert _canonical_mode_name("code.normal") == "code.normal"
+    assert _mode_display_name("design.plan", "en") == "design.plan"
+    assert _mode_display_name("code", "en") == "code"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "mode", "needle"),
+    [
+        ("en", "design", "- Current mode: Design Mode\n"),
+        ("en", "design.team", "- Current mode: Design Team Mode\n"),
+        ("cn", "code.normal", "- 当前模式：代码模式\n"),
+        ("cn", "design", "- 当前模式：设计模式\n"),
+    ],
+)
+async def test_runtime_attachment_renders_live_mode_display_names(
+    tmp_path, monkeypatch, language, mode, needle
+):
+    monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
+    runtime_state = tmp_path / "runtime_state" / "default.yaml"
+    runtime_state.parent.mkdir(parents=True, exist_ok=True)
+    runtime_state.write_text(f"model: model-x\nmode: {mode}\n", encoding="utf-8")
+    builder = SystemPromptBuilder(language=language)
+    agent = _FakeAgent(builder)
+    runtime_rail = RuntimePromptRail(language=language, channel="desktop")
+    runtime_rail.init(agent)
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=None,
+        session=_FakeSession(),
+        extra={},
+    )
+
+    await runtime_rail.before_model_call(ctx)
+    items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+    rendered = agent.prompt_attachment_manager.render(items)
+    assert needle in rendered
 
 
 @pytest.mark.asyncio

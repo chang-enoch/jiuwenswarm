@@ -57,13 +57,14 @@ _EXTENSION_REFERENCE_MUTATOR_MARKER = "_jiuwenswarm_extension_reference_mutator"
 
 _MODE_DISPLAY_MAP: dict[str, dict[str, str]] = {
     "agent": {"cn": "智能体模式", "en": "Agent Mode"},
-    # Web 的 work 单 agent 计划模式（mode=agent.plan + work_mode=work）。
     "agent.plan": {"cn": "计划模式", "en": "Plan Mode"},
-    # 历史 token 归一到合并后的 agent 显示名（兼容旧会话 / 旧请求）。
-    "agent.fast": {"cn": "智能体模式", "en": "Agent Mode"},
     "team": {"cn": "集群模式", "en": "Cluster Mode"},
     "team.plan": {"cn": "集群计划模式", "en": "Cluster Plan Mode"},
+    "code.normal": {"cn": "代码模式", "en": "Code Mode"},
+    "code.plan": {"cn": "代码计划模式", "en": "Code Plan Mode"},
     "code.team": {"cn": "代码集群模式", "en": "Code Team Mode"},
+    "design": {"cn": "设计模式", "en": "Design Mode"},
+    "design.team": {"cn": "设计集群模式", "en": "Design Team Mode"},
 }
 
 
@@ -462,7 +463,8 @@ class RuntimePromptRail(DeepAgentRail):
                 f"- 当前渠道：{channel}"
             )
         else:
-            mode_line = f"- Current mode: {mode}\n" if include_mode else ""
+            mode_display = _mode_display_name(mode, "en")
+            mode_line = f"- Current mode: {mode_display}\n" if include_mode else ""
             runtime_content = (
                 "# Runtime State\n\n"
                 f"- Current model: {model}\n"
