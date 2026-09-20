@@ -1433,3 +1433,104 @@ def test_enterprise_gateway_blocks_mcp_server_methods(monkeypatch) -> None:
     monkeypatch.setattr(web_invoke, "is_enterprise", lambda: False)
     assert not web_invoke.is_enterprise_write_forbidden("mcp.server.add")
 
+# ---------------------------------------------------------------------------
+# tool_filter：入口过滤（_apply_tool_filter）与注册表端到端（add/update 经过滤）
+# ---------------------------------------------------------------------------
+
+
+def test_apply_tool_filter_missing_field_returns_all() -> None:
+    from jiuwenswarm.common.mcp_config import _apply_tool_filter
+
+    tools = [{"name": "a", "description": "d"}, {"name": "b"}]
+    assert _apply_tool_filter(tools, {}) == tools
+    assert _apply_tool_filter(tools, {"tool_filter": "not-a-list"}) == tools
+    assert _apply_tool_filter(tools, {"other": 1}) == tools
+
+
+def test_apply_tool_filter_empty_list_disables_all() -> None:
+    from jiuwenswarm.common.mcp_config import _apply_tool_filter
+
+    assert _apply_tool_filter([{"name": "a"}], {"tool_filter": []}) == []
+    # 全是空白项的 filter 视为空名单
+    assert _apply_tool_filter([{"name": "a"}], {"tool_filter": ["  ", ""]}) == []
+
+
+def test_apply_tool_filter_partial_match_keeps_order() -> None:
+    from jiuwenswarm.common.mcp_config import _apply_tool_filter
+
+    tools = [
+        {"name": "search", "description": "s"},
+        {"name": "delete", "description": "d"},
+        {"name": "get", "description": "g"},
+    ]
+    filtered = _apply_tool_filter(tools, {"tool_filter": ["search", " get ", "missing"]})
+    assert [tool["name"] for tool in filtered] == ["search", "get"]
+
+
+@pytest.mark.asyncio
+async def test_registry_add_servers_respects_tool_filter(monkeypatch) -> None:
+    registry = reset_mcp_server_registry_for_tests()
+
+    async def _multi_tools(name, config):
+        return (
+            [
+                {"name": f"{name}_a", "description": "d", "input_params": {}},
+                {"name": f"{name}_b", "description": "d", "input_params": {}},
+                {"name": f"{name}_c", "description": "d", "input_params": {}},
+            ],
+            {"_mcp_client_type": "streamable-http", "url": "https://example.com/mcp"},
+        )
+
+    # patch 内层发现入口：让真实包装（_apply_tool_filter）参与执行
+    monkeypatch.setattr(
+        "jiuwenswarm.common.mcp_config._list_request_mcp_server_tools_inner",
+        _multi_tools,
+    )
+    results = await registry.add_servers(
+        [
+            {**_remote_cfg("conn_full")},  # 无 filter → 全量
+            {**_remote_cfg("conn_half"), "tool_filter": ["conn_half_a", "conn_half_c"]},
+            {**_remote_cfg("conn_none"), "tool_filter": []},
+        ]
+    )
+    by_name = {item["name"]: item for item in results}
+    assert by_name["conn_full"]["tools_count"] == 3
+    assert by_name["conn_half"]["tools_count"] == 2
+    assert by_name["conn_half"]["ok"] is True
+    assert by_name["conn_none"]["tools_count"] == 0
+    assert by_name["conn_none"]["ok"] is True  # 全停用 server 仍在册
+
+    # 快照路径同样只暴露过滤后的工具
+    snapshots = await registry.snapshot_for_chat(["conn_full", "conn_half", "conn_none"])
+    snap_by_name = {name: [tool["name"] for tool in tools] for name, tools, _ in snapshots}
+    assert snap_by_name["conn_full"] == ["conn_full_a", "conn_full_b", "conn_full_c"]
+    assert snap_by_name["conn_half"] == ["conn_half_a", "conn_half_c"]
+    assert snap_by_name["conn_none"] == []
+
+
+@pytest.mark.asyncio
+async def test_registry_update_servers_refilters_when_tool_filter_changes(monkeypatch) -> None:
+    registry = reset_mcp_server_registry_for_tests()
+
+    async def _multi_tools(name, config):
+        return (
+            [
+                {"name": f"{name}_a", "description": "d", "input_params": {}},
+                {"name": f"{name}_b", "description": "d", "input_params": {}},
+            ],
+            {"_mcp_client_type": "streamable-http", "url": "https://example.com/mcp"},
+        )
+
+    monkeypatch.setattr(
+        "jiuwenswarm.common.mcp_config._list_request_mcp_server_tools_inner",
+        _multi_tools,
+    )
+    (added,) = await registry.add_servers([{**_remote_cfg("conn_x"), "tool_filter": ["conn_x_a"]}])
+    assert added["tools_count"] == 1
+
+    # filter 变化 → config 指纹变化 → update 重扫并按新名单过滤
+    (updated,) = await registry.update_servers([{**_remote_cfg("conn_x"), "tool_filter": ["conn_x_b"]}])
+    assert updated["ok"] is True
+    assert updated["tools_count"] == 1
+    snapshots = await registry.snapshot_for_chat(["conn_x"])
+    assert [tool["name"] for tool in snapshots[0][1]] == ["conn_x_b"]
