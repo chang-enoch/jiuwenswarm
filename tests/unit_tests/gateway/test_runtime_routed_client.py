@@ -59,6 +59,15 @@ http_base_from_pod_sse_url = _routed_mod.http_base_from_pod_sse_url
 identity_from_envelope = _routed_mod.identity_from_envelope
 
 
+@pytest.fixture(autouse=True)
+def agent_resources(monkeypatch):
+    from unittest.mock import AsyncMock
+    auth = _load("agent_authorization")
+    repo = types.SimpleNamespace(get=AsyncMock(return_value={"enabled": True, "match_expr": []}))
+    monkeypatch.setattr(auth, "get_enterprise_record_repository", lambda _: repo)
+    return repo
+
+
 def _chat_env():
     from jiuwenswarm.common.request_identity import apply_routing_metadata
 
@@ -740,4 +749,219 @@ async def test_unary_value_error_not_rerouted() -> None:
     with pytest.raises(ValueError, match="assemble"):
         await client.send_request(env)
     assert len(route.routes) == 1
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("method", ["chat.send", "chat.resume", "chat.user_answer", "chat.swarmflow_reply"])
+@pytest.mark.parametrize("row", [
+    None,
+    {"enabled": False, "match_expr": []},
+    {"enabled": True, "match_expr": "user_id == 'other'"},
+    {"enabled": True, "match_expr": "user_id in ('other')"},
+    {"enabled": True, "expires_at": "2000-01-01T00:00:00Z"},
+    {"enabled": True, "expires_at": "invalid"},
+])
+async def test_agent_denial_never_routes_or_sends(agent_resources, stream, method, row):
+    agent_resources.get.return_value = row
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    env = _chat_env()
+    env.method = method
+    with pytest.raises(FatalRouteError) as exc:
+        if stream:
+            _ = [chunk async for chunk in client.send_request_stream(env)]
+        else:
+            await client.send_request(env)
+    assert exc.value.code == "FORBIDDEN"
+    assert not route.routes and not http.calls and not route.touches
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_session", [False, True])
+async def test_authorization_and_route_use_trusted_identity(agent_resources, missing_session):
+    agent_resources.get.return_value = {"enabled": True, "match_expr": "user_id == 'user-1'"}
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    env = _chat_env()
+    env.params.update(user_id="forged", group_id="forged", bot_id="forged")
+    if missing_session:
+        env.session_id = None
+        env.params.pop("session_id", None)
+    assert (await client.send_request(env)).ok
+    agent_resources.get.assert_awaited_once_with(resource_id="bot-1")
+    assert route.routes[0]["session_id"] == ("grp-1:bot-1:user-1" if missing_session else "sess-1")
+    assert (route.routes[0]["group_id"], route.routes[0]["bot_id"], route.routes[0]["user_id"]) == (
+        "grp-1", "bot-1", "user-1",
+    )
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_missing_trusted_identity_cannot_use_params(agent_resources):
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    env = _chat_env()
+    env.channel_context = {}
+    with pytest.raises(FatalRouteError):
+        await client.send_request(env)
+    agent_resources.get.assert_not_awaited()
+    assert not route.routes and not http.calls
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revoke", "expire"])
+async def test_existing_session_rechecks_grant(agent_resources, monkeypatch, change):
+    from datetime import datetime, timezone
+    auth = _load("agent_authorization")
+    class Clock(datetime):
+        current = datetime(2026, 9, 18, tzinfo=timezone.utc)
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+    monkeypatch.setattr(auth, "datetime", Clock)
+    agent_resources.get.return_value = {
+        "enabled": True, "match_expr": [], "expires_at": "2026-09-19T00:00:00Z",
+    }
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    assert (await client.send_request(_chat_env())).ok
+    if change == "revoke":
+        agent_resources.get.return_value = {"enabled": True, "match_expr": "user_id == 'other'"}
+    else:
+        Clock.current = datetime(2026, 9, 19, tzinfo=timezone.utc)
+    with pytest.raises(FatalRouteError):
+        await client.send_request(_chat_env())
+    assert len(route.routes) == len(http.calls) == 1
+    assert agent_resources.get.await_count == 2
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_repository_failure_does_not_forward(agent_resources):
+    agent_resources.get.side_effect = RuntimeError("database unavailable")
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await client.send_request(_chat_env())
+    assert not route.routes and not http.calls
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_distinct_resource_grants_with_same_template(agent_resources):
+    from jiuwenswarm.common.request_identity import apply_routing_metadata
+    grants = {
+        "bot-1": {"enabled": True, "ref_template_id": "shared", "match_expr": "user_id in ('user-1')"},
+        "bot-2": {"enabled": True, "ref_template_id": "shared", "match_expr": "user_id in ('other')"},
+    }
+    agent_resources.get.side_effect = lambda *, resource_id: grants[resource_id]
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    assert (await client.send_request(_chat_env())).ok
+    env = _chat_env()
+    env.channel_context = apply_routing_metadata(
+        {}, {"user_id": "user-1", "group_id": "grp-1", "bot_id": "bot-2"},
+    )
+    with pytest.raises(FatalRouteError):
+        await client.send_request(env)
+    assert len(route.routes) == len(http.calls) == 1
+    await client.disconnect()
+
+
+def test_authorization_error_uses_existing_http_contract():
+    from jiuwenswarm.gateway.channel_manager.web.web_http_app import _envelope_from_res
+    body, status = _envelope_from_res(
+        { "ok": False, "error": "Agent access denied", "code": "FORBIDDEN", "payload": {}},
+        "request-1", rpc_method="chat.send",
+    )
+    assert status == 403
+    assert body["error"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["session.create", "history.get", "chat.interrupt"])
+async def test_non_chat_requests_keep_existing_behavior(agent_resources, method):
+    agent_resources.get.side_effect = AssertionError("must not query chat admission")
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    env = _chat_env()
+    env.method = method
+    assert (await client.send_request(env)).ok
+    agent_resources.get.assert_not_awaited()
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("change", ["revoke", "disable", "delete", "expire", "invalid"])
+async def test_persisted_grant_changes_block_next_chat(monkeypatch, stream, change):
+    from jiuwenswarm.gateway.config.enterprise.repository import EnterpriseRecordRepository
+    from jiuwenswarm.gateway.storage.backends.memory_persistent import InMemoryPersistentBackend
+
+    repo = EnterpriseRecordRepository(InMemoryPersistentBackend(), "instance_agent_resource")
+    await repo.create({
+        "resource_id": "bot-1", "enabled": True, "match_expr": "user_id == 'user-1'",
+    })
+    auth = _load("agent_authorization")
+    monkeypatch.setattr(auth, "get_enterprise_record_repository", lambda _: repo)
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+
+    async def chat():
+        if stream:
+            return [chunk async for chunk in client.send_request_stream(_chat_env())]
+        return await client.send_request(_chat_env())
+
+    await chat()
+    if change == "delete":
+        await repo.delete(resource_id="bot-1")
+    else:
+        updates = {
+            "revoke": {"match_expr": "user_id == 'other'"},
+            "disable": {"enabled": False},
+            "expire": {"expires_at": "2000-01-01T00:00:00Z"},
+            "invalid": {"match_expr": "unknown"},
+        }
+        await repo.update({"resource_id": "bot-1"}, updates[change])
+    with pytest.raises(FatalRouteError) as exc:
+        await chat()
+    assert exc.value.code == "FORBIDDEN"
+    assert len(route.routes) == len(http.calls) == 1
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("enabled", [True, False, 1, 0, None, "0", "false"])
+async def test_database_enabled_values(agent_resources, stream, enabled):
+    from jiuwenswarm.gateway.storage.backends.db.bool_codec import mysql_boolean_for_read
+    # 包括实际 MySQL 读值转换，避免仅用 bool 字面量模拟数据库。
+    value = mysql_boolean_for_read(enabled) if isinstance(enabled, (bool, int)) else enabled
+    agent_resources.get.return_value = {"enabled": value, "match_expr": []}
+    route, http = _FakeRoute(), _FakeHttp()
+    client = RuntimeRoutedAgentClient(route_client=route, http_client=http)
+    await client.connect("")
+    async def chat():
+        if stream:
+            return [chunk async for chunk in client.send_request_stream(_chat_env())]
+        return await client.send_request(_chat_env())
+    if enabled is True or enabled == 1:
+        await chat()
+        assert len(route.routes) == len(http.calls) == 1
+    else:
+        with pytest.raises(FatalRouteError):
+            await chat()
+        assert not route.routes and not http.calls
     await client.disconnect()

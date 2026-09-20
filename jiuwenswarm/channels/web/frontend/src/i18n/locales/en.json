@@ -707,7 +707,7 @@
       "tabs": { "ariaLabel": "A2A request history direction", "ingress": "Ingress", "outbound": "Outbound" },
       "copy": "Click to copy",
       "copied": "Copied",
-      "copyFailed": "Copy failed. Check the browser clipboard permission.",
+      "copyFailed": "Copy failed. Select the text and copy it manually.",
       "ingress": {
         "title": "Ingress request history",
         "description": "Shows the latest 200 A2A ingress requests in this Gateway process without retaining request bodies.",

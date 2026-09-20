@@ -563,7 +563,13 @@ async def test_real_model_decorators_normalize_positional_input_and_llm_output_o
         event for event in spans[0].events if event.name == "gen_ai.assistant.message"
     ]
     assert len(assistant_events) == 1
-    assert "observable answer" in assistant_events[0].attributes["content"]
+    event_content = assistant_events[0].attributes["content"]
+    assert "observable answer" in event_content
+    # Agent-core owns gen_ai.output.messages (text content only). Reasoning
+    # and tool-call bodies remain on the jiuwenswarm-owned assistant event.
+    assert "observable reasoning" in event_content
+    assert "call-weather" in event_content
+    assert "Paris" in event_content
 
 
 @pytest.mark.asyncio
@@ -924,8 +930,8 @@ async def test_host_message_policy_does_not_disable_sdk_trajectory_content(
     ][0]
     assert finished.attributes["gen_ai.input.messages.count"] == 1
     assert finished.attributes["gen_ai.input.messages.total_length"] == 13
-    # Develop's SDK owns the trajectory payload. The host-only
-    # telemetry.log_messages switch does not suppress SDK span content.
+    # Agent-core always writes the message bodies; log_messages=False only
+    # stops jiuwenswarm from adding a second copy or emitting events.
     assert "prompt-secret" in finished.attributes["gen_ai.input.messages"]
     assert "completion-visible" in finished.attributes["gen_ai.output.messages"]
     assert not any(
@@ -1074,8 +1080,6 @@ async def test_real_tool_wrapper_enriches_skill_output_without_result_identity(
     assert span.attributes["gen_ai.skill.name"] == "forecast"
     assert span.attributes["gen_ai.skill.id"] == "skill-forecast"
     assert span.attributes["gen_ai.skill.version"] == "v2"
-    # Develop's SDK owns the generic operation name. Skill-specific semantics
-    # remain available through gen_ai.skill.* and the lifecycle event.
     assert span.attributes["gen_ai.operation.name"] == "execute_tool"
     assert [event.name for event in span.events].count(event_name) == 1
     assert len(_metric_points(telemetry_env.reader, "gen_ai.skill.call.count")) == (
@@ -2146,9 +2150,12 @@ async def test_llm_output_field_failure_preserves_remaining_enrichment_and_metri
     assistant_events = [
         event for event in span.events if event.name == "gen_ai.assistant.message"
     ]
-    # Even if the host serializer failed, develop's SDK still records its
-    # independently owned structured output on the same span.
-    assert "world" in output_messages
+    if failure_point == "serializer":
+        # Agent-core already wrote output.messages; a jiuwenswarm serializer
+        # failure cannot unwrite that core-owned attribute.
+        assert "world" in (output_messages or "")
+    else:
+        assert "world" in output_messages
     assert assistant_events == []
     assert (
         len(_metric_points(telemetry_env.reader, "gen_ai.client.operation.count")) == 1
