@@ -20,6 +20,7 @@ import pytest
 
 from jiuwenswarm.server.runtime.skill_turbo.fallback_handler import (
     DeepAgentFallbackHandler,
+    FallbackCall,
     FallbackContractError,
 )
 from jiuwenswarm.server.runtime.skill_turbo.plan_node import PlanNode
@@ -73,11 +74,13 @@ class TestNonStreamFallbackWritesBackContext:
         inputs = {"topic": "数学知识点", "search_mode": "", "page_count": 28}
 
         result = await handler.fallback(
-            node_name="p2_4_derive_params",
-            instruction="## P2.4 派生参数推断",
-            inputs=inputs,
-            error=RequirementCollectError(_FAILURE),
-            parent_session=None,
+            FallbackCall(
+                node_name="p2_4_derive_params",
+                instruction="## P2.4 派生参数推断",
+                inputs=inputs,
+                error=RequirementCollectError(_FAILURE),
+                parent_session=None,
+            )
         )
 
         # 返回值语义保持：契约字段完整（execute_plan 根路径消费）
@@ -105,11 +108,13 @@ class TestNonStreamFallbackWritesBackContext:
         ) -> Any:
             # 模拟 SkillTurboExecutor.fallback：把同一 inputs 引用透传给 handler
             return await handler.fallback(
-                node_name=failing_node.plan_name,
-                instruction=failing_node.instruction or "",
-                inputs=inputs_cb,
-                error=err,
-                parent_session=None,
+                FallbackCall(
+                    node_name=failing_node.plan_name,
+                    instruction=failing_node.instruction or "",
+                    inputs=inputs_cb,
+                    error=err,
+                    parent_session=None,
+                )
             )
 
         node.set_runtime_callbacks(fallback=executor_fallback_cb)
@@ -133,11 +138,13 @@ class TestFallbackRegressionGuards:
         chunks = [
             chunk
             async for chunk in handler.fallback_stream(
-                node_name="p2_4_derive_params",
-                instruction="## P2.4 派生参数推断",
-                inputs=inputs,
-                error=RequirementCollectError(_FAILURE),
-                parent_session=None,
+                FallbackCall(
+                    node_name="p2_4_derive_params",
+                    instruction="## P2.4 派生参数推断",
+                    inputs=inputs,
+                    error=RequirementCollectError(_FAILURE),
+                    parent_session=None,
+                )
             )
         ]
 
@@ -154,11 +161,13 @@ class TestFallbackRegressionGuards:
 
         with pytest.raises(FallbackContractError):
             await handler.fallback(
-                node_name="p2_4_derive_params",
-                instruction="## P2.4 派生参数推断",
-                inputs=inputs,
-                error=RequirementCollectError(_FAILURE),
-                parent_session=None,
+                FallbackCall(
+                    node_name="p2_4_derive_params",
+                    instruction="## P2.4 派生参数推断",
+                    inputs=inputs,
+                    error=RequirementCollectError(_FAILURE),
+                    parent_session=None,
+                )
             )
 
         assert inputs == {"topic": "数学知识点", "search_mode": ""}
