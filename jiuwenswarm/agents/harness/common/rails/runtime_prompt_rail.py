@@ -55,6 +55,31 @@ _CELIA_MEMORY_REFERENCE_SECTION = "runtime.celia_memory_context"
 _EXTENSION_REFERENCE_MESSAGE_MARKER = "jiuwenswarm_extension_reference_context"
 _EXTENSION_REFERENCE_MUTATOR_MARKER = "_jiuwenswarm_extension_reference_mutator"
 
+_MODE_DISPLAY_MAP: dict[str, dict[str, str]] = {
+    "agent": {"cn": "智能体模式", "en": "Agent Mode"},
+    "agent.plan": {"cn": "计划模式", "en": "Plan Mode"},
+    "team": {"cn": "集群模式", "en": "Cluster Mode"},
+    "team.plan": {"cn": "集群计划模式", "en": "Cluster Plan Mode"},
+    "code.normal": {"cn": "代码模式", "en": "Code Mode"},
+    "code.plan": {"cn": "代码计划模式", "en": "Code Plan Mode"},
+    "code.team": {"cn": "代码集群模式", "en": "Code Team Mode"},
+    "design": {"cn": "设计模式", "en": "Design Mode"},
+    "design.team": {"cn": "设计集群模式", "en": "Design Team Mode"},
+}
+
+
+def _canonical_mode_name(mode: str) -> str:
+    """Normalize a legacy localized display name to its canonical value."""
+    for canonical, display_names in _MODE_DISPLAY_MAP.items():
+        if mode in display_names.values():
+            return canonical
+    return mode
+
+
+def _mode_display_name(mode: str, language: str) -> str:
+    """Render a canonical mode using the requested prompt language."""
+    return _MODE_DISPLAY_MAP.get(mode, {}).get(language, mode)
+
 
 class RuntimePromptRail(DeepAgentRail):
     """在 before_model_call 中注入时间及运行时状态文件路径。"""
@@ -82,6 +107,7 @@ class RuntimePromptRail(DeepAgentRail):
         self._model_name: str = ""
         self._mode: str = ""
         self._session_id: str | None = None
+        self._last_mode_by_session: dict[str, str] = {}
         self._force_english: bool = False
         self._include_subagent_usage_rules = include_subagent_usage_rules
 
@@ -108,6 +134,7 @@ class RuntimePromptRail(DeepAgentRail):
         self.system_prompt_builder = None
         self.attachment_manager = None
         self._user_message_context = None
+        self._last_mode_by_session.clear()
 
     def set_language(self, language: str) -> None:
         """per-request 更新语言。"""
@@ -412,7 +439,11 @@ class RuntimePromptRail(DeepAgentRail):
         configured_mode = str(
             runtime_state.get("mode") or self._mode or "unknown"
         ).strip()
+        configured_mode = _canonical_mode_name(configured_mode)
         mode = self._resolve_current_mode(ctx, configured_mode)
+        previous_mode = self._last_mode_by_session.get(session_id)
+        include_mode = previous_mode is None or previous_mode != mode
+        self._last_mode_by_session[session_id] = mode
         language_val = (
             self._language
             or runtime_state.get("language")
@@ -421,20 +452,24 @@ class RuntimePromptRail(DeepAgentRail):
         channel = (runtime_state.get("channel") or self._channel or "unknown").strip()
 
         if not self._force_english and self._language == "cn":
+            mode_display = _mode_display_name(mode, "cn")
+            mode_line = f"- 当前模式：{mode_display}\n" if include_mode else ""
             runtime_content = (
                 "# 运行时状态\n\n"
                 f"- 当前模型：{model}\n"
                 f"- 可用模型：{available_models_str}\n"
-                f"- 当前模式：{mode}\n"
+                f"{mode_line}"
                 f"- 当前语言：{language_val}\n"
                 f"- 当前渠道：{channel}"
             )
         else:
+            mode_display = _mode_display_name(mode, "en")
+            mode_line = f"- Current mode: {mode_display}\n" if include_mode else ""
             runtime_content = (
                 "# Runtime State\n\n"
                 f"- Current model: {model}\n"
                 f"- Available models: {available_models_str}\n"
-                f"- Current mode: {mode}\n"
+                f"{mode_line}"
                 f"- Current language: {language_val}\n"
                 f"- Current channel: {channel}"
             )

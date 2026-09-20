@@ -427,10 +427,10 @@ def build_structured_ask_user(params: dict[str, Any], ctx: SwarmBuildContext) ->
 @harness_element(
     kind=ElementKind.RAIL,
     name=CODE_TASK_PLANNING,
-    description="Code-specific task planning rail (Claude-Code-aligned todo tools).",
+    description="Task planning rail shared with work mode.",
 )
 def build_code_task_planning(params: dict[str, Any], ctx: SwarmBuildContext) -> Any:
-    """Build the code-specific task planning rail (CC-aligned todo tools)."""
+    """Build task planning with the same tools and behavior as work mode."""
     try:
         from jiuwenswarm.agents.harness.code.rails import CodeTaskPlanningRail
 

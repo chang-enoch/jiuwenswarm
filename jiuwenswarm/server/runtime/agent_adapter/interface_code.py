@@ -804,7 +804,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
 
     @staticmethod
     def _build_code_task_planning_rail() -> CodeTaskPlanningRail | None:
-        """Register todo tools without openjiuwen todo system prompt injection."""
+        """Use the same todo tools and task-planning prompt as work mode."""
         try:
             return CodeTaskPlanningRail()
         except Exception as exc:

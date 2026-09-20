@@ -1,15 +1,5 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""Code-mode tools.
 
-from jiuwenswarm.agents.harness.code.tools.code_todo_tools import (
-    CodeTodoCreateTool,
-    CodeTodoGetTool,
-    CodeTodoListTool,
-    CodeTodoModifyTool,
-)
-
-__all__ = [
-    "CodeTodoCreateTool",
-    "CodeTodoGetTool",
-    "CodeTodoListTool",
-    "CodeTodoModifyTool",
-]
+Todo tools are provided by the shared OpenJiuWen ``TaskPlanningRail`` used by
+work, code, and design modes.
+"""
