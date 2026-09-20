@@ -76,6 +76,8 @@ def _adapter_with_cached_enterprise() -> JiuWenSwarmDeepAdapter:
 async def test_refresh_enterprise_config_restores_cache_when_load_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("JIUWENSWARM_CONFIG_SOURCE", "enterprise")
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.agent_adapter.interface_deep.is_enterprise",
         lambda: True,
@@ -133,6 +135,8 @@ def test_skill_authorization_rail_uses_agent_template_without_request_context(
 async def test_load_enterprise_config_keeps_cache_when_gateway_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    monkeypatch.setenv("JIUWENSWARM_CONFIG_SOURCE", "enterprise")
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.agent_adapter.interface_deep.is_enterprise",
         lambda: True,
@@ -169,6 +173,7 @@ async def test_load_enterprise_config_keeps_cache_when_gateway_raises(
 async def test_merge_clears_mcp_only_when_enterprise_config_is_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.agent_adapter.interface_deep.is_enterprise",
         lambda: True,
