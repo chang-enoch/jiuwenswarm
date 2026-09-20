@@ -1822,6 +1822,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel_manager = bind.channel_manager
     on_config_saved = bind.on_config_saved
     heartbeat_service = bind.heartbeat_service
+    cron_controller = bind.cron_controller
     cron_registry = bind.cron_registry or bind.cron_controller
     updater_service = bind.updater_service
     a2a_manager = bind.a2a_manager
