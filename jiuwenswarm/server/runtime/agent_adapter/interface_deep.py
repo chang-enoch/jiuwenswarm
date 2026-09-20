@@ -1293,12 +1293,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # via ``_update_prompt_for_mode``) English, which drives the SAFETY /
         # skills / memory / subagent rails' en/cn branch selection. Only
         # ``configure_team_member_agent`` overrides this per team member.
-        # User-visible rails/tools (StructuredAskUserRail / CircuitBreakerRail
-        # / WorkAgentModeRail / WebPaidSearchTool, etc.) read
-        # ``_resolve_output_language`` directly so their button labels / error
-        # messages / plan-mode notes follow ``preferred_language`` without
-        # touching scaffolding. ``preferred_language`` also governs the
-        # response Language section (see ``_resolve_output_language``).
+        # Model-facing tool cards use ``_resolve_prompt_language``. User-visible
+        # rails (CircuitBreakerRail / WorkAgentModeRail) and the response
+        # Language section continue to read ``_resolve_output_language``.
         self._runtime_language_override: str | None = None
         self._force_english_runtime_prompt: bool = True
         # The configured string is only a bootstrap value for agent-core.  Its
@@ -2952,7 +2949,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         cfg = self._audio_model_config or AudioModelConfig()
         tools = list(
             create_audio_tools(
-                language=self._resolve_output_language(),
+                language=self._resolve_prompt_language(),
                 audio_model_config=cfg,
                 agent_id=agent_id,
             )
@@ -3225,7 +3222,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             registered=self._vision_tools_registered,
             enabled=self._vision_model_config is not None,
             create_fn=lambda: create_vision_tools(
-                language=self._resolve_output_language(),
+                language=self._resolve_prompt_language(),
                 vision_model_config=self._vision_model_config,
                 agent_id=agent_id,
             ),
@@ -3270,7 +3267,9 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             registered=self._paid_search_registered,
             enabled=is_paid_search_enabled(),
             create_fn=lambda: [
-                WebPaidSearchTool(language=self._resolve_output_language(), agent_id=agent_id)
+                WebPaidSearchTool(
+                    language=self._resolve_prompt_language(), agent_id=agent_id
+                )
             ],
             warn_label="paid search tool",
         )
@@ -4714,7 +4713,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def _build_structured_ask_user_rail(self) -> StructuredAskUserRail | None:
         """Build StructuredAskUserRail for agent mode clarification."""
         try:
-            return StructuredAskUserRail(language=self._resolve_output_language())
+            return StructuredAskUserRail(language=self._resolve_prompt_language())
         except Exception as exc:
             logger.warning("[JiuWenSwarmDeepAdapter] StructuredAskUserRail create failed: %s", exc)
             return None
@@ -5588,17 +5587,19 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # 付费搜索工具：有任意一个付费 key 就注册
         if is_paid_search_enabled():
             self._paid_search_tool = WebPaidSearchTool(
-                language=self._resolve_output_language(), agent_id=agent_id
+                language=self._resolve_prompt_language(), agent_id=agent_id
             )
             self._register_agent_owned_tool(self._paid_search_tool, agent_id)
             tool_cards.append(self._paid_search_tool.card)
             self._paid_search_registered = True
 
         for tool_cls in [WebFreeSearchTool, WebFetchWebpageTool]:
-            tool_instance = tool_cls(agent_id=agent_id)
+            tool_instance = tool_cls(
+                language=self._resolve_prompt_language(), agent_id=agent_id
+            )
             _apply_xiaoyi_fetch_webpage_description(
                 tool_instance,
-                self._resolve_output_language(),
+                self._resolve_prompt_language(),
             )
             self._register_agent_owned_tool(tool_instance, agent_id)
             tool_cards.append(tool_instance.card)
@@ -5608,7 +5609,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         if self._vision_model_config is not None:
             try:
                 for tool in create_vision_tools(
-                    language=self._resolve_output_language(),
+                    language=self._resolve_prompt_language(),
                     vision_model_config=self._vision_model_config,
                     agent_id=agent_id,
                 ):

@@ -17,6 +17,7 @@ The provider name constants are re-exported here so ``config_specs`` can build
 
 from __future__ import annotations
 
+from functools import wraps
 from typing import Any
 
 from openjiuwen.agent_evolving.trajectory import InMemoryTrajectoryRegistry
@@ -64,7 +65,6 @@ from jiuwenswarm.common.config import get_config
 # Swarm-owned tools (each self-gated by config + whitelist-filtered).
 SKILL_TOOLKIT = _tools.SKILL_TOOLKIT
 SKILL_RETRIEVAL = _tools.SKILL_RETRIEVAL
-USER_TODOS = _tools.USER_TODOS
 VIDEO = _tools.VIDEO
 IMAGE_GEN = _tools.IMAGE_GEN
 XIAOYI_PHONE = _tools.XIAOYI_PHONE
@@ -81,6 +81,10 @@ WEB_FETCH = _OJ_WEB_FETCH
 WEB_PAID_SEARCH = _OJ_WEB_PAID_SEARCH
 VISION = _OJ_VISION
 AUDIO = _OJ_AUDIO
+MODEL_TOOL_LANGUAGE = "en"
+MODEL_LANGUAGE_TOOL_TYPES = frozenset(
+    {WEB_SEARCH, WEB_FETCH, WEB_PAID_SEARCH, VISION, AUDIO}
+)
 RUNTIME_PROMPT = _member_rails.RUNTIME_PROMPT
 TEAM_SKILL_STORAGE_POLICY = _member_rails.TEAM_SKILL_STORAGE_POLICY
 TEAM_SHARED_SKILL_LINK_REFRESH = _member_rails.TEAM_SHARED_SKILL_LINK_REFRESH
@@ -171,6 +175,39 @@ def _build_swarm_context_from_seed(seed: dict[str, Any]) -> SwarmBuildContext:
     )
 
 
+def _install_model_tool_language_override() -> None:
+    """Keep model-facing core tool language overrides after spec round-trips.
+
+    ``DeepAgentSpec`` validates serialized tools as the base
+    ``BuiltinToolSpec``, so a custom spec subclass cannot carry behavior across
+    a spawn or recovery boundary. The Swarm specs persist ``language="en"`` in
+    their params; this narrow adapter turns that serialized value into the
+    per-tool context override required by core ``ConstructionInput`` models.
+    """
+    from openjiuwen.agent_teams.schema.deep_agent_spec import BuiltinToolSpec
+
+    original_build = BuiltinToolSpec.build
+    if getattr(original_build, "jiuwenswarm_model_language_wrapped", False):
+        return
+
+    @wraps(original_build)
+    def build(self: Any, *args: Any, **kwargs: Any) -> Any:
+        model_language = (
+            self.params.get("language")
+            if self.type in MODEL_LANGUAGE_TOOL_TYPES
+            else None
+        )
+        if model_language == MODEL_TOOL_LANGUAGE:
+            kwargs["language"] = MODEL_TOOL_LANGUAGE
+            context = kwargs.get("context")
+            if context is not None:
+                kwargs["context"] = context.derive(language=MODEL_TOOL_LANGUAGE)
+        return original_build(self, *args, **kwargs)
+
+    build.jiuwenswarm_model_language_wrapped = True  # type: ignore[attr-defined]
+    BuiltinToolSpec.build = build
+
+
 def register_swarm_providers() -> None:
     """Register all swarm providers and rail types with openjiuwen (idempotent).
 
@@ -189,6 +226,7 @@ def register_swarm_providers() -> None:
     # worktree / lsp / explore_agent / ...) are declared and registered.
     ensure_harness_elements_registered()
     register_from_catalog()
+    _install_model_tool_language_override()
     register_build_context_factory(_build_swarm_context_from_seed)
 
     _REGISTERED = True
@@ -198,7 +236,6 @@ __all__ = [
     "register_swarm_providers",
     "SKILL_TOOLKIT",
     "SKILL_RETRIEVAL",
-    "USER_TODOS",
     "VIDEO",
     "IMAGE_GEN",
     "XIAOYI_PHONE",
@@ -208,6 +245,8 @@ __all__ = [
     "WEB_PAID_SEARCH",
     "VISION",
     "AUDIO",
+    "MODEL_TOOL_LANGUAGE",
+    "MODEL_LANGUAGE_TOOL_TYPES",
     "CRON_TOOLS",
     "SEND_FILE",
     "SEND_HTML_CARD",

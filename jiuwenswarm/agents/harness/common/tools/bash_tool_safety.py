@@ -100,16 +100,15 @@ def _shell_mismatch(tool_name: str, command: str) -> str | None:
     return None
 
 
-def _bash_schema_exposes_run_in_background() -> bool:
-    """True when agent-core's bash tool card schema already has the field."""
-    try:
-        from openjiuwen.harness.prompts.tools import get_tool_input_params
-
-        params = get_tool_input_params("bash")
-    except (KeyError, TypeError, AttributeError):
-        return False
-    properties = params.get("properties") if isinstance(params, dict) else None
-    return isinstance(properties, dict) and "run_in_background" in properties
+def _remove_shell_description_param(tool: Any) -> None:
+    """Remove the model-facing shell ``description`` input when present."""
+    card = getattr(tool, "card", None)
+    params = getattr(card, "input_params", None) if card is not None else None
+    if not isinstance(params, dict):
+        return
+    properties = params.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("description", None)
 
 
 def _ensure_bash_background_card(tool: Any, language: str) -> None:
@@ -117,6 +116,7 @@ def _ensure_bash_background_card(tool: Any, language: str) -> None:
     card = getattr(tool, "card", None)
     if card is None:
         return
+    _remove_shell_description_param(tool)
     lang = language if language in _RUN_IN_BACKGROUND_PARAM else "cn"
     params = getattr(card, "input_params", None)
     if isinstance(params, dict):
@@ -138,6 +138,7 @@ def _ensure_powershell_background_card(tool: Any, language: str) -> None:
     card = getattr(tool, "card", None)
     if card is None:
         return
+    _remove_shell_description_param(tool)
     description = getattr(card, "description", None)
     if not isinstance(description, str) or "Start-Process" in description:
         return
@@ -223,11 +224,7 @@ def _patch_tool_class(tool_cls: type, tool_name: str) -> None:
     if not getattr(tool_cls.stream, "jiuwenswarm_safety_wrapped", False):
         tool_cls.stream = _wrap_stream(tool_cls.stream, tool_name)
     already_card_wrapped = getattr(tool_cls.__init__, "jiuwenswarm_card_wrapped", False)
-    if (
-        tool_name == "bash"
-        and not already_card_wrapped
-        and not _bash_schema_exposes_run_in_background()
-    ):
+    if tool_name == "bash" and not already_card_wrapped:
         tool_cls.__init__ = _wrap_card_init(tool_cls.__init__, _ensure_bash_background_card)
     elif tool_name == "powershell" and not already_card_wrapped:
         tool_cls.__init__ = _wrap_card_init(
@@ -301,7 +298,7 @@ def reset_installed_flag() -> None:
 
 
 __all__ = [
-    "_bash_schema_exposes_run_in_background",
+    "_remove_shell_description_param",
     "_ensure_bash_background_card",
     "_ensure_powershell_background_card",
     "_patch_tool_class",

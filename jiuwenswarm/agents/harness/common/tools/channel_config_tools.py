@@ -126,14 +126,16 @@ async def _request_gateway_control(method: str, params: dict[str, Any]) -> dict[
 @tool(
     name="configure_channel",
     description=(
-        "配置并立即重连 JiuwenSwarm 的第三方消息频道。仅当用户明确要连接、修改或断开三方"
-        "频道时使用；不要把普通聊天误当成配置请求。channel_id 只能为 "
-        f"{CONFIGURABLE_THIRD_PARTY_CHANNEL_ID_TEXT}。settings 是需要合并的配置对象；常见"
-        "字段包括 enabled=true、app_id、app_secret、bot_token、client_id、client_secret、"
-        "corp_id、agent_id、secret、webhook_url 等。微信扫码登录使用 enabled=true、"
-        "auto_login=true，并可继续调用 get_wechat_login_status 获取二维码。查询微信扫码状态时"
-        "不要调用本工具；只有用户明确要求刷新/重新生成二维码时才传 refresh_qr=true。工具成功后"
-        "目标频道已在 Gateway 中应用。不要使用 bash/python 自行生成微信二维码图片。"
+        "Configure and immediately reconnect a JiuwenSwarm third-party messaging channel. Use this "
+        "only when the user explicitly asks to connect, modify, or disconnect a third-party channel; "
+        "do not treat ordinary conversation as a configuration request. channel_id must be one of "
+        f"{CONFIGURABLE_THIRD_PARTY_CHANNEL_ID_TEXT}. settings is the object to merge into the current "
+        "configuration; common fields include enabled=true, app_id, app_secret, bot_token, client_id, "
+        "client_secret, corp_id, agent_id, secret, and webhook_url. For WeChat QR login, use "
+        "enabled=true and auto_login=true, then call get_wechat_login_status to retrieve the QR code. "
+        "Do not call this tool just to query WeChat login status; pass refresh_qr=true only when the user "
+        "explicitly asks to refresh or regenerate the QR code. After success, the target channel is "
+        "applied in the Gateway. Do not generate a WeChat QR image with bash or Python."
     ),
 )
 async def configure_channel(channel_id: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -147,12 +149,14 @@ async def configure_channel(channel_id: str, settings: dict[str, Any]) -> dict[s
 @tool(
     name="get_wechat_login_status",
     description=(
-        "查询微信扫码登录状态和当前二维码。用户要求绑定微信、查看二维码、重新扫码或确认微信登录状态时使用。"
-        "返回的 qr 字段可能是 url、data_url、encode 或 text；若 kind=encode，直接把 value 作为二维码内容展示/"
-        "转述给用户扫码。三方频道会自动基于当前状态下发二维码图片或链接，不要使用 bash/python 自行生成"
-        "二维码图片。本工具只查询状态，不会刷新二维码。若二维码过期或用户明确要求重新生成二维码，"
-        "再调用 configure_channel(channel_id='wechat', settings={'enabled': true, 'auto_login': true, "
-        "'refresh_qr': true}) 重新触发登录。"
+        "Query the WeChat QR login status and current QR code. Use this when the user asks to bind WeChat, "
+        "view the QR code, scan again, or confirm the login status. The qr field may be a url, data_url, "
+        "encode value, or text; when kind=encode, show or relay value directly as the QR content for the "
+        "user to scan. The third-party channel automatically delivers a QR image or link based on the "
+        "current state; do not generate a QR image with bash or Python. This tool only queries status and "
+        "does not refresh the QR code. If the QR code expires or the user explicitly asks to regenerate it, "
+        "call configure_channel(channel_id='wechat', settings={'enabled': true, 'auto_login': true, "
+        "'refresh_qr': true}) to trigger login again."
     ),
 )
 async def get_wechat_login_status() -> dict[str, Any]:

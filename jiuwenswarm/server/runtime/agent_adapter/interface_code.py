@@ -44,7 +44,6 @@ from openjiuwen.harness.workspace.workspace import Workspace
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     JiuWenSwarmDeepAdapter,
     _AGENT_CARD_ID,
-    _CRON_TOOL_CHANNEL_ID,
     _RailBuildInfo,
     _apply_xiaoyi_fetch_webpage_description,
     _agent_def_to_subagent_config,
@@ -239,7 +238,6 @@ _TOOL_BUILD_NAMES: dict[str, str] = {
     "web_free_search": "_build_web_free_search_tool",
     "web_fetch_webpage": "_build_web_fetch_webpage_tool",
     "web_paid_search": "_build_paid_search_tool",
-    "user_todos": "_build_user_todos_tool",
     "skill_toolkit": "_build_skill_toolkit",
     "skill_retrieval": "_build_skill_retrieval_toolkit",
     "acp_chat": "_build_acp_chat_tool",
@@ -414,9 +412,8 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         # ``system_prompt_builder.language`` by ``_update_prompt_for_mode``,
         # keeping SAFETY / skills / memory / subagent rails' en/cn branches
         # on English. Only ``configure_team_member_agent`` overrides per
-        # member. User-visible rails/tools (StructuredAskUserRail /
-        # WebPaidSearchTool, etc.) read ``_resolve_output_language`` directly
-        # so their content follows ``preferred_language``.
+        # member. Model-facing tool cards use ``_resolve_prompt_language`` while
+        # user-visible rails continue to read ``_resolve_output_language``.
         self._runtime_language_override: str | None = None
         self._force_english_runtime_prompt: bool = True
 
@@ -817,7 +814,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
     def _build_structured_ask_user_rail(self) -> StructuredAskUserRail | None:
         """构建 StructuredAskUserRail."""
         try:
-            return StructuredAskUserRail(language=self._resolve_output_language())
+            return StructuredAskUserRail(language=self._resolve_prompt_language())
         except Exception as exc:
             logger.warning("[JiuwenSwarmCodeAdapter] StructuredAskUserRail create failed: %s", exc)
             return None
@@ -1311,21 +1308,6 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         )
         self._update_prompt_for_mode(runtime_config.mode, resolved_language)
 
-        # user_todos channel_id per-request sync
-        try:
-            from jiuwenswarm.agents.harness.common.tools.user_todo_tool import (
-                get_decorated_tools as _get_user_todo_tools,
-                set_global_workspace_dir as _set_user_todo_workspace,
-                set_global_channel_id as _set_user_todo_channel_id,
-            )
-            _set_user_todo_workspace(self._agent_workspace_dir)
-            _set_user_todo_channel_id(_CRON_TOOL_CHANNEL_ID.get())
-            for tool in _get_user_todo_tools():
-                self._register_shared_tool(tool)
-                self._instance.ability_manager.add(tool.card)
-        except ImportError:
-            pass
-
     # ─── Tools 构建 ──────────────────────────
 
     async def _get_tool_cards(self, agent_id: str) -> list[Any]:
@@ -1412,16 +1394,16 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
     def _build_web_free_search_tool(self, agent_id: str) -> Any:
         """构建 web_free_search 工具."""
         return WebFreeSearchTool(
-            language=self._resolve_output_language(), agent_id=agent_id
+            language=self._resolve_prompt_language(), agent_id=agent_id
         )
 
     def _build_web_fetch_webpage_tool(self, agent_id: str) -> Any:
         """构建 web_fetch_webpage 工具."""
         return _apply_xiaoyi_fetch_webpage_description(
             WebFetchWebpageTool(
-                language=self._resolve_output_language(), agent_id=agent_id
+                language=self._resolve_prompt_language(), agent_id=agent_id
             ),
-            self._resolve_output_language(),
+            self._resolve_prompt_language(),
         )
 
     def _build_paid_search_tool(self, agent_id: str) -> WebPaidSearchTool | None:
@@ -1433,27 +1415,11 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
             logger.info("[JiuwenSwarmCodeAdapter] web_paid_search skipped: no paid search API key")
             return None
         tool = WebPaidSearchTool(
-            language=self._resolve_output_language(), agent_id=agent_id
+            language=self._resolve_prompt_language(), agent_id=agent_id
         )
         self._paid_search_tool = tool
         self._paid_search_registered = True
         return tool
-
-    def _build_user_todos_tool(self, agent_id: str) -> list[Any] | None:
-        """注册 user_todos 工具."""
-        try:
-            from jiuwenswarm.agents.harness.common.tools.user_todo_tool import (
-                get_decorated_tools as _get_user_todo_tools,
-                set_global_workspace_dir as _set_user_todo_workspace,
-                set_global_channel_id as _set_user_todo_channel_id,
-            )
-            _set_user_todo_workspace(self._agent_workspace_dir)
-            _set_user_todo_channel_id(self._runtime_cron_tool_context.channel_id)
-            tools = _get_user_todo_tools()
-            return tools
-        except ImportError:
-            logger.info("[JiuwenSwarmCodeAdapter] user_todos skipped: module not importable")
-            return None
 
     def _build_skill_toolkit(self, agent_id: str) -> list[Any] | None:
         """构建 SkillToolkit 工具（不注册到 Runner，由 _get_tool_cards 统一注册）.

@@ -121,7 +121,6 @@ _COMMON_TOOL_NAMES: tuple[str, ...] = (
     # warning per tool every build; the rail is the sole registrar.
     registry.SKILL_RETRIEVAL,
     registry.SYMPHONY_TOOLKIT,
-    registry.USER_TODOS,
     registry.VIDEO,
     registry.IMAGE_GEN,
     registry.XIAOYI_PHONE,
@@ -175,7 +174,6 @@ _CODE_TOOL_NAMES: tuple[str, ...] = (
     # rail; declaring SKILL_TOOLKIT here too would double-register them.
     registry.SKILL_RETRIEVAL,
     registry.SYMPHONY_TOOLKIT,
-    registry.USER_TODOS,
     registry.VIDEO,
     registry.IMAGE_GEN,
     registry.XIAOYI_PHONE,
@@ -441,7 +439,10 @@ def _rail_params(name: str, config: dict[str, Any]) -> dict[str, Any]:
 def _tool_params(name: str, config: dict[str, Any]) -> dict[str, Any]:
     """Return attribute params baked into tool *name* (empty when parameterless)."""
     builder = _TOOL_PARAM_BUILDERS.get(name)
-    return builder(config) if builder else {}
+    params = dict(builder(config) if builder else {})
+    if name in registry.MODEL_LANGUAGE_TOOL_TYPES:
+        params["language"] = registry.MODEL_TOOL_LANGUAGE
+    return params
 
 
 def _team_common_rail_names(role: str) -> tuple[str, ...]:

@@ -107,7 +107,6 @@ TOOL_WHITELIST = frozenset({
     "skill_index_build",
     "skill_branch_explore",
     "skill_branch_peek",
-    "user_todos",
     "get_user_location",
     "create_note",
     "search_notes",
@@ -204,7 +203,7 @@ def build_member_rails(
 
     if role == "leader":
         try:
-            rail = StructuredAskUserRail(language=language)
+            rail = StructuredAskUserRail(language="en")
             rails_list.append(rail)
             logger.info("[TeamRuntime] StructuredAskUserRail created for leader")
         except Exception as exc:
