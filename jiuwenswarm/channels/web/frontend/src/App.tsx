@@ -115,6 +115,36 @@ function shouldPreviewModelSetupGuide(): boolean {
   return PREVIEW_MODEL_SETUP_GUIDE;
 }
 
+function isCronConversation(session: Pick<Session, 'cron_id'>): boolean {
+  return Boolean(session.cron_id);
+}
+
+async function refreshCronListsAfterDelete(
+  deletedSessionIds: ReadonlySet<string>,
+  fallbackProjectId?: string,
+): Promise<void> {
+  const cronStore = useCronStore.getState();
+  const projectIds = new Set<string>();
+  if (fallbackProjectId) {
+    projectIds.add(fallbackProjectId);
+  }
+  for (const [jobId, sessions] of Object.entries(cronStore.cronSessions)) {
+    if (sessions.some((session) => deletedSessionIds.has(session.session_id))) {
+      const projectId = cronStore.jobs.find((item) => item.id === jobId)?.project_id || 'default';
+      void cronStore.loadCronSessions(projectId, jobId);
+      projectIds.add(projectId);
+    }
+  }
+  for (const [projectId, sessions] of Object.entries(cronStore.projectCronSessions)) {
+    if (sessions.some((session) => deletedSessionIds.has(session.session_id))) {
+      projectIds.add(projectId);
+    }
+  }
+  await Promise.all(
+    [...projectIds].map((projectId) => cronStore.loadProjectCronSessions(projectId)),
+  );
+}
+
 type LoadedHistoryPage = {
   pageIdx: number;
   totalPages: number;
@@ -592,6 +622,7 @@ function AppContent() {
   const isLoadingHistory = useChatStore((s) => s.runtimes[sessionId]?.isLoadingHistory ?? false);
   const replaceHistoryMessages = useChatStore((s) => s.replaceHistoryMessages);
   const restoreReasoningSegments = useChatStore((s) => s.restoreReasoningSegments);
+  const setPendingQuestion = useChatStore((s) => s.setPendingQuestion);
   const isRestoringHistorySession = isLoadingHistory && !historyPagerMeta && messages.length === 0;
   const isRestoringTeamHistory = mode === 'team' && isRestoringHistorySession;
 
@@ -717,6 +748,7 @@ function AppContent() {
             description: n.description,
             formatted_args: n.formatted_args,
             display_name: n.display_name,
+            source_skill: n.source_skill,
             memberName: n.memberName,
           },
           { startedAt: item.at }
@@ -1356,9 +1388,12 @@ function AppContent() {
     prevProcessingBySessionRef.current.set(sessionId, isProcessing);
   }, [sessionId, isProcessing, hasPendingQuestion, loadSessionMetadata]);
 
-  // 连接成功后从 config.yaml 同步 preferred_language 到前端显示
+  // 连接成功后从服务端同步 preferred_language 到前端显示。
+  // 企业版 preferred_language 无独立持久化（personal-only YAML overlay），
+  // get_conf 只能读到全局只读 config.yaml 默认 zh；若仍用它覆盖 i18n，
+  // 会冲掉 localStorage 里用户刚选的 en，刷新后语言回中文。
   useEffect(() => {
-    if (!isConnected) return;
+    if (!isConnected || isEnterprise()) return;
     void webRequest<{ preferred_language?: string }>('locale.get_conf')
       .then((payload) => {
         const lang = payload?.preferred_language;
@@ -1444,6 +1479,7 @@ function AppContent() {
                 description: n.description,
                 formatted_args: n.formatted_args,
                 display_name: n.display_name,
+                source_skill: n.source_skill,
                 memberName: n.memberName,
               },
               { startedAt: item.at }
@@ -1512,6 +1548,14 @@ function AppContent() {
       onReasoningReplay: (items) => {
         restoreReasoningSegments(sid, items);
       },
+      onAskUserReplay: (question) => {
+        // replaceHistoryMessages 会把 pendingQuestion 清掉；回放必须在它之后。
+        setPendingQuestion(sid, question);
+        if (question) {
+          setProcessing(sid, true);
+          setThinking(sid, false);
+        }
+      },
       onError: (message) => {
         console.warn('[history.restore]', message);
         setLoadingHistory(sid, false);
@@ -1565,6 +1609,9 @@ function AppContent() {
     replaceHistoryMessages,
     restoreReasoningSegments,
     startBackgroundHistoryPrefetch,
+    setPendingQuestion,
+    setProcessing,
+    setThinking,
   ]);
 
   // 轮询兜底刷新：企业版 HTTP 无 cron 结果 push，立即执行跳转后 skipHistoryLoad，
@@ -2164,13 +2211,7 @@ function AppContent() {
     await workspaceState.loadProjects();
     await Promise.all(loadedProjectIds.map((projectId) => workspaceState.loadProjectSessions(projectId)));
 
-    const cronStore = useCronStore.getState();
-    for (const [jobId, sessions] of Object.entries(cronStore.cronSessions)) {
-      if (sessions.some((session) => deletedSessionIds.has(session.session_id))) {
-        const job = cronStore.jobs.find((item) => item.id === jobId);
-        void cronStore.loadCronSessions(job?.project_id || 'default', jobId);
-      }
-    }
+    await refreshCronListsAfterDelete(deletedSessionIds);
   }, [routeSessionId]);
 
   const handleDeleteConversation = useCallback(async () => {
@@ -2191,14 +2232,12 @@ function AppContent() {
       const deletingCurrent = sessionIdRef.current === deleteTarget.session_id;
       setDeleteTarget(null);
       await useWorkspaceStore.getState().refreshSessionWorkspace(deletedSession);
-      // 删除 session 后刷新所属定时任务的触发会话列表
-      const cronStore = useCronStore.getState();
-      for (const [jobId, sessions] of Object.entries(cronStore.cronSessions)) {
-        if (sessions.some((s) => s.session_id === deletedSession.session_id)) {
-          const job = cronStore.jobs.find((j) => j.id === jobId);
-          void cronStore.loadCronSessions(job?.project_id || 'default', jobId);
-        }
-      }
+      await refreshCronListsAfterDelete(
+        new Set([deletedSession.session_id]),
+        isCronConversation(deletedSession)
+          ? (deletedSession.project_id?.trim() || 'default')
+          : undefined,
+      );
       if (deletingCurrent) {
         enterNewConversation();
       }

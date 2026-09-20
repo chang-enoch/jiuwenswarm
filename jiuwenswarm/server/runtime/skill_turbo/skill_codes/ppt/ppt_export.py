@@ -10,6 +10,9 @@ from typing import Any
 
 from jiuwenswarm.server.runtime.skill_turbo.plan_node import AbortError, PlanNode
 from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.ppt_common import PptCommon
+from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.ppt_page_gen import (
+    restore_unexportable_pages_from_backup,
+)
 from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.utils.bash_utils import (
     BashExecError,
     cli_path,
@@ -102,6 +105,14 @@ class PPTExportNode(PlanNode):
         pptx_root = str(inputs.get("pptx_root") or "").strip()
 
         missing_pages = inputs.get("missing_pages") or []
+        if isinstance(missing_pages, list) and missing_pages:
+            recovered_pages = await restore_unexportable_pages_from_backup(
+                self, pages_dir, list(missing_pages), log_prefix="[P9]"
+            )
+            if recovered_pages:
+                logger.warning("[P9] 缺页备份自愈恢复: %s", recovered_pages)
+                recovered_set = set(recovered_pages)
+                missing_pages = [p for p in missing_pages if p not in recovered_set]
         if isinstance(missing_pages, list) and missing_pages:
             logger.error("[P9] 上游页面缺失 missing=%s，拒绝导出", missing_pages)
             return {
@@ -267,19 +278,7 @@ class PPTExportNode(PlanNode):
         }
 
     async def _read_file(self, path: str) -> str:
-        if not path:
-            return ""
-        if not self.has_tool("read_file"):
-            logger.warning("[P9] read_file 工具不可用，无法读取文件 %s", path)
-            return ""
-        try:
-            result = await self.call_tool("read_file", file_path=path)
-            return PptCommon.parse_tool_file_content(result)
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P9] 读取文件失败 %s: %s", path, e)
-            return ""
+        return await PptCommon.read_file_with_retry(self, path, log_prefix="[P9]")
 
     async def _resolve_native_plan_arg(self, plan_path: str, output_dir: str) -> str:
         """v2 且 nativeTemplate.available=true 时返回 plan 路径，否则空串。

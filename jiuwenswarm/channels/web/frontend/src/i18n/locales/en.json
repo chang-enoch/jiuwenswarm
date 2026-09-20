@@ -73,6 +73,7 @@
     "noTasks": "No tasks",
     "noMemberData": "No member data",
     "selectMember": "Select a team member",
+    "noMembers": "No members yet",
     "detailTabs": {
       "members": "Members",
       "group": "Group Chat"
@@ -553,14 +554,15 @@
       "modeAria": "Context setup mode",
       "selectAgent": "Select Agent",
       "custom": "Custom",
-      "agentOrgLabel": "Agent name - Organization name",
+      "agentOrgLabel": "Agent name | Organization name | Cluster name",
       "botId": "bot_id",
       "groupId": "group_id",
       "userId": "user_id",
+      "jiuwenclawId": "jiuwenclaw_id",
       "apply": "Apply",
       "switching": "Switching...",
       "logout": "Sign out",
-      "customRequired": "Please fill in bot_id, group_id, and user_id",
+      "customRequired": "Please fill in bot_id, group_id, user_id, and jiuwenclaw_id",
       "noMatch": "No matches",
       "pleaseSelect": "Please select"
     }
@@ -633,14 +635,17 @@
       },
       "localDebug": {
         "title": "Network access settings",
-        "description": "Allow access to loopback addresses such as localhost.",
+        "description": "Allow localhost, 127.0.0.1 and ::1 in the Gateway environment. LAN addresses are not included.",
         "allow": "Allow loopback addresses",
         "warning": "Risk: Loopback access may expose Gateway-local services. Use only trusted Agents.",
         "httpWarning": "Risk: HTTP permits plaintext traffic over public networks, exposing credentials and task data.",
         "saving": "Saving...",
         "saved": "Outbound network settings were saved and applied immediately.",
+        "allowPrivateNetwork": "Allow LAN addresses",
+        "privateNetworkDescription": "Allow RFC1918 addresses: 10.*, 172.16–31.* and 192.168.*.",
+        "privateNetworkWarning": "Risk: LAN access may expose internal services reachable by the Gateway. Use only trusted Agents.",
         "allowHttp": "Allow HTTP",
-        "httpDescription": "Allow plaintext HTTP. Loopback access also requires the switch above."
+        "httpDescription": "Allow plaintext HTTP. LAN or loopback access also requires its address switch."
       },
       "discovery": {
         "title": "Discover a third-party Agent",
@@ -707,7 +712,7 @@
       "tabs": { "ariaLabel": "A2A request history direction", "ingress": "Ingress", "outbound": "Outbound" },
       "copy": "Click to copy",
       "copied": "Copied",
-      "copyFailed": "Copy failed. Check the browser clipboard permission.",
+      "copyFailed": "Copy failed. Select the text and copy it manually.",
       "ingress": {
         "title": "Ingress request history",
         "description": "Shows the latest 200 A2A ingress requests in this Gateway process without retaining request bodies.",

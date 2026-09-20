@@ -76,7 +76,19 @@ def _postprocess_structural_template_fill_html(
     html: str,
     ctx: "PageGenContext",
     page_type: str,
+    seed_html: str = "",
 ) -> str:
+    # 落盘权威：优先 seed 骨架 + 仅 skill 已定义槽；merge 失败时回退旧门禁校验 LLM html。
+    if (seed_html or "").strip():
+        merged = _repair_structural_template_slots(seed_html, html)
+        if merged:
+            html = merged
+        else:
+            logger.warning(
+                "[P8.1] 结构页 seed-slot-merge 失败 page=%d type=%s；回退旧门禁校验 LLM html",
+                ctx.page_num,
+                page_type,
+            )
     html = _apply_visible_page_number_policy(
         html,
         user_query=ctx.user_query,
@@ -85,6 +97,14 @@ def _postprocess_structural_template_fill_html(
         total_pages=ctx.total_pages,
         style_id=ctx.style_id,
     )
+    if _has_unfilled_placeholders(html):
+        logger.warning(
+            "[P8.1] 结构页填槽残留占位符 page=%d type=%s placeholders=%s",
+            ctx.page_num,
+            page_type,
+            _UNFILLED_PLACEHOLDER_RE.findall(html)[:8],
+        )
+        return ""
     if not _validate_slide_dom(html):
         logger.warning(
             "[P8.1] 结构页 DOM 校验失败 page=%d type=%s",
@@ -108,47 +128,39 @@ def _postprocess_content_template_fill_html(
     validate_fn: Callable[[str, str], tuple[bool, str]],
 ) -> tuple[str, str, str]:
     html = _replace_placeholder_headings(html, ctx.outline_page)
-    html = _apply_visible_page_number_policy(
-        html,
+    html = _fix_echarts_svg_renderer(html)
+    html = _strip_unsupported_fullpage_overlays(html)
+    html = _strip_chart_header_unit(html)
+    html = _fix_chart_scaffold_activation(html)
+    html = _fix_chart_height_chain(html)
+
+    # 主路径出口：始终 seed-slot-merge，不以 LLM 整页 HTML 为落盘权威。
+    merged = _repair_content_template_chrome(seed_html, html)
+    if not merged:
+        _ok, reason = validate_fn(seed_html, html)
+        logger.warning(
+            "[P8.1] 内容页 seed-slot-merge 失败 page=%d style=%s reason=%s",
+            ctx.page_num,
+            ctx.style_id,
+            reason or "slot_merge_failed",
+        )
+        return "", html, reason or "slot_merge_failed"
+
+    merged = _apply_visible_page_number_policy(
+        merged,
         user_query=ctx.user_query,
         style_constraints=ctx.style_constraints,
         page_number=ctx.page_num,
         total_pages=ctx.total_pages,
         style_id=ctx.style_id,
     )
-    html = _fix_echarts_svg_renderer(html)
-    html = _strip_unsupported_fullpage_overlays(html)
-    html = _strip_chart_header_unit(html)
-    html = _fix_chart_scaffold_activation(html)
-    html = _fix_chart_height_chain(html)
-    ok, reason = validate_fn(seed_html, html)
-    if not ok and reason in _REPAIRABLE_CONTENT_TEMPLATE_REASONS:
-        repaired = _repair_content_template_chrome(seed_html, html)
-        if repaired:
-            repaired = _fix_echarts_svg_renderer(repaired)
-            repaired = _strip_unsupported_fullpage_overlays(repaired)
-            repaired = _strip_chart_header_unit(repaired)
-            repaired = _fix_chart_scaffold_activation(repaired)
-            repaired = _fix_chart_height_chain(repaired)
-            ok_repaired, reason_repaired = validate_fn(seed_html, repaired)
-            if ok_repaired:
-                _warn_chart_mount_mismatch_soft(repaired, page_num=ctx.page_num)
-                logger.info(
-                    "[P8.1] repaired=content_template_chrome page=%d style=%s "
-                    "from_reason=%s",
-                    ctx.page_num,
-                    ctx.style_id,
-                    reason,
-                )
-                return repaired, "", ""
-            logger.warning(
-                "[P8.1] 内容页 chrome 自动修复后仍失败 page=%d style=%s "
-                "from_reason=%s repair_reason=%s",
-                ctx.page_num,
-                ctx.style_id,
-                reason,
-                reason_repaired,
-            )
+    merged = _fix_echarts_svg_renderer(merged)
+    merged = _strip_unsupported_fullpage_overlays(merged)
+    merged = _strip_chart_header_unit(merged)
+    merged = _fix_chart_scaffold_activation(merged)
+    merged = _fix_chart_height_chain(merged)
+
+    ok, reason = validate_fn(seed_html, merged)
     if not ok:
         logger.warning(
             "[P8.1] 内容页填槽校验失败 page=%d style=%s reason=%s",
@@ -156,14 +168,21 @@ def _postprocess_content_template_fill_html(
             ctx.style_id,
             reason,
         )
-        return "", html, reason
-    _warn_chart_mount_mismatch_soft(html, page_num=ctx.page_num)
+        return "", merged, reason
+    if _chart_activation_incomplete(merged):
+        logger.warning(
+            "[P8.1] 内容页图表 scaffold 未激活（本轮重试） page=%d style=%s",
+            ctx.page_num,
+            ctx.style_id,
+        )
+        return "", merged, "chart_scaffold_not_activated"
+    _warn_chart_mount_mismatch_soft(merged, page_num=ctx.page_num)
     logger.info(
         "[P8.1] 内容页官方模板填槽完成 page=%d style=%s",
         ctx.page_num,
         ctx.style_id,
     )
-    return html, "", ""
+    return merged, "", ""
 
 
 def _postprocess_generated_html(
@@ -909,29 +928,95 @@ def _filled_chart_scaffold_is_progressed(filled_html: str) -> bool:
     return False
 
 
-def _extract_chart_scaffold_region(filled_html: str) -> str | None:
-    for match in _COMMENTED_CHART_SCAFFOLD_BLOCK_RE.finditer(filled_html):
+def _collect_activated_chart_scaffolds(filled_html: str) -> list[tuple[str, str]]:
+    """Collect activated chart scaffolds as (target_id, replacement) pairs.
+
+    Path A: commented CHART_SCAFFOLD blocks with populated option (body only).
+    Path B: live scripts after </main> (full <script> tag); only for ids not
+    already taken by path A. Empty-id path-B scripts are kept only when path A
+    found nothing (legacy single-scaffold unwrap).
+    """
+    activated: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+
+    for match in _COMMENTED_CHART_SCAFFOLD_BLOCK_RE.finditer(filled_html or ""):
         body = match.group(2) or ""
-        if _chart_scaffold_option_populated(body):
-            return body.strip()
-    html_no_comments = _HTML_COMMENT_RE.sub("", filled_html)
+        if not _chart_scaffold_option_populated(body):
+            continue
+        target_id = _chart_scaffold_target_id(body)
+        if target_id and target_id in seen_ids:
+            continue
+        if target_id:
+            seen_ids.add(target_id)
+        activated.append((target_id, body.strip()))
+
+    html_no_comments = _HTML_COMMENT_RE.sub("", filled_html or "")
     scaffold_region = _html_chart_scaffold_script_region(html_no_comments)
-    for match in reversed(list(_SCRIPT_BODY_RE.finditer(scaffold_region))):
+    for match in _SCRIPT_BODY_RE.finditer(scaffold_region):
         body = match.group(1) or ""
-        if "echarts.init" in body.lower() and _chart_scaffold_option_populated(body):
-            return match.group(0).strip()
-    return None
+        if "echarts.init" not in body.lower():
+            continue
+        if not _chart_scaffold_option_populated(body):
+            continue
+        target_id = _chart_scaffold_target_id(body)
+        if target_id:
+            if target_id in seen_ids:
+                continue
+            seen_ids.add(target_id)
+            activated.append((target_id, match.group(0).strip()))
+            continue
+        # Anonymous path-B: only when no commented activations were found.
+        if not activated:
+            activated.append(("", match.group(0).strip()))
+            break
+    return activated
 
 
 def _merge_chart_scaffold_from_filled(seed_html: str, filled_html: str) -> str:
+    """Merge activated chart scaffolds from filled into seed comment blocks.
+
+    Match by ``_chart_scaffold_target_id`` one-to-one; unmatched seed blocks stay
+    dormant. Preserves legacy single-block / empty-id unwrap behavior.
+    """
     if not _filled_chart_scaffold_is_progressed(filled_html):
         return seed_html
-    filled_scaffold = _extract_chart_scaffold_region(filled_html)
-    if not filled_scaffold:
+    activated = _collect_activated_chart_scaffolds(filled_html)
+    if not activated:
         return seed_html
-    match = _COMMENTED_CHART_SCAFFOLD_BLOCK_RE.search(seed_html)
-    if match:
-        return seed_html[:match.start()] + filled_scaffold + seed_html[match.end():]
+
+    by_id = {tid: snippet for tid, snippet in activated if tid}
+    unused_anon = [snippet for tid, snippet in activated if not tid]
+    seed_blocks = list(_COMMENTED_CHART_SCAFFOLD_BLOCK_RE.finditer(seed_html or ""))
+
+    if seed_blocks:
+        pieces: list[str] = []
+        last = 0
+        for match in seed_blocks:
+            pieces.append(seed_html[last:match.start()])
+            body = match.group(2) or ""
+            target_id = _chart_scaffold_target_id(body)
+            replacement: str | None = None
+            if target_id and target_id in by_id:
+                replacement = by_id.pop(target_id)
+            elif not target_id and unused_anon:
+                replacement = unused_anon.pop(0)
+            elif (
+                not target_id
+                and len(seed_blocks) == 1
+                and len(by_id) == 1
+            ):
+                # Legacy: seed dormants without getElementById; filled has one id.
+                replacement = next(iter(by_id.values()))
+                by_id.clear()
+            if replacement is not None:
+                pieces.append(replacement)
+            else:
+                pieces.append(match.group(0))
+            last = match.end()
+        pieces.append(seed_html[last:])
+        return "".join(pieces)
+
+    filled_scaffold = activated[0][1]
     body_close = seed_html.lower().rfind("</body>")
     if body_close == -1:
         return seed_html
@@ -947,21 +1032,12 @@ def _merge_chart_scaffold_from_filled(seed_html: str, filled_html: str) -> str:
     return seed_html[:body_close] + filled_scaffold + seed_html[body_close:]
 
 
-_REPAIRABLE_CONTENT_TEMPLATE_REASONS = frozenset({
-    "content_template_chrome_changed",
-    "head_chrome_changed",
-    "header_chrome_changed",
-    "footer_chrome_changed",
-    "main_tag_changed",
-})
-
-
 def _repair_content_template_chrome(seed_html: str, filled_html: str) -> str | None:
-    """Restore Page Chrome from seed; keep filled title/content/footer slot values.
+    """Seed-slot-merge for content templates: chrome from seed, slots from filled.
 
-    When the model rewrites head/header/footer/`<main>` chrome but still fills usable
-    slots, reassemble onto the seed skeleton instead of forcing a full LLM retry.
-    Returns None when filled output lacks extractable slot content.
+    Primary write-path authority for preset/custom content-template fill (and
+    layout-patch). PAGE_FOOTER may be empty (build-custom.md). Returns None when
+    required slots cannot be extracted.
     """
     if not (seed_html or "").strip() or not (filled_html or "").strip():
         return None
@@ -975,7 +1051,11 @@ def _repair_content_template_chrome(seed_html: str, filled_html: str) -> str | N
         return None
 
     footer_inner = _extract_filled_footer_inner(filled_html)
-    if not footer_inner or _has_placeholder_slop(_plain_text_fragment(footer_inner)):
+    # Allow empty footer; reject only unreplaced token / non-empty placeholder slop.
+    if "{{PAGE_FOOTER}}" in (footer_inner or ""):
+        return None
+    footer_plain = _plain_text_fragment(footer_inner)
+    if footer_plain and _has_placeholder_slop(footer_plain):
         return None
 
     out = seed_html
@@ -1005,16 +1085,229 @@ def _repair_content_template_chrome(seed_html: str, filled_html: str) -> str | N
         # <p> 标签内替换文本。_P_INNER_TEXT_RE 只匹配 count=1（footer block 内
         # 第一个 <p>），不会双重替换——footer_inner 是纯文本，不含 <p> 标签。
         seed_footer = _extract_footer_block(out)
-        if not seed_footer:
-            return None
-        repaired_footer = _P_INNER_TEXT_RE.sub(
-            lambda m: f"{m.group(1)}{footer_inner}{m.group(3)}",
-            seed_footer,
-            count=1,
-        )
-        out = out.replace(seed_footer, repaired_footer, 1)
+        if seed_footer:
+            repaired_footer = _P_INNER_TEXT_RE.sub(
+                lambda m: f"{m.group(1)}{footer_inner}{m.group(3)}",
+                seed_footer,
+                count=1,
+            )
+            out = out.replace(seed_footer, repaired_footer, 1)
+        # seed 无 footer 区域时跳过（不因此失败）
 
     out = _merge_chart_scaffold_from_filled(out, filled_html)
+    return out
+
+
+def _slice_between_anchors(
+    text: str,
+    left: str,
+    right: str,
+    *,
+    search_from: int = 0,
+) -> tuple[str, int] | None:
+    """Return (slice_between_anchors, end_index_of_slice)."""
+    if left:
+        pos = text.find(left, search_from)
+        if pos < 0:
+            return None
+        start = pos + len(left)
+    else:
+        start = search_from
+    if right:
+        end = text.find(right, start)
+        if end < 0:
+            return None
+    else:
+        end = len(text)
+    return text[start:end], end
+
+
+_IMG_OPEN_TAG_RE = re.compile(r"<img\b[^>]*", re.IGNORECASE)
+_STRUCTURAL_IMAGE_ATTR_SLOTS = frozenset({"STRUCTURAL_IMAGE_PATH", "STRUCTURAL_IMAGE_ALT"})
+
+
+def _strip_open_tag_attrs(anchor: str) -> str:
+    """Drop <img ...> attributes in anchors; attr reorder/reindent must not break slice."""
+    return _IMG_OPEN_TAG_RE.sub("<img", anchor or "")
+
+
+def _structural_slot_dom_fallback(name: str, filled_html: str) -> str | None:
+    """DOM extract for common structural slots (attr slots prefer this over adjacency)."""
+    if name == "PAGE_TITLE":
+        title = _extract_filled_title_inner(filled_html)
+        if title and not _has_placeholder_slop(_plain_text_fragment(title)):
+            return title
+        return None
+    if name == "PAGE_CONTENT":
+        main_inner = _extract_main_inner_html(filled_html)
+        if main_inner.strip() and "{{PAGE_CONTENT}}" not in main_inner:
+            return main_inner
+        return None
+    if name == "PAGE_FOOTER" or name.startswith("PAGE_FOOTER"):
+        footer_inner = _extract_filled_footer_inner(filled_html)
+        if "{{PAGE_FOOTER}}" in (footer_inner or ""):
+            return None
+        plain = _plain_text_fragment(footer_inner)
+        if plain and _has_placeholder_slop(plain):
+            return None
+        return footer_inner
+    # Attribute slots: values live inside <img ...> attrs; adjacency after
+    # _strip_open_tag_attrs shifts the slice start and can swallow neighboring attrs.
+    if name in _STRUCTURAL_IMAGE_ATTR_SLOTS:
+        match = re.search(
+            r"<img\b[^>]*(?:"
+            r"\bdata-pptx-role\s*=\s*[\"']structural-background[\"']|"
+            r"\bclass\s*=\s*[\"'][^\"']*\babsolute\b[^\"']*\binset-0\b"
+            r")[^>]*>",
+            filled_html or "",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        tag = match.group(0)
+        attr = "src" if name == "STRUCTURAL_IMAGE_PATH" else "alt"
+        attr_m = re.search(
+            rf"\b{attr}\s*=\s*([\"'])(.*?)\1",
+            tag,
+            re.IGNORECASE | re.DOTALL,
+        )
+        return None if attr_m is None else attr_m.group(2)
+    return None
+
+
+_PPT_SLIDE_OPEN_FULL_RE = re.compile(
+    r'(<div\b[^>]*\bclass="[^"]*\bppt-slide\b[^"]*"[^>]*>)',
+    re.IGNORECASE,
+)
+_STRUCTURAL_BG_BUNDLE_RE = re.compile(
+    r'(\s*<img\b[^>]*(?:'
+    r'class="[^"]*\babsolute\b[^"]*\binset-0\b[^"]*"|'
+    r'data-pptx-role="structural-background"'
+    r')[^>]*>'
+    r'(?:\s*<div\b[^>]*class="[^"]*\babsolute\b[^"]*\binset-0\b[^"]*"[^>]*>\s*</div>)?)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _merge_structural_background_from_filled(merged_html: str, filled_html: str) -> str:
+    """Preserve preset structural background img/overlay allowed outside {{}} slots."""
+    if re.search(
+        r'<img\b[^>]*(?:class="[^"]*\babsolute\b[^"]*\binset-0\b[^"]*"|'
+        r'data-pptx-role="structural-background")',
+        merged_html or "",
+        re.IGNORECASE,
+    ):
+        return merged_html
+    slide = _PPT_SLIDE_OPEN_FULL_RE.search(filled_html or "")
+    if not slide:
+        return merged_html
+    bundle = _STRUCTURAL_BG_BUNDLE_RE.match((filled_html or "")[slide.end():])
+    if not bundle:
+        return merged_html
+    out_slide = _PPT_SLIDE_OPEN_FULL_RE.search(merged_html or "")
+    if not out_slide:
+        return merged_html
+    return (
+        (merged_html or "")[: out_slide.end()]
+        + bundle.group(1)
+        + (merged_html or "")[out_slide.end():]
+    )
+
+
+def _repair_structural_template_slots(seed_html: str, filled_html: str) -> str | None:
+    """Seed-slot-merge for structural templates; slot set driven by seed {{...}}."""
+    if not (seed_html or "").strip() or not (filled_html or "").strip():
+        return None
+
+    from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.template_fill import (
+        apply_template_slots,
+        scan_placeholders,
+    )
+
+    names = scan_placeholders(seed_html)
+    if not names:
+        return None
+
+    slots: dict[str, str] = {}
+    search_from = 0
+    # Unique slot names only：同名 {{PAGE_TITLE}} 多处只抽一次，避免 search_from 错位。
+    for name in names:
+        token = f"{{{{{name}}}}}"
+        idx = seed_html.find(token)
+        if idx < 0:
+            return None
+        prev = list(_UNFILLED_PLACEHOLDER_RE.finditer(seed_html, 0, idx))
+        left_start = prev[-1].end() if prev else 0
+        left = seed_html[left_start:idx]
+        after = seed_html[idx + len(token):]
+        next_m = _UNFILLED_PLACEHOLDER_RE.search(after)
+        right = after[: next_m.start()] if next_m else after[:64]
+        left_anchor = left if len(left) <= 96 else left[-96:]
+        right_anchor = right if len(right) <= 96 else right[:96]
+        # Open-tag attributes are unstable under LLM rewrite; keep tag names only.
+        left_anchor = _strip_open_tag_attrs(left_anchor)
+        right_anchor = _strip_open_tag_attrs(right_anchor)
+
+        # PATH/ALT：DOM 优先。剥离 img 属性后邻接切片起点会前移，happy path
+        # 也会把相邻属性吞进槽值（如 src=" data-pptx-role=...）。
+        if name in _STRUCTURAL_IMAGE_ATTR_SLOTS:
+            value = _structural_slot_dom_fallback(name, filled_html)
+            if value is not None:
+                slots[name] = value
+                if value:
+                    loc = filled_html.find(value, search_from)
+                    if loc >= 0:
+                        search_from = loc + len(value)
+                continue
+
+        sliced = _slice_between_anchors(
+            filled_html, left_anchor, right_anchor, search_from=search_from
+        )
+        if sliced is None:
+            value = _structural_slot_dom_fallback(name, filled_html)
+            if value is None:
+                return None
+            slots[name] = value
+            # DOM fallback 也推进游标，避免后续邻接切片回到文档前部。
+            if value:
+                loc = filled_html.find(value, search_from)
+                if loc >= 0:
+                    search_from = loc + len(value)
+            continue
+        value, value_end = sliced
+        slots[name] = value
+        search_from = value_end
+
+    if "PAGE_TITLE" in slots:
+        dom_title = _extract_filled_title_inner(filled_html)
+        if dom_title and not _has_placeholder_slop(_plain_text_fragment(dom_title)):
+            slots["PAGE_TITLE"] = dom_title
+    if "PAGE_CONTENT" in slots:
+        main_inner = _extract_main_inner_html(filled_html)
+        if main_inner.strip() and "{{PAGE_CONTENT}}" not in main_inner:
+            slots["PAGE_CONTENT"] = main_inner
+    if "PAGE_FOOTER" in slots:
+        footer_inner = _extract_filled_footer_inner(filled_html)
+        if "{{PAGE_FOOTER}}" not in (footer_inner or ""):
+            footer_plain = _plain_text_fragment(footer_inner)
+            if not footer_plain or not _has_placeholder_slop(footer_plain):
+                slots["PAGE_FOOTER"] = footer_inner
+
+    # 仅拒绝槽值内残留 {{PLACEHOLDER}}；空串交给模板语义。
+    # footer 额外拒绝非空敷衍值（与内容页 PAGE_FOOTER 口径一致）。
+    for name, value in slots.items():
+        text = value or ""
+        if _UNFILLED_PLACEHOLDER_RE.search(text):
+            return None
+        if name == "PAGE_FOOTER" or name.startswith("PAGE_FOOTER"):
+            plain = _plain_text_fragment(text)
+            if plain and _has_placeholder_slop(plain):
+                return None
+
+    out = apply_template_slots(seed_html, slots)
+    out = _merge_structural_background_from_filled(out, filled_html)
+    if _has_unfilled_placeholders(out):
+        return None
     return out
 
 
@@ -1413,6 +1706,7 @@ def _build_content_template_fill_system_prompt(
         if is_chart:
             prompt += (
                 "图表候选页还须编辑 </body> 前 CHART_SCAFFOLD（删定界符、填 option）；"
+                "多图须独立 CHART_SCAFFOLD_* 与各自 const option；"
                 "CHART_SCAFFOLD 不在 Page Chrome 锁内。"
             )
         prompt += "只输出完整 HTML 原文，不要解释、不要 Markdown 代码块。"
@@ -1423,7 +1717,8 @@ def _build_content_template_fill_system_prompt(
     )
     if is_chart:
         prompt += (
-            "图表候选页还须编辑 </body> 前 CHART_SCAFFOLD（删定界符、填 option）。"
+            "图表候选页还须编辑 </body> 前 CHART_SCAFFOLD（删定界符、填 option）；"
+            "多图须独立 CHART_SCAFFOLD_* 与各自 const option。"
             "Page Chrome（head/header/`<main>` 开标签/footer 骨架）须与预铺稿一致；"
             "CHART_SCAFFOLD 不在 Chrome 锁内。"
         )
@@ -2213,9 +2508,134 @@ def _main_inside_ppt_slide(html: str) -> bool:
     return start <= main_match.start() < end
 
 
+_RAW_TEXT_TAG_NAMES = frozenset({"script", "style", "textarea", "title"})
+
+
+def _is_ascii_alpha(ch: str) -> bool:
+    """htmlparser2 非 XML 模式的 isTagStartChar：仅 ASCII 字母可开标签名。"""
+    return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+
+def _has_malformed_open_tag(html: str) -> bool:
+    """检测畸形开标签：属性引号吞入完整标签、标签缺闭合 ``>``、标签内
+    引号外出现新标签开头（被解析器吞成属性名）、raw text 元素缺闭合。
+
+    htmlparser2 与浏览器对 ``<tag attr="value`` 缺失闭合引号的处理，是把后续
+    内容（直到文档中下一个引号）吞进属性值，导致真实标签从解析树消失；
+    pptx-craft fix 的 tags 剖面会在这棵错误解析树上"补/删闭合标签"，破坏
+    DOM 配对并使页面不可导出。此处镜像 htmlparser2 tokenizer 的相关状态
+    （data / tag open / 属性引号 / raw text / 注释声明）做单遍扫描，在写盘
+    前提前拦截。
+
+    判定口径（与 htmlparser2 tokenizer 对齐）：
+    - 标签入口仅 ``<``+ASCII 字母；``<``+非 ASCII（如正文"利润<支出"的
+      ``<支``）按文本放行；
+    - script/style/textarea/title 为 raw text 元素，内容对解析器不透明，
+      直接跳到 ``</name`` 闭合前缀；缺闭合（如截断的 ``<script>var a=1``）
+      判畸形（剩余文档全部被吞）。自闭合 ``<script/>`` 不开 raw text
+      （htmlparser2 stateInSelfClosingTag 将 isSpecial 置回 false）；
+    - 引号区间内出现 ``<``+ASCII 字母/斜杠时，仅当引号角色混淆（从 ``<``
+      到下一个引号的区间含 ``>`` 且以 ``=`` 结尾——区间含 ``>`` 说明值已
+      吞入完整标签，区间以 ``=`` 结尾说明该"闭合引号"实为下一属性的开
+      引号，本属性值的真正闭合被吞，后续标签会从解析树消失）或引号到
+      文件尾仍未闭合时才判畸形；仅含 ``>`` 的标签形态文本（如
+      ``title="支持 <b> 标记"``）与仅以 ``=`` 结尾的字面值（如
+      ``data-formula="若a<b则x="``）均是 htmlparser2 的合法字面属性值，
+      不得误杀；
+    - 标签引号外出现 ``<``+ASCII 字母/斜杠（如 ``<div class="a" <span>``）
+      判畸形：``<span`` 被吞成属性名，真实标签从解析树消失；
+    - 注释/声明/处理指令内容对解析器不透明，跳到 ``-->`` / ``>``；未闭合
+      判畸形。
+    """
+    pos = 0
+    n = len(html)
+    while pos < n:
+        if html[pos] != "<":
+            pos += 1
+            continue
+        next_ch = html[pos + 1] if pos + 1 < n else ""
+        if not _is_ascii_alpha(next_ch):
+            if next_ch == "!":
+                if html.startswith("<!--", pos):
+                    # 注释内容不透明；未闭合注释会吞掉文档剩余部分
+                    close = html.find("-->", pos + 4)
+                    if close == -1:
+                        return True
+                    pos = close + 3
+                else:
+                    # 声明 / CDATA 按 bogus comment 处理，跳到 ">"
+                    close = html.find(">", pos + 2)
+                    if close == -1:
+                        return True
+                    pos = close + 1
+                continue
+            if next_ch == "?":
+                # 处理指令按 bogus comment 处理，跳到 ">"
+                close = html.find(">", pos + 2)
+                if close == -1:
+                    return True
+                pos = close + 1
+                continue
+            # </ 闭标签、<+非字母（含中文正文比较符）按文本处理
+            pos += 1
+            continue
+        # 开标签扫描（HTML5 tag open state：仅 ASCII 字母进入标签名）
+        tag_start = pos
+        in_quote = None
+        tag_end = -1
+        pos += 1
+        while pos < n:
+            ch = html[pos]
+            next_ch = html[pos + 1] if pos + 1 < n else ""
+            if in_quote:
+                if ch == in_quote:
+                    in_quote = None
+                elif ch == "<" and (_is_ascii_alpha(next_ch) or next_ch == "/"):
+                    closing = html.find(in_quote, pos + 1)
+                    if closing == -1:
+                        # 引号到文件尾未闭合
+                        return True
+                    segment = html[pos:closing]
+                    if ">" in segment and segment.rstrip().endswith("="):
+                        # 双签名：区间含 ">"（值已吞入完整标签）且以 "="
+                        # 结尾（找到的"闭合引号"实为下一属性的开引号，
+                        # 本属性值的真正闭合被吞）。仅含 ">" 的标签形态
+                        # 文本或仅以 "=" 结尾的字面值均按合法放行
+                        return True
+            else:
+                if ch == '"' or ch == "'":
+                    in_quote = ch
+                elif ch == ">":
+                    tag_end = pos
+                    break
+                elif ch == "<" and (_is_ascii_alpha(next_ch) or next_ch == "/"):
+                    # 引号外遇新标签开头：当前标签缺 ">"，新标签会被吞成属性名
+                    return True
+            pos += 1
+        if tag_end == -1:
+            return True
+        # raw text 元素：内容不透明，跳到闭合标签前缀（</script 等）
+        name_match = re.match(
+            r"[a-zA-Z][a-zA-Z0-9-]*", html[tag_start + 1:tag_end + 1]
+        )
+        tag_name = name_match.group(0).lower() if name_match else ""
+        if tag_name in _RAW_TEXT_TAG_NAMES and html[tag_end - 1] != "/":
+            close_match = re.search(
+                rf"</{tag_name}", html[tag_end + 1:], re.IGNORECASE
+            )
+            if not close_match:
+                return True
+            pos = tag_end + 1 + close_match.start()
+            continue
+        pos = tag_end + 1
+    return False
+
+
 def _validate_slide_dom(html: str) -> bool:
     """P8.1 写盘前校验：拦截 LLM 畸形片段与 main 滑出 slide。"""
     if _MALFORMED_HTML_RE.search(html):
+        return False
+    if _has_malformed_open_tag(html):
         return False
     return _main_inside_ppt_slide(html)
 
@@ -2223,6 +2643,109 @@ def _validate_slide_dom(html: str) -> bool:
 def _is_slide_exportable(html: str) -> bool:
     """P8.2 fix 后校验：仅确认导出边界内的结构未被破坏。"""
     return _main_inside_ppt_slide(html)
+
+
+async def _find_latest_backup_page_path(
+    node: PlanNode,
+    pages_dir: str,
+    page_num: int,
+    *,
+    log_prefix: str = "[P8.2]",
+) -> str:
+    """定位 cli.js fix 自动备份中该页的最新版本（pages/_backup/<ts>/page-N.pptx.html）。"""
+    if not node.has_tool("glob"):
+        return ""
+    try:
+        result = await node.call_tool(
+            "glob",
+            pattern=f"_backup/*/page-{page_num}.pptx.html",
+            path=pages_dir,
+        )
+    except Exception as e:
+        if isinstance(e, AbortError):
+            raise
+        logger.warning("%s 查找 backup 失败 page=%d: %s", log_prefix, page_num, e)
+        return ""
+    # 不能用 _parse_listing：它会把结果裁成裸文件名，丢失 _backup/<ts>/ 目录，
+    # 直接从原始返回中提取时间戳，重建以 pages_dir 为锚点的完整路径。
+    timestamps = re.findall(
+        rf"_backup[/\\]+(\d+)[/\\]+page-{page_num}\.pptx\.html",
+        str(result),
+    )
+    if not timestamps:
+        return ""
+    paths = [
+        f"{pages_dir}/_backup/{ts}/page-{page_num}.pptx.html"
+        for ts in set(timestamps)
+    ]
+    return max(paths, key=_extract_backup_timestamp)
+
+
+async def restore_unexportable_pages_from_backup(
+    node: PlanNode,
+    pages_dir: str,
+    missing_pages: list[int],
+    *,
+    log_prefix: str = "[P8]",
+) -> list[int]:
+    """自愈：把不可导出页面从 cli.js fix 的自动备份恢复（备份=fix 前状态）。
+
+    cli.js fix 处理前会把全部页面备份到 pages/_backup/<ts>/；若 fix 在畸形标签
+    上误判并破坏 DOM 配对（div 失衡 → 不可导出），用备份原文覆盖回去即可恢复。
+    仅在 reconcile 判定缺页后调用（正常路径零开销）。
+
+    恢复资格=导出口径（_is_slide_exportable，与 _reconcile_missing_pages、
+    P9 缺页门一致）：畸形但可导出的备份（含写盘拦截漏检变体的 fix 前状态）
+    照常恢复，交付成功率优先——convert 为 Playwright Chromium 渲染，此类页面
+    可正常出片（畸形标签只会吞掉部分正文显示，不会使导出失败）；恢复时告警
+    标记视觉残缺风险，便于排查。新写内容的源头质量由写盘校验
+    （_validate_slide_dom）负责拦截。
+
+    公共函数：P9（ppt_export）作为最后防线复用；留在本模块是因为依赖
+    _find_latest_backup_page_path 等私有实现，下沉 ppt_common 会形成循环
+    导入（ppt_page_gen 已导入 ppt_common）。
+
+    返回成功恢复的页号列表；AbortError（HITL 中断）原样上抛，不吞。
+    """
+    recovered: list[int] = []
+    if not pages_dir or not missing_pages:
+        return recovered
+    if not (
+        node.has_tool("glob")
+        and node.has_tool("read_file")
+        and node.has_tool("write_file")
+    ):
+        logger.warning("%s 备份恢复跳过：glob/read_file/write_file 工具不可用", log_prefix)
+        return recovered
+    for page_num in missing_pages:
+        try:
+            backup_path = await _find_latest_backup_page_path(
+                node, pages_dir, page_num, log_prefix=log_prefix
+            )
+            if not backup_path:
+                continue
+            backup_html = await PptCommon.read_file_with_retry(
+                node, backup_path, log_prefix=log_prefix
+            )
+            if not (backup_html and _is_slide_exportable(backup_html)):
+                continue
+            if not _validate_slide_dom(backup_html):
+                logger.warning(
+                    "%s page-%d 备份含畸形开标签，按导出口径恢复，页面可能有视觉残缺",
+                    log_prefix,
+                    page_num,
+                )
+            page_path = f"{pages_dir}/page-{page_num}.pptx.html"
+            if await PptCommon.safe_overwrite_file(
+                node, page_path, backup_html, log_prefix=log_prefix
+            ):
+                recovered.append(page_num)
+        except Exception as e:
+            if isinstance(e, AbortError):
+                raise
+            logger.warning("%s page-%d 备份恢复失败: %s", log_prefix, page_num, e)
+            continue
+    return recovered
 
 
 _CHART_DIV_RE = re.compile(
@@ -2388,6 +2911,23 @@ def _count_filled_chart_options(html: str) -> int:
 def _count_null_chart_options(html: str) -> int:
     """统计可执行的 `const option = null`（忽略注释内说明文字）。"""
     return len(_CHART_OPTION_NULL_RE.findall(_chart_option_scan_text(html)))
+
+
+def _chart_activation_incomplete(html: str) -> bool:
+    """charts.md §激活镜像：有 chart 壳却未剥定界符 / 无非注释 option 对象 / 仍可执行 null。
+
+    仅作填槽重试信号；不得单独升级为 missing_pages / P9 拒导。
+    """
+    if not html or not _CHART_DIV_RE.search(html):
+        return False
+    if _COMMENTED_CHART_SCAFFOLD_BLOCK_RE.search(html):
+        return True
+    scan = _chart_option_scan_text(html)
+    if not _CHART_OPTION_OBJ_RE.search(scan):
+        return True
+    if _CHART_OPTION_NULL_RE.search(scan):
+        return True
+    return False
 
 
 def _layout_patch_regressed_chart_options(before: str, after: str) -> bool:
@@ -3697,6 +4237,11 @@ _REWRITE_ACTIONS = {
     "footer_missing": "保留 footer 结构并填入 PAGE_FOOTER",
     "footer_invalid": "将 PAGE_FOOTER 替换为有效页脚文案，禁止占位敷衍文案",
     "llm_failed": "重新生成完整页面 HTML，确保输出可解析",
+    "chart_scaffold_not_activated": (
+        "本页已有 chart 容器：必须成对删除 CHART_SCAFFOLD_* 定界符，"
+        "并将 const option = null 替换为配置对象 const option = {…}；"
+        "禁止手写 echarts.init / var optionN"
+    ),
 }
 
 
@@ -4343,20 +4888,7 @@ class PrepareNode(PlanNode):
         }
 
     async def _read_file(self, path: str) -> str:
-        if not path:
-            return ""
-        if not self.has_tool("read_file"):
-            logger.warning("[P8.0] read_file 工具不可用 %s", path)
-            return ""
-        try:
-            result = await self.call_tool("read_file", file_path=path)
-            content = PptCommon.parse_tool_file_content(result)
-            return content
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P8.0] 读取文件失败 %s: %s", path, e)
-            return ""
+        return await PptCommon.read_file_with_retry(self, path, log_prefix="[P8.0]")
 
     async def _execute_stream(self, inputs: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         result = await self._execute(inputs)
@@ -4641,6 +5173,24 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
             if html:
                 break
         if not html:
+            # 与 SlideDesignerWorker 对齐：图表未激活不得升格 missing → P9 拒导
+            if (
+                last_fail_reason == "chart_scaffold_not_activated"
+                and last_raw_html.strip()
+            ):
+                logger.warning(
+                    "[P8.1] 图表 scaffold 未激活，重试耗尽仍交付 page=%d",
+                    page_num,
+                )
+                ok = await self._write_file(path, last_raw_html)
+                if not ok:
+                    return {"missing": True, "low_density": False, "report": {}}
+                return {
+                    "missing": False,
+                    "layout_warning": True,
+                    "low_density": False,
+                    "report": {},
+                }
             return {"missing": True, "low_density": False, "report": {}}
 
         ok = await self._write_file(path, html)
@@ -4654,19 +5204,7 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
         }
 
     async def _read_file(self, path: str) -> str:
-        if not path:
-            return ""
-        if not self.has_tool("read_file"):
-            logger.warning("[P8.1] read_file 工具不可用 %s", path)
-            return ""
-        try:
-            result = await self.call_tool("read_file", file_path=path)
-            return PptCommon.parse_tool_file_content(result)
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P8.1] 读取文件失败 %s: %s", path, e)
-            return ""
+        return await PptCommon.read_file_with_retry(self, path, log_prefix="[P8.1]")
 
     async def _generate_structural_template_fill(
         self,
@@ -4746,19 +5284,12 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
                 page_type,
             )
             return ""
-        if _has_unfilled_placeholders(html):
-            logger.warning(
-                "[P8.1] 结构页填槽残留占位符 page=%d type=%s placeholders=%s",
-                ctx.page_num,
-                page_type,
-                _UNFILLED_PLACEHOLDER_RE.findall(html)[:8],
-            )
-            return ""
         return await _run_postprocess(
             _postprocess_structural_template_fill_html,
             html,
             ctx,
             page_type,
+            seed_html,
         )
 
     async def _generate_agenda_template_fill(self, ctx: PageGenContext) -> str:
@@ -4902,6 +5433,10 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
                 "再微调 `<main>` 内布局。禁止只改 flex/gap 假装过检。"
                 "Page Chrome 必须保持不动。只输出完整 HTML，不要解释。"
             )
+        system_prompt += (
+            "当前 HTML 中的 `data-skill-turbo-page-number` 页码锚点属于 Page Chrome，"
+            "输出时必须原样保留，禁止删除或改写。"
+        )
         try:
             result = await self.stream_llm_collect(
                 prompt=_build_layout_patch_prompt(
@@ -4936,26 +5471,25 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
         html = _fix_chart_height_chain(html)
 
         if is_content:
+            merged = _repair_content_template_chrome(seed_html, html)
+            if merged:
+                merged = _fix_echarts_svg_renderer(merged)
+                merged = _strip_unsupported_fullpage_overlays(merged)
+                merged = _strip_chart_header_unit(merged)
+                merged = _fix_chart_scaffold_activation(merged)
+                merged = _fix_chart_height_chain(merged)
+                html = merged
+            else:
+                return "", html, "layout_patch_slot_merge_failed"
             ok, reason = _validate_content_template_fill_output(seed_html, html)
-            if not ok and reason in _REPAIRABLE_CONTENT_TEMPLATE_REASONS:
-                repaired = _repair_content_template_chrome(seed_html, html)
-                if repaired:
-                    repaired = _fix_echarts_svg_renderer(repaired)
-                    repaired = _strip_unsupported_fullpage_overlays(repaired)
-                    repaired = _strip_chart_header_unit(repaired)
-                    repaired = _fix_chart_scaffold_activation(repaired)
-                    repaired = _fix_chart_height_chain(repaired)
-                    ok_rep, reason_rep = _validate_content_template_fill_output(
-                        seed_html, repaired
-                    )
-                    if ok_rep:
-                        html = repaired
-                        ok = True
-                    else:
-                        reason = reason_rep or reason
             if not ok:
                 return "", html, reason or "layout_patch_invalid"
         else:
+            merged = _repair_structural_template_slots(seed_html, html)
+            if merged:
+                html = merged
+            else:
+                return "", html, "layout_patch_slot_merge_failed"
             if not _is_valid_html(html) or not _validate_slide_dom(html):
                 return "", html, "layout_patch_invalid_dom"
             if _has_unfilled_placeholders(html):
@@ -4979,6 +5513,14 @@ class PageWorkerNode(DisableThinkingMixin, PlanNode):
             )
             return "", html, "layout_patch_chart_option_still_null"
 
+        html = _apply_visible_page_number_policy(
+            html,
+            user_query=ctx.user_query,
+            style_constraints=ctx.style_constraints,
+            page_number=ctx.page_num,
+            total_pages=ctx.total_pages,
+            style_id=ctx.style_id,
+        )
         logger.info("[P8.1] 布局原位修补完成 page=%d", ctx.page_num)
         return html, "", ""
 
@@ -5238,7 +5780,7 @@ class QAFixNode(PlanNode):
                 pages_dir=pages_dir,
                 pptx_root=pptx_root,
                 style_file_path=style_file_path,
-                page_count=len(page_files) or total_pages,
+                page_files=page_files,
             )
             if fix_ok:
                 logger.info("[P8.2] cli.js fix 完成 (目录级 --fix --style)")
@@ -5290,32 +5832,9 @@ class QAFixNode(PlanNode):
         )
 
     async def _find_latest_backup_path(self, pages_dir: str, page_num: int) -> str:
-        if not self.has_tool("glob"):
-            return ""
-        try:
-            result = await self.call_tool(
-                "glob",
-                pattern=f"_backup/*/page-{page_num}.pptx.html",
-                path=pages_dir,
-            )
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P8.2] 查找 backup 失败 page=%d: %s", page_num, e)
-            return ""
-        # 不能用 _parse_listing：它会把结果裁成裸文件名，丢失 _backup/<ts>/ 目录，
-        # 直接从原始返回中提取时间戳，重建以 pages_dir 为锚点的完整路径。
-        timestamps = re.findall(
-            rf"_backup[/\\]+(\d+)[/\\]+page-{page_num}\.pptx\.html",
-            str(result),
+        return await _find_latest_backup_page_path(
+            self, pages_dir, page_num, log_prefix="[P8.2]"
         )
-        if not timestamps:
-            return ""
-        paths = [
-            f"{pages_dir}/_backup/{ts}/page-{page_num}.pptx.html"
-            for ts in set(timestamps)
-        ]
-        return max(paths, key=_extract_backup_timestamp)
 
     async def _fix_directory(
         self,
@@ -5323,22 +5842,30 @@ class QAFixNode(PlanNode):
         pages_dir: str,
         pptx_root: str,
         style_file_path: str,
-        page_count: int = 0,
+        page_files: list[str],
     ) -> tuple[bool, str]:
         """目录级 fix（build-standard §6）：tags/fonts/charts 安全网，不用于 layout 修复。
 
         BashExecError（缺 CLI / 超时抛错 / bash 不可用）与非零退出统一为
         ``(False, detail)``，由调用方降 partial，避免环境故障整书拒导。
+        fix 后逐页复查导出 DOM，破坏页回退 _backup 快照（与 _fix_pages 同口径）。
         """
         if not self.has_tool("bash") or not pptx_root or not pages_dir:
             return False, "bash_or_paths_unavailable"
+        page_nums: list[int] = []
+        for name in page_files:
+            if not name.startswith("page-") or not name.endswith(".pptx.html"):
+                continue
+            stem = name.removeprefix("page-").removesuffix(".pptx.html")
+            if stem.isdigit():
+                page_nums.append(int(stem))
         style_arg = (
             f" --style {quote_path(style_file_path)}"
             if style_file_path
             else ""
         )
         # 小 deck 不低于 600s（不劣化）；大 deck 按页放大，降低整目录超时误杀。
-        timeout_seconds = max(600, int(page_count or 0) * 30)
+        timeout_seconds = max(600, len(page_nums) * 30)
         try:
             cmd = (
                 f"{cli_path('fix', pptx_root)} {quote_path(pages_dir + '/')} "
@@ -5355,7 +5882,48 @@ class QAFixNode(PlanNode):
             logger.error("[P8.2] cli.js fix 异常: %s", exc)
             return False, f"bash_error: {exc}"
         output = combined_output(result)[:2000]
+        restored = await self._restore_pages_broken_by_fix(
+            pages_dir=pages_dir,
+            page_nums=page_nums,
+        )
+        if restored:
+            output = f"{output} dom_restored_from_backup={sorted(restored)}"
         return result.exit_code == 0, output
+
+    async def _restore_pages_broken_by_fix(
+        self,
+        *,
+        pages_dir: str,
+        page_nums: list[int],
+    ) -> list[int]:
+        """fix 后不可导出的页回退 _backup 最新快照；读失败页跳过交 reconcile 兜底。"""
+        restored: list[int] = []
+        for page_num in page_nums:
+            page_path = f"{pages_dir}/page-{page_num}.pptx.html"
+            async with PptCommon.page_path_lock(page_path):
+                after_html = await self._read_page_file(page_path)
+                if not after_html:
+                    continue
+                if _is_slide_exportable(after_html):
+                    continue
+                backup_path = await self._find_latest_backup_path(pages_dir, page_num)
+                if not backup_path:
+                    continue
+                backup_html = await self._read_page_file(backup_path)
+                if backup_html and _is_slide_exportable(backup_html):
+                    if await PptCommon.safe_overwrite_file(
+                        self,
+                        page_path,
+                        backup_html,
+                        already_locked=True,
+                        log_prefix="[P8.2]",
+                    ):
+                        logger.warning(
+                            "[P8.2] page-%d fix 破坏 DOM，已回退 backup",
+                            page_num,
+                        )
+                        restored.append(page_num)
+        return restored
 
     async def _fix_pages(
         self,
@@ -5823,6 +6391,24 @@ class PPTPageGenNode(DisableThinkingMixin, PlanNode):
             reported_page_files=final_page_files,
         )
 
+        # 自愈：fix 误修导致的不可导出页面，从 cli.js fix 的自动备份恢复
+        # （备份=fix 前状态）。仅在 reconcile 判定缺页后触发，正常路径零开销。
+        if missing_pages and pages_dir:
+            recovered_pages = await restore_unexportable_pages_from_backup(
+                self, pages_dir, missing_pages, log_prefix="[P8]"
+            )
+            if recovered_pages:
+                logger.info("[P8] 备份自愈恢复页面: %s", recovered_pages)
+                recovered_set = set(recovered_pages)
+                missing_pages = [p for p in missing_pages if p not in recovered_set]
+                for page_num in recovered_pages:
+                    filename = f"page-{page_num}.pptx.html"
+                    if filename not in final_page_files:
+                        final_page_files.append(filename)
+                final_page_files.sort(
+                    key=lambda f: _extract_page_number(f or "") or 10**9,
+                )
+
         if qa_status == "failed":
             ppt_gen_status = "failed"
         else:
@@ -5904,8 +6490,6 @@ class PPTPageGenNode(DisableThinkingMixin, PlanNode):
 
         流程：preflight → 逐页(seed → LLM 填充) → check
         """
-        import json as _json
-
         pack_dir = str(inputs.get("pack_dir") or "").strip()
         output_dir = str(inputs.get("output_dir") or "").strip()
         pages_dir = str(inputs.get("pages_dir") or "").strip()
@@ -6109,20 +6693,7 @@ class PPTPageGenNode(DisableThinkingMixin, PlanNode):
 
     async def _read_file(self, path: str) -> str:
         """读取文件内容（PPTPageGenNode 自身用，模板分支）。"""
-        if not path:
-            return ""
-        if not self.has_tool("read_file"):
-            logger.warning("[P8-TP] read_file 工具不可用 %s", path)
-            return ""
-        try:
-            result = await self.call_tool("read_file", file_path=path)
-            content = PptCommon.parse_tool_file_content(result)
-            return content
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P8-TP] 读取文件失败 %s: %s", path, e)
-            return ""
+        return await PptCommon.read_file_with_retry(self, path, log_prefix="[P8-TP]")
 
     async def _write_file(
         self,

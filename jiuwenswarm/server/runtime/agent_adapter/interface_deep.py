@@ -79,6 +79,14 @@ from openjiuwen.harness.rails import (
 )
 from openjiuwen.harness.rails.personal_context import PersonalContextRail
 from openjiuwen.harness.rails.evolution import EvolutionReviewRuntime
+try:
+    from openjiuwen.harness.rails.evolution import (
+        TTSEConfig,
+        TTSERail,
+    )
+except ImportError:
+    TTSEConfig = None  # type: ignore[misc, assignment]
+    TTSERail = None  # type: ignore[misc, assignment]
 from openjiuwen.harness.rails.context_engineer.context_assemble_rail import ContextAssembleRail
 from openjiuwen.harness.rails.context_engineer.context_processor_rail import ContextProcessorRail
 # FullCompact 仅用于溢出兜底（413/上下文溢出），日常压缩由 preset 链承担。
@@ -455,6 +463,8 @@ from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools import (
 )
 from jiuwenswarm.common.config import (
     _get_evolution_config,
+    agent_file_read_backend_is_local,
+    get_agent_file_read_backend,
     get_config,
     get_default_models,
     get_evolution_enabled,
@@ -466,10 +476,15 @@ from jiuwenswarm.common.config import (
     get_sandbox_runtime,
     get_sandbox_startup_mode,
     get_skill_create_enabled,
+    coerce_config_bool,
+    _get_ttse_config,
+    get_ttse_embedding_config,
+    get_ttse_enabled,
     resolve_env_vars,
     resolve_string_or_list_config,
 )
 from jiuwenswarm.common.mcp_config import (
+    MCP_REGISTRY_REQUEST_TOOL_ID_PREFIX,
     OfficeClawMcpRegistration,
     RequestScopedOfficeClawMcpTool,
     acquire_request_scoped_mcp_session,
@@ -480,6 +495,7 @@ from jiuwenswarm.common.mcp_config import (
     extract_office_claw_mcp,
     extract_request_mcp_servers,
     is_asyncio_outer_cancellation,
+    is_request_scoped_mcp_tool_id,
     list_office_claw_mcp_tools,
     list_request_mcp_server_tools,
     preflight_mcp_server_reachable,
@@ -490,6 +506,17 @@ from jiuwenswarm.common.mcp_config import (
     set_agent_office_claw_tool_ids,
     unregister_live_office_claw_tool_instance,
     validate_office_claw_mcp_config,
+    _positive_timeout_s,
+)
+from jiuwenswarm.common.mcp_server_registry import (
+    DisabledMcpServerError,
+    McpRegistryChatError,
+    UnknownMcpServerError,
+    extract_mcp_server_list,
+    get_mcp_server_registry,
+)
+from jiuwenswarm.server.runtime.agent_adapter.deepagent_task_plan_binding_patch import (
+    apply_deepagent_task_plan_binding_patch,
 )
 from jiuwenswarm.common.mcp_call_timeout_patch import apply_mcp_call_timeout_patch
 from jiuwenswarm.perf.context import DeepResearchReportType
@@ -1297,6 +1324,7 @@ _DEFAULT_PROGRESSIVE_EAGER_TOOLS = [
 ]
 
 _PROGRESSIVE_META_TOOL_NAMES = frozenset({"tools_search", "invoke_tool"})
+_TTSE_CONSULT_TOOL_NAME = "ttse_consult"
 _LEGACY_PROGRESSIVE_EAGER_TOOL_ALIASES = {
     "ask_user_question": "ask_user",
 }
@@ -1317,6 +1345,67 @@ def _ensure_progressive_meta_tools(eager_tools: list[str]) -> list[str]:
         eager_tools.insert(0, "tools_search")
     if "invoke_tool" not in eager_tools:
         eager_tools.insert(1, "invoke_tool")
+    return eager_tools
+
+
+def _merge_ttse_config(runtime_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Yaml ``react.ttse`` plus runtime overlay (runtime keys win).
+
+    Same merge used by TTSERail mount and ``ttse_consult`` eager gating so a
+    sparse runtime cache (OfficeAce sync snapshot omitting ``ttse``) still
+    inherits the on-disk default. An explicit runtime ``enabled: false`` wins.
+    """
+    merged: dict[str, Any] = {}
+    try:
+        yaml_ttse = _get_ttse_config(get_config())
+    except Exception:
+        yaml_ttse = {}
+    if isinstance(yaml_ttse, dict):
+        merged.update(yaml_ttse)
+    runtime = _get_ttse_config(runtime_config)
+    if isinstance(runtime, dict):
+        merged.update(runtime)
+    return merged
+
+
+def _ttse_consult_should_be_eager(react_config: dict[str, Any] | None) -> bool:
+    """True when TTSE is opted in and inject is on, so ``ttse_consult`` stays in schema.
+
+    Master switch uses :func:`_merge_ttse_config` then :func:`get_ttse_enabled`
+    so eager gating cannot diverge from TTSERail mount.
+    """
+    if not isinstance(react_config, dict):
+        return False
+    merged = _merge_ttse_config(react_config)
+    if not get_ttse_enabled({"ttse": merged}):
+        return False
+    return coerce_config_bool(merged.get("inject_enabled"), True)
+
+
+def _ensure_ttse_consult_eager_tool(
+    eager_tools: list[str],
+    react_config: dict[str, Any] | None,
+) -> list[str]:
+    """Expose ``ttse_consult`` on first turn only after TTSE is explicitly enabled.
+
+    ProgressiveToolRail only exposes ``eager_tools``. After ``react.ttse.enabled``
+    (and inject) is on, P:45 tells the model to call ``ttse_consult`` before
+    ``skill_acceleration_exec``; if the name is filtered out, first-turn consult
+    is impossible without tools_search. Default-off must strip the name even if
+    a yaml eager list still includes it.
+    """
+    if not _ttse_consult_should_be_eager(react_config):
+        return [name for name in eager_tools if name != _TTSE_CONSULT_TOOL_NAME]
+    if _TTSE_CONSULT_TOOL_NAME in eager_tools:
+        return eager_tools
+    if "skill_acceleration_exec" in eager_tools:
+        eager_tools.insert(
+            eager_tools.index("skill_acceleration_exec"),
+            _TTSE_CONSULT_TOOL_NAME,
+        )
+    else:
+        insert_at = 2 if len(eager_tools) >= 2 else len(eager_tools)
+        eager_tools.insert(insert_at, _TTSE_CONSULT_TOOL_NAME)
     return eager_tools
 
 
@@ -1406,6 +1495,8 @@ def build_progressive_tool_rail_from_config(
         # invoke_tool would hide the outer call from its lifecycle Rail.
         if "deepresearch_execute" not in eager_tools:
             eager_tools.insert(2, "deepresearch_execute")
+
+    eager_tools = _ensure_ttse_consult_eager_tool(eager_tools, config)
 
     normalized_language = resolve_language(language)
     disabled_tools: list[str] = []
@@ -1504,8 +1595,8 @@ def _resolve_instance_config_base(config_base: dict[str, Any] | None) -> dict[st
     if not isinstance(config_base, dict):
         raise TypeError("config_base must be a dict when provided")
     # 外部传入的 config_base（如企业同步的稀疏 override）与 shipped 模板做补缺型
-    # 合并：模板补全缺失键（如 react.subagents），外部显式键与独有键全部保留，
-    # 保证与 config_base=None 时 get_config() 的模板合并语义一致。
+    # 合并：模板补全缺失键（如 react.ttse / react.subagents），外部显式键与独有
+    # 键全部保留。create_instance 与 reload 共用，避免热更丢掉模板默认值。
     template = load_yaml_dict(resolve_shipped_template_config_path())
     return resolve_env_vars(fill_template_defaults(config_base, template))
 
@@ -2117,6 +2208,16 @@ class OfficeClawMcpBuiltinNameConflict(RuntimeError):
         self.existing_id = existing_id
 
 
+@dataclass
+class _RequestMcpToolBuffers:
+    """One-request MCP tool-install accumulators (G.FNM.03)."""
+
+    tool_ids: list[str]
+    tool_names: list[str]
+    registered_tools: list[RequestScopedOfficeClawMcpTool]
+    seen_names: set[str]
+
+
 class JiuWenSwarmDeepAdapter:
     SESSION_ADAPTER_IDLE_TTL_SEC = 2 * 60 * 60
     SESSION_ADAPTER_EVICT_BATCH_SIZE = 3
@@ -2145,12 +2246,15 @@ class JiuWenSwarmDeepAdapter:
         agent_id: str | None = None,
         service_id: str | None = None,
     ) -> None:
-        # Apply the MCP per-call timeout patch once per process: wraps
-        # StreamableHttpClient/SseClient.call_tool & list_tools in
-        # asyncio.wait_for and honors config ``timeout_s`` (--timeout_s), so a
-        # killed remote MCP server fails fast instead of hanging on the MCP
-        # SDK's 300s SSE read timeout. Idempotent (module-level _PATCHED guard).
+        # Apply the MCP per-call timeout patch once per process: remote HTTP
+        # call_tool/list_tools use asyncio.wait_for (not anyio.fail_after on
+        # the transport; that collides with SDK cancel scopes). Timeout force-
+        # invalidates the session so the next call can reconnect
+        # (TC_MCP_CALL_014). AbilityManager __init_subclass__ hook is a
+        # classmethod. Honors config ``timeout_s``. Idempotent (_PATCHED).
         apply_mcp_call_timeout_patch()
+        # 绑定交互续轮的 task id 到 TaskPlan 任务，使外层循环收敛。幂等。
+        apply_deepagent_task_plan_binding_patch()
         self._instance: DeepAgent | None = None
         self._project_dir: str | None = None
         # 企业多租户：企业版下可用外部传入的隔离 workspace / 租户 ID
@@ -2247,6 +2351,7 @@ class JiuWenSwarmDeepAdapter:
         self._heartbeat_rail: HeartbeatRail | None = None
         self._skill_evolution_rail: SkillEvolutionRail | None = None
         self._evolution_interrupt_rail: EvolutionInterruptRail | None = None
+        self._ttse_rail: Any | None = None
         self._pending_auto_rebuild_skills: list[str] = []
         self._auto_rebuild_lock = asyncio.Lock()
         self._auto_rebuild_task: asyncio.Task | None = None
@@ -2262,6 +2367,8 @@ class JiuWenSwarmDeepAdapter:
         self._evolution_watcher_tasks: set[asyncio.Task] = set()
         self._sys_operation = None
         self._sys_operation_card: SysOperationCard | None = None
+        # 专供 rail 使用的本地 sysop（忽略沙箱配置；与 self._sys_operation 可不同）
+        self._local_sys_operation: SysOperation | None = None
         # Ids of the sys operations this adapter currently holds a reference on,
         # in acquisition order. ``cleanup`` releases them so a disposed adapter
         # stops pinning its SysOperation (and the ~16 tools derived from it) in
@@ -4116,14 +4223,502 @@ class JiuWenSwarmDeepAdapter:
         self._registered_mcp_server_ids.discard(server_id)
         self._registered_mcp_servers.pop(server_id, None)
 
+    async def _append_identity_pinned_office_claw_tools(
+        self,
+        request: AgentRequest,
+        raw_config: dict[str, Any],
+        request_scope: str,
+        buffers: _RequestMcpToolBuffers,
+        *,
+        yield_to_existing: bool = False,
+    ) -> str:
+        """Register identity-pinned office-claw system tools. Returns invocation_id or '-'."""
+
+        tool_ids = buffers.tool_ids
+        tool_names = buffers.tool_names
+        registered_tools = buffers.registered_tools
+        seen_names = buffers.seen_names
+        params = validate_office_claw_mcp_config(raw_config)
+        tool_defs = await list_office_claw_mcp_tools(params)
+        for tool_def in tool_defs:
+            tool_name = str(tool_def.get("name") or "").strip()
+            if not tool_name:
+                raise RuntimeError("OfficeClaw MCP returned an invalid or duplicate tool name")
+            if tool_name in seen_names:
+                if yield_to_existing:
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] office_claw_mcp tool '%s' skipped; "
+                        "mcp_server_list already registered this name: request_id=%s",
+                        tool_name,
+                        request.request_id,
+                    )
+                    continue
+                raise RuntimeError("OfficeClaw MCP returned an invalid or duplicate tool name")
+            seen_names.add(tool_name)
+            tool_id = f"office-claw-request-{request_scope}.office-claw.{tool_name}"
+            card = ToolCard(
+                id=tool_id,
+                name=tool_name,
+                description=str(tool_def.get("description") or ""),
+                input_params=tool_def.get("input_params") or {},
+            )
+            tool = RequestScopedOfficeClawMcpTool(
+                card, params, request.request_id, "office-claw"
+            )
+            add_result = Runner.resource_mgr.add_tool(tool, tag="office-claw")
+            is_ok = getattr(add_result, "is_ok", None)
+            add_succeeded = True
+            if callable(is_ok):
+                add_succeeded = bool(is_ok())
+            elif isinstance(add_result, bool):
+                add_succeeded = add_result
+            if not add_succeeded:
+                raise RuntimeError(f"failed to register OfficeClaw MCP tool: {tool_name}")
+            tool_ids.append(tool_id)
+            tool_names.append(tool_name)
+            registered_tools.append(tool)
+            self._install_office_claw_ability_card(card)
+        request_env = params.get("env") if isinstance(params.get("env"), dict) else {}
+        return str(request_env.get("OFFICE_CLAW_INVOCATION_ID") or "").strip() or "-"
+
+    @staticmethod
+    def _leftover_request_mcp_servers(
+        request_mcp_servers: dict[str, dict[str, Any]] | None,
+        covered_names: list[str],
+    ) -> tuple[dict[str, dict[str, Any]] | None, list[str]]:
+        """Drop servers already named in mcp_server_list; keep leftovers such as pptx-mcp."""
+
+        if not request_mcp_servers:
+            return None, []
+        covered = set(covered_names)
+        dropped = [name for name in request_mcp_servers if name in covered]
+        leftover = {
+            name: config
+            for name, config in request_mcp_servers.items()
+            if name not in covered
+        }
+        return (leftover or None), dropped
+
+    async def _append_request_mcp_server_tools(
+        self,
+        request: AgentRequest,
+        request_mcp_servers: dict[str, dict[str, Any]],
+        request_scope: str,
+        buffers: _RequestMcpToolBuffers,
+        invocation_id: str,
+        *,
+        skip_office_claw: bool = False,
+    ) -> str:
+        """Register request_mcp_servers tools. Returns possibly updated invocation_id."""
+
+        tool_ids = buffers.tool_ids
+        tool_names = buffers.tool_names
+        registered_tools = buffers.registered_tools
+        seen_names = buffers.seen_names
+        for server_name, server_config in request_mcp_servers.items():
+            # office-claw 已由 Source1 处理。
+            if server_name == "office-claw" and skip_office_claw:
+                continue
+            try:
+                connector_tool_defs, connector_params = (
+                    await list_request_mcp_server_tools(
+                        server_name, server_config
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                    "discovery error: request_id=%s error=%s",
+                    server_name,
+                    request.request_id,
+                    exc,
+                )
+                continue
+            if not connector_tool_defs:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                    "no tools: request_id=%s",
+                    server_name,
+                    request.request_id,
+                )
+                continue
+            # 单连接器失败不中断注册，但若其全部工具都注册失败则升 error（避免静默缺工具）。
+            _connector_registered = 0
+            for tool_def in connector_tool_defs:
+                tool_name = str(tool_def.get("name") or "").strip()
+                if not tool_name or tool_name in seen_names:
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                        "duplicate/invalid tool name '%s' skipped (a tool "
+                        "with this name is already registered by an "
+                        "earlier connector/office-claw): request_id=%s",
+                        server_name,
+                        tool_name,
+                        request.request_id,
+                    )
+                    continue
+                seen_names.add(tool_name)
+                tool_id = (
+                    f"office-claw-request-{request_scope}."
+                    f"{server_name}.{tool_name}"
+                )
+                card = ToolCard(
+                    id=tool_id,
+                    name=tool_name,
+                    description=str(tool_def.get("description") or ""),
+                    input_params=tool_def.get("input_params") or {},
+                )
+                # 连接器下发的 timeout_s（经 create_mcp_tool 透传进 connector_params）
+                # 同步写入卡片 resilience 块：外层 AbilityManager 按
+                # properties["resilience"]["timeout_s"] 决定 per-call 超时上限，
+                # 不写则默认 300s 会先于长超时连接器（>300s）掐断调用。
+                _connector_timeout = _positive_timeout_s(
+                    connector_params.get("timeout_s")
+                )
+                if _connector_timeout is not None:
+                    card.properties["resilience"] = {"timeout_s": _connector_timeout}
+                # connector_params 是经 create_mcp_tool 安全层过滤的连接参数
+                # （sse/streamable-http 连接描述 + _mcp_client_type）；
+                # 首次 invoke 按 (request_id, server_name) 起长生命周期连接并复用。
+                tool = RequestScopedOfficeClawMcpTool(
+                    card, connector_params, request.request_id, server_name
+                )
+                add_result = Runner.resource_mgr.add_tool(tool, tag="office-claw")
+                is_ok = getattr(add_result, "is_ok", None)
+                add_succeeded = True
+                if callable(is_ok):
+                    add_succeeded = bool(is_ok())
+                elif isinstance(add_result, bool):
+                    add_succeeded = add_result
+                if not add_succeeded:
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                        "tool '%s' resource_mgr.add_tool failed: request_id=%s",
+                        server_name,
+                        tool_name,
+                        request.request_id,
+                    )
+                    continue
+                tool_ids.append(tool_id)
+                tool_names.append(tool_name)
+                registered_tools.append(tool)
+                try:
+                    self._install_office_claw_ability_card(card)
+                except OfficeClawMcpBuiltinNameConflict as exc:
+                    # 与内置工具撞名（如 filesystem 连接器的 read_file 撞内置
+                    # read_file）：仅跳过该工具，不回滚整次注册——否则已注册好
+                    # 的同连接器/其他连接器工具会被一并清掉，导致 tools_search 0命中
+                    # 注意：仅对“内置撞名”降级，对外部短名冲突（foreign request-scoped）仍 raise
+                    # RuntimeError 走外层 fail-closed 回滚。
+                    try:
+                        tool_ids.pop()
+                        tool_names.pop()
+                        registered_tools.pop()
+                    except IndexError:
+                        pass
+                    try:
+                        Runner.resource_mgr.remove_tool(tool_id)
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                            "tool '%s' shadow-skip resource cleanup failed: "
+                            "request_id=%s error=%s",
+                            server_name,
+                            tool_name,
+                            request.request_id,
+                            cleanup_exc,
+                        )
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                        "tool '%s' shadows a built-in tool, skipped: "
+                        "request_id=%s existing_id=%s new_id=%s",
+                        server_name,
+                        tool_name,
+                        request.request_id,
+                        exc.existing_id,
+                        tool_id,
+                    )
+                    continue
+                _connector_registered += 1
+                if (
+                    server_name == "office-claw"
+                    and invocation_id == "-"
+                ):
+                    connector_env = (
+                        connector_params.get("env")
+                        if isinstance(connector_params.get("env"), dict)
+                        else {}
+                    )
+                    invocation_id = (
+                        str(
+                            connector_env.get("OFFICE_CLAW_INVOCATION_ID") or ""
+                        ).strip()
+                        or "-"
+                    )
+            if _connector_registered == 0:
+                logger.error(
+                    "[JiuWenSwarmDeepAdapter] request-scoped MCP connector "
+                    "'%s' registered 0/%d tools — all failed (duplicate "
+                    "names or add_tool errors); invoke of its tools will "
+                    "find nothing: request_id=%s",
+                    server_name,
+                    len(connector_tool_defs),
+                    request.request_id,
+                )
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
+                "registered: request_id=%s tools=%s",
+                server_name,
+                request.request_id,
+                [str(t.get("name") or "") for t in connector_tool_defs],
+            )
+
+        return invocation_id
+
+    async def _register_mcp_from_registry(
+        self,
+        request: AgentRequest,
+        server_names: list[str],
+        office_claw_config: dict[str, Any] | None = None,
+        leftover_servers: dict[str, dict[str, Any]] | None = None,
+    ) -> OfficeClawMcpRegistration | None:
+        """从进程缓存安装用户 MCP；名单未覆盖的 request_mcp_servers 和 office_claw_mcp 同轮再贴，撞名时名单优先。"""
+
+        if self._instance is None:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] registry MCP skipped: "
+                "request_id=%s agent is not initialized",
+                request.request_id,
+            )
+            return None
+
+        snapshots = await get_mcp_server_registry().snapshot_for_chat(server_names)
+        request_scope = hashlib.sha256(
+            f"{request.session_id}:{request.request_id}".encode("utf-8")
+        ).hexdigest()[:20]
+        tool_ids: list[str] = []
+        tool_names: list[str] = []
+        registered_tools: list[RequestScopedOfficeClawMcpTool] = []
+        seen_names: set[str] = set()
+        install_buffers = _RequestMcpToolBuffers(
+            tool_ids=tool_ids,
+            tool_names=tool_names,
+            registered_tools=registered_tools,
+            seen_names=seen_names,
+        )
+        invocation_id = "-"
+
+        def _build_registration() -> OfficeClawMcpRegistration:
+            return OfficeClawMcpRegistration(
+                request_id=request.request_id,
+                tool_ids=tuple(tool_ids),
+                tool_names=tuple(tool_names),
+                tool_instances=tuple(registered_tools),
+                invocation_id="" if invocation_id == "-" else invocation_id,
+            )
+
+        try:
+            for server_name, tool_defs, connect_params in snapshots:
+                for tool_def in tool_defs:
+                    tool_name = str(tool_def.get("name") or "").strip()
+                    if not tool_name or tool_name in seen_names:
+                        logger.warning(
+                            "[JiuWenSwarmDeepAdapter] registry MCP connector '%s' "
+                            "duplicate/invalid tool name '%s' skipped: request_id=%s",
+                            server_name,
+                            tool_name,
+                            request.request_id,
+                        )
+                        continue
+                    seen_names.add(tool_name)
+                    tool_id = (
+                        f"{MCP_REGISTRY_REQUEST_TOOL_ID_PREFIX}{request_scope}."
+                        f"{server_name}.{tool_name}"
+                    )
+                    card = ToolCard(
+                        id=tool_id,
+                        name=tool_name,
+                        description=str(tool_def.get("description") or ""),
+                        input_params=tool_def.get("input_params") or {},
+                    )
+                    _connector_timeout = _positive_timeout_s(connect_params.get("timeout_s"))
+                    if _connector_timeout is not None:
+                        card.properties["resilience"] = {"timeout_s": _connector_timeout}
+                    tool = RequestScopedOfficeClawMcpTool(
+                        card,
+                        connect_params,
+                        request.request_id,
+                        server_name,
+                        use_global_pool=True,
+                    )
+                    add_result = Runner.resource_mgr.add_tool(tool, tag="office-claw")
+                    is_ok = getattr(add_result, "is_ok", None)
+                    add_succeeded = True
+                    if callable(is_ok):
+                        add_succeeded = bool(is_ok())
+                    elif isinstance(add_result, bool):
+                        add_succeeded = add_result
+                    if not add_succeeded:
+                        logger.warning(
+                            "[JiuWenSwarmDeepAdapter] registry MCP connector '%s' "
+                            "tool '%s' add_tool failed: request_id=%s",
+                            server_name,
+                            tool_name,
+                            request.request_id,
+                        )
+                        continue
+                    tool_ids.append(tool_id)
+                    tool_names.append(tool_name)
+                    registered_tools.append(tool)
+                    try:
+                        self._install_office_claw_ability_card(card)
+                    except OfficeClawMcpBuiltinNameConflict as exc:
+                        try:
+                            tool_ids.pop()
+                            tool_names.pop()
+                            registered_tools.pop()
+                        except IndexError:
+                            pass
+                        try:
+                            Runner.resource_mgr.remove_tool(tool_id)
+                        except Exception as cleanup_exc:
+                            logger.warning(
+                                "[JiuWenSwarmDeepAdapter] registry MCP shadow-skip "
+                                "cleanup failed: request_id=%s error=%s",
+                                request.request_id,
+                                cleanup_exc,
+                            )
+                        logger.warning(
+                            "[JiuWenSwarmDeepAdapter] registry MCP connector '%s' "
+                            "tool '%s' shadows a built-in tool, skipped: "
+                            "request_id=%s existing_id=%s new_id=%s",
+                            server_name,
+                            tool_name,
+                            request.request_id,
+                            exc.existing_id,
+                            tool_id,
+                        )
+                        continue
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] registry MCP connector '%s' "
+                    "registered: request_id=%s tools=%s",
+                    server_name,
+                    request.request_id,
+                    [str(t.get("name") or "") for t in tool_defs],
+                )
+            if leftover_servers:
+                invocation_id = await self._append_request_mcp_server_tools(
+                    request,
+                    leftover_servers,
+                    request_scope,
+                    install_buffers,
+                    invocation_id,
+                    skip_office_claw=office_claw_config is not None,
+                )
+            if office_claw_config is not None:
+                invocation_id = await self._append_identity_pinned_office_claw_tools(
+                    request,
+                    office_claw_config,
+                    request_scope,
+                    install_buffers,
+                    yield_to_existing=True,
+                )
+            registration = _build_registration()
+            self._active_office_claw_mcp = registration
+            set_agent_office_claw_tool_ids(self._instance, tool_ids)
+            publish_live_office_claw_allowlist(registration.tool_ids)
+            for registered_tool in registered_tools:
+                register_live_office_claw_tool_instance(
+                    registered_tool,
+                    registration.tool_ids,
+                )
+            self._sync_office_claw_allowlist_to_progressive_rail(
+                registration.tool_ids,
+                delivery_thread_id=self._office_claw_thread_id_from_tools(
+                    registered_tools
+                ),
+                invocation_id=registration.invocation_id,
+            )
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] registry MCP registered: "
+                "request_id=%s session_id=%s invocation_id=%s tools=%s",
+                request.request_id,
+                request.session_id,
+                invocation_id,
+                tool_names,
+            )
+            return registration
+        except asyncio.CancelledError:
+            await self.cleanup_request_scoped_office_claw_mcp(_build_registration())
+            raise
+        except (McpRegistryChatError, UnknownMcpServerError, DisabledMcpServerError):
+            await self.cleanup_request_scoped_office_claw_mcp(_build_registration())
+            raise
+        except Exception as exc:
+            await self.cleanup_request_scoped_office_claw_mcp(_build_registration())
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] registry MCP registration failed; "
+                "continuing without it: request_id=%s error=%s names=%s",
+                request.request_id,
+                exc,
+                server_names,
+            )
+            return None
+
     async def register_request_scoped_office_claw_mcp(
         self,
         request: AgentRequest,
     ) -> OfficeClawMcpRegistration | None:
-        """Install Relay's legacy OfficeClaw MCP tools for one request only."""
+        """Install Relay MCP tools for one request.
 
+        ``mcp_server_list`` 只读缓存贴用户连接器；名单未覆盖的
+        ``request_mcp_servers``（如 pptx-mcp）和 ``office_claw_mcp`` 同轮仍注册，
+        撞名时名单优先。
+        """
+
+        server_list = extract_mcp_server_list(request.params)
         raw_config = extract_office_claw_mcp(request.params)
         request_mcp_servers = extract_request_mcp_servers(request.params)
+        if server_list is not None:
+            leftover, dropped = self._leftover_request_mcp_servers(
+                request_mcp_servers, server_list
+            )
+            if dropped:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] mcp_server_list present; ignoring "
+                    "request_mcp_servers already covered by the list: "
+                    "request_id=%s names=%s",
+                    request.request_id,
+                    dropped,
+                )
+            if leftover:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] keeping leftover request_mcp_servers "
+                    "not in mcp_server_list: request_id=%s names=%s",
+                    request.request_id,
+                    list(leftover),
+                )
+            request_mcp_servers = leftover
+            if server_list:
+                return await self._register_mcp_from_registry(
+                    request,
+                    server_list,
+                    office_claw_config=raw_config,
+                    leftover_servers=leftover,
+                )
+            if raw_config is None and leftover is None:
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] mcp_server_list empty; skipping user MCP: "
+                    "request_id=%s",
+                    request.request_id,
+                )
+                return None
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] mcp_server_list empty; registering "
+                "office_claw_mcp / leftover request_mcp_servers: request_id=%s",
+                request.request_id,
+            )
+
         if raw_config is None and request_mcp_servers is None:
             # 无 MCP 载荷（既无 office_claw_mcp 也无 request_mcp_servers）：静默不注册。
             logger.info(
@@ -4144,6 +4739,16 @@ class JiuWenSwarmDeepAdapter:
         tool_names: list[str] = []
         registered_tools: list[RequestScopedOfficeClawMcpTool] = []
         invocation_id = "-"
+
+        def _build_registration() -> OfficeClawMcpRegistration:
+            return OfficeClawMcpRegistration(
+                request_id=request.request_id,
+                tool_ids=tuple(tool_ids),
+                tool_names=tuple(tool_names),
+                tool_instances=tuple(registered_tools),
+                invocation_id="" if invocation_id == "-" else invocation_id,
+            )
+
         try:
             request_scope = hashlib.sha256(
                 f"{request.session_id}:{request.request_id}".encode("utf-8")
@@ -4151,211 +4756,35 @@ class JiuWenSwarmDeepAdapter:
             # seen_names 跨两源去重：Source1(可信自带 office-claw)重名→fail-fast；
             # Source2(用户连接器)重名→仅跳过该工具，不中断整次注册。
             seen_names: set[str] = set()
+            install_buffers = _RequestMcpToolBuffers(
+                tool_ids=tool_ids,
+                tool_names=tool_names,
+                registered_tools=registered_tools,
+                seen_names=seen_names,
+            )
 
             # --- Source 1: 自带 office-claw MCP（identity-pinned）。 ---
             if raw_config is not None:
-                params = validate_office_claw_mcp_config(raw_config)
-                tool_defs = await list_office_claw_mcp_tools(params)
-                for tool_def in tool_defs:
-                    tool_name = str(tool_def.get("name") or "").strip()
-                    if not tool_name or tool_name in seen_names:
-                        raise RuntimeError("OfficeClaw MCP returned an invalid or duplicate tool name")
-                    seen_names.add(tool_name)
-                    tool_id = f"office-claw-request-{request_scope}.office-claw.{tool_name}"
-                    card = ToolCard(
-                        id=tool_id,
-                        name=tool_name,
-                        description=str(tool_def.get("description") or ""),
-                        input_params=tool_def.get("input_params") or {},
-                    )
-                    tool = RequestScopedOfficeClawMcpTool(
-                        card, params, request.request_id, "office-claw"
-                    )
-                    add_result = Runner.resource_mgr.add_tool(tool, tag="office-claw")
-                    is_ok = getattr(add_result, "is_ok", None)
-                    add_succeeded = True
-                    if callable(is_ok):
-                        add_succeeded = bool(is_ok())
-                    elif isinstance(add_result, bool):
-                        add_succeeded = add_result
-                    if not add_succeeded:
-                        raise RuntimeError(f"failed to register OfficeClaw MCP tool: {tool_name}")
-                    # Track before touching the AbilityManager so partial failures
-                    # are still fully removable by the common cleanup path.
-                    tool_ids.append(tool_id)
-                    tool_names.append(tool_name)
-                    registered_tools.append(tool)
-                    self._install_office_claw_ability_card(card)
-                request_env = params.get("env") if isinstance(params.get("env"), dict) else {}
-                invocation_id = str(request_env.get("OFFICE_CLAW_INVOCATION_ID") or "").strip() or "-"
+                invocation_id = await self._append_identity_pinned_office_claw_tools(
+                    request,
+                    raw_config,
+                    request_scope,
+                    install_buffers,
+                )
 
             # --- Source 2: 用户连接器（request_mcp_servers）。 ---
             # 单连接器失败不中断整次注册（对齐 Relay 的 per-connector skip 语义）。
             if request_mcp_servers is not None:
-                for server_name, server_config in request_mcp_servers.items():
-                    # office-claw 已由 Source1 处理。
-                    if server_name == "office-claw" and raw_config is not None:
-                        continue
-                    try:
-                        connector_tool_defs, connector_params = (
-                            await list_request_mcp_server_tools(
-                                server_name, server_config
-                            )
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                            "discovery error: request_id=%s error=%s",
-                            server_name,
-                            request.request_id,
-                            exc,
-                        )
-                        continue
-                    if not connector_tool_defs:
-                        logger.info(
-                            "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                            "no tools: request_id=%s",
-                            server_name,
-                            request.request_id,
-                        )
-                        continue
-                    # 单连接器失败不中断注册，但若其全部工具都注册失败则升 error（避免静默缺工具）。
-                    _connector_registered = 0
-                    for tool_def in connector_tool_defs:
-                        tool_name = str(tool_def.get("name") or "").strip()
-                        if not tool_name or tool_name in seen_names:
-                            logger.warning(
-                                "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                                "duplicate/invalid tool name '%s' skipped (a tool "
-                                "with this name is already registered by an "
-                                "earlier connector/office-claw): request_id=%s",
-                                server_name,
-                                tool_name,
-                                request.request_id,
-                            )
-                            continue
-                        seen_names.add(tool_name)
-                        tool_id = (
-                            f"office-claw-request-{request_scope}."
-                            f"{server_name}.{tool_name}"
-                        )
-                        card = ToolCard(
-                            id=tool_id,
-                            name=tool_name,
-                            description=str(tool_def.get("description") or ""),
-                            input_params=tool_def.get("input_params") or {},
-                        )
-                        # 连接器下发的 timeout_s（经 create_mcp_tool 透传进 connector_params）
-                        # 同步写入卡片 resilience 块：外层 AbilityManager 按
-                        # properties["resilience"]["timeout_s"] 决定 per-call 超时上限，
-                        # 不写则默认 300s 会先于长超时连接器（>300s）掐断调用。
-                        _connector_timeout = connector_params.get("timeout_s")
-                        if (isinstance(_connector_timeout, (int, float)) and not isinstance(_connector_timeout, bool)
-                            and _connector_timeout > 0):
-                            card.properties["resilience"] = {"timeout_s": float(_connector_timeout)}
-                        # connector_params 是经 create_mcp_tool 安全层过滤的连接参数
-                        # （stdio 启动参数，或 sse/streamable-http 连接描述 + _mcp_client_type）；
-                        # 首次 invoke 按 (request_id, server_name) 起长生命周期进程/连接并复用。
-                        tool = RequestScopedOfficeClawMcpTool(
-                            card, connector_params, request.request_id, server_name
-                        )
-                        add_result = Runner.resource_mgr.add_tool(tool, tag="office-claw")
-                        is_ok = getattr(add_result, "is_ok", None)
-                        add_succeeded = True
-                        if callable(is_ok):
-                            add_succeeded = bool(is_ok())
-                        elif isinstance(add_result, bool):
-                            add_succeeded = add_result
-                        if not add_succeeded:
-                            logger.warning(
-                                "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                                "tool '%s' resource_mgr.add_tool failed: request_id=%s",
-                                server_name,
-                                tool_name,
-                                request.request_id,
-                            )
-                            continue
-                        tool_ids.append(tool_id)
-                        tool_names.append(tool_name)
-                        registered_tools.append(tool)
-                        try:
-                            self._install_office_claw_ability_card(card)
-                        except OfficeClawMcpBuiltinNameConflict as exc:
-                            # 与内置工具撞名（如 filesystem 连接器的 read_file 撞内置
-                            # read_file）：仅跳过该工具，不回滚整次注册——否则已注册好
-                            # 的同连接器/其他连接器工具会被一并清掉，导致 tools_search 0命中
-                            # 注意：仅对“内置撞名”降级，对外部短名冲突（foreign request-scoped）仍 raise
-                            # RuntimeError 走外层 fail-closed 回滚。
-                            try:
-                                tool_ids.pop()
-                                tool_names.pop()
-                                registered_tools.pop()
-                            except IndexError:
-                                pass
-                            try:
-                                Runner.resource_mgr.remove_tool(tool_id)
-                            except Exception as cleanup_exc:
-                                logger.warning(
-                                    "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                                    "tool '%s' shadow-skip resource cleanup failed: "
-                                    "request_id=%s error=%s",
-                                    server_name,
-                                    tool_name,
-                                    request.request_id,
-                                    cleanup_exc,
-                                )
-                            logger.warning(
-                                "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                                "tool '%s' shadows a built-in tool, skipped: "
-                                "request_id=%s existing_id=%s new_id=%s",
-                                server_name,
-                                tool_name,
-                                request.request_id,
-                                exc.existing_id,
-                                tool_id,
-                            )
-                            continue
-                        _connector_registered += 1
-                        if (
-                            server_name == "office-claw"
-                            and invocation_id == "-"
-                        ):
-                            connector_env = (
-                                connector_params.get("env")
-                                if isinstance(connector_params.get("env"), dict)
-                                else {}
-                            )
-                            invocation_id = (
-                                str(
-                                    connector_env.get("OFFICE_CLAW_INVOCATION_ID") or ""
-                                ).strip()
-                                or "-"
-                            )
-                    if _connector_registered == 0:
-                        logger.error(
-                            "[JiuWenSwarmDeepAdapter] request-scoped MCP connector "
-                            "'%s' registered 0/%d tools — all failed (duplicate "
-                            "names or add_tool errors); invoke of its tools will "
-                            "find nothing: request_id=%s",
-                            server_name,
-                            len(connector_tool_defs),
-                            request.request_id,
-                        )
-                    logger.info(
-                        "[JiuWenSwarmDeepAdapter] request-scoped MCP connector '%s' "
-                        "registered: request_id=%s tools=%s",
-                        server_name,
-                        request.request_id,
-                        [str(t.get("name") or "") for t in connector_tool_defs],
-                    )
+                invocation_id = await self._append_request_mcp_server_tools(
+                    request,
+                    request_mcp_servers,
+                    request_scope,
+                    install_buffers,
+                    invocation_id,
+                    skip_office_claw=raw_config is not None,
+                )
 
-            registration = OfficeClawMcpRegistration(
-                request_id=request.request_id,
-                tool_ids=tuple(tool_ids),
-                tool_names=tuple(tool_names),
-                tool_instances=tuple(registered_tools),
-                invocation_id="" if invocation_id == "-" else invocation_id,
-            )
+            registration = _build_registration()
             self._active_office_claw_mcp = registration
             # Store tool_ids on the agent's shared ability_manager so the
             # supervisor / round task (created before bind_active_office_claw_mcp_tools)
@@ -4372,7 +4801,7 @@ class JiuWenSwarmDeepAdapter:
                 delivery_thread_id=self._office_claw_thread_id_from_tools(
                     registered_tools
                 ),
-                invocation_id="" if invocation_id == "-" else invocation_id,
+                invocation_id=registration.invocation_id,
             )
             logger.info(
                 "[JiuWenSwarmDeepAdapter] request-scoped OfficeClaw MCP registered: "
@@ -4388,24 +4817,10 @@ class JiuWenSwarmDeepAdapter:
             logger.info("[latency] stage=2 name=mcp request_id=%s", request.request_id)
             return registration
         except asyncio.CancelledError:
-            registration = OfficeClawMcpRegistration(
-                request_id=request.request_id,
-                tool_ids=tuple(tool_ids),
-                tool_names=tuple(tool_names),
-                tool_instances=tuple(registered_tools),
-                invocation_id="" if invocation_id == "-" else invocation_id,
-            )
-            await self.cleanup_request_scoped_office_claw_mcp(registration)
+            await self.cleanup_request_scoped_office_claw_mcp(_build_registration())
             raise
         except Exception as exc:
-            registration = OfficeClawMcpRegistration(
-                request_id=request.request_id,
-                tool_ids=tuple(tool_ids),
-                tool_names=tuple(tool_names),
-                tool_instances=tuple(registered_tools),
-                invocation_id="" if invocation_id == "-" else invocation_id,
-            )
-            await self.cleanup_request_scoped_office_claw_mcp(registration)
+            await self.cleanup_request_scoped_office_claw_mcp(_build_registration())
             _raw_command = str(raw_config.get("command") or "").strip() if isinstance(raw_config, dict) else ""
             _connector_names = (
                 list(request_mcp_servers.keys())
@@ -4468,7 +4883,7 @@ class JiuWenSwarmDeepAdapter:
                         existing_id,
                         exc,
                     )
-            elif existing_id.startswith("office-claw-request-"):
+            elif is_request_scoped_mcp_tool_id(existing_id):
                 # Foreign request-scoped tool (different request scope) owns the
                 # short name. Fail closed so a concurrent request cannot silently
                 # steal the mapping.
@@ -4502,7 +4917,7 @@ class JiuWenSwarmDeepAdapter:
                 ability_result = ability_manager.add(card)
                 added = getattr(ability_result, "added", None) if ability_result is not None else None
             if added is False:
-                if existing_id and existing_id.startswith("office-claw-request-"):
+                if existing_id and is_request_scoped_mcp_tool_id(existing_id):
                     raise RuntimeError(
                         f"OfficeClaw MCP tool name conflicts with an existing tool: {tool_name}"
                     )
@@ -4518,7 +4933,7 @@ class JiuWenSwarmDeepAdapter:
         installed = getter(tool_name) if callable(getter) else None
         installed_id = str(getattr(installed, "id", "") or "") if installed is not None else ""
         if installed_id != tool_id:
-            if installed_id and installed_id.startswith("office-claw-request-"):
+            if installed_id and is_request_scoped_mcp_tool_id(installed_id):
                 # Foreign request-scoped tool stole the short name: fail closed.
                 raise RuntimeError(
                     f"OfficeClaw MCP tool name conflicts with an existing tool: {tool_name} "
@@ -4830,13 +5245,13 @@ class JiuWenSwarmDeepAdapter:
         config_base: dict[str, Any],
     ) -> bool:
         """Build DeepAgent video config from service config/env mapping."""
-        apply_video_model_config_from_yaml(config_base)
         if not complete_multimodal_model_configured(config_base, "video"):
             logger.info(
                 "[JiuWenSwarmDeepAdapter] skip video_understanding: models.video requires "
                 "api_key, api_base, and model_name in config.yaml"
             )
             return False
+        apply_video_model_config_from_yaml(config_base)
         video_api_key = str(read_env("VIDEO_API_KEY", "")).strip()
         video_api_base = str(read_env("VIDEO_API_BASE", "")).strip()
         video_model_name = str(read_env("VIDEO_MODEL_NAME", "")).strip()
@@ -5033,6 +5448,11 @@ class JiuWenSwarmDeepAdapter:
         if routing is None:
             return
         try:
+            from jiuwenswarm.server.runtime.enterprise_config import (
+                invalidate_enterprise_config_caches,
+            )
+
+            invalidate_enterprise_config_caches()
             request = AgentRequest(
                 request_id="enterprise-config-refresh",
                 channel_id="default",
@@ -6485,10 +6905,30 @@ class JiuWenSwarmDeepAdapter:
             The resolved SysOperation, or None when registration failed.
         """
         previously_retained = list(self._retained_sys_operation_ids)
+        # 读盘用的本地 sysop 与 agent 沙箱 sysop 可能是两份：重建 agent 时不能
+        # 把仍在用的 local 一并 release，否则 rail 会拿着已注销引用。
+        local_keep_id: str | None = None
+        if self._local_sys_operation is not None:
+            local_keep_id = str(self._local_sys_operation.id)
+
         sys_operation = self._resolve_sys_operation()
         if sys_operation is not None:
             self._retain_sys_operation(str(sys_operation.id))
-        self._release_sys_operations(previously_retained)
+
+        to_release = [sid for sid in previously_retained if sid != local_keep_id]
+        # agent 与 local 共用同一张卡时：新 retain 已加上，只丢掉上一轮那一票。
+        same_card_as_local = (
+            sys_operation is not None
+            and local_keep_id is not None
+            and str(sys_operation.id) == local_keep_id
+        )
+        prior_local_retain = (
+            local_keep_id is not None
+            and previously_retained.count(local_keep_id) >= 1
+        )
+        if same_card_as_local and prior_local_retain:
+            to_release.append(local_keep_id)
+        self._release_sys_operations(to_release)
         return sys_operation
 
     def _retain_sys_operation(self, sys_operation_id: str) -> None:
@@ -6568,6 +7008,14 @@ class JiuWenSwarmDeepAdapter:
                     exc,
                 )
 
+        # 本地读盘 sysop 若已不在本 adapter retain 列表里，清掉缓存，避免下次
+        # 误以为还能复用已注销实例。
+        local = self._local_sys_operation
+        if local is not None:
+            local_id = str(getattr(local, "id", "") or "")
+            if not local_id or local_id not in self._retained_sys_operation_ids:
+                self._local_sys_operation = None
+
     def _resolve_sys_operation(self) -> SysOperation | None:
         """Create a sys operation.
 
@@ -6640,6 +7088,357 @@ class JiuWenSwarmDeepAdapter:
         except Exception as exc:
             logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", exc)
             return None
+
+    def _create_local_sys_operation(self) -> SysOperation | None:
+        """只创建/复用本地 SysOperation，给读盘类 rail 用；与沙箱实例分离。"""
+        _t0 = time.monotonic()
+        cached = self._local_sys_operation
+        if cached is not None:
+            cached_id = str(getattr(cached, "id", "") or "")
+            still_held = bool(
+                cached_id and cached_id in self._retained_sys_operation_ids
+            )
+            still_registered = bool(
+                cached_id
+                and Runner.resource_mgr.get_sys_operation(cached_id) is not None
+            )
+            if still_held and still_registered:
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s reuse=1 "
+                    "elapsed_ms=%.1f",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return cached
+            # 上一轮 recreate 已 release/unregister：丢掉脏缓存，下面重建。
+            self._local_sys_operation = None
+        existing = self._sys_operation
+        if existing is not None and getattr(existing, "mode", None) == OperationMode.LOCAL:
+            existing_id = str(getattr(existing, "id", "") or "")
+            if existing_id and existing_id not in self._retained_sys_operation_ids:
+                self._retain_sys_operation(existing_id)
+            self._local_sys_operation = existing
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s reuse_agent=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return existing
+        try:
+            work_dir = self._workspace_dir or str(get_agent_root_dir())
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] create local-only sys_operation (work_dir=%s)",
+                work_dir,
+            )
+            sysop_card = create_local_sysop_card(work_dir=work_dir)
+            if sysop_card is None:
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                    "elapsed_ms=%.1f reason=card_none",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return None
+            isolation_key = self._sys_operation_isolation_key(sysop_card)
+            if isolation_key:
+                registered = self._get_registered_sys_operation_by_isolation_key(
+                    isolation_key
+                )
+                if registered is not None:
+                    self._retain_sys_operation(str(registered.id))
+                    self._local_sys_operation = registered
+                    logger.info(
+                        "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=1 "
+                        "reuse_registered=1 elapsed_ms=%.1f",
+                        self._agent_id,
+                        (time.monotonic() - _t0) * 1000,
+                    )
+                    return registered
+            result = Runner.resource_mgr.add_sys_operation(sysop_card)
+            if result.is_err():
+                registered = (
+                    self._get_registered_sys_operation_by_isolation_key(isolation_key)
+                    if isolation_key
+                    else None
+                )
+                if registered is not None:
+                    self._retain_sys_operation(str(registered.id))
+                    self._local_sys_operation = registered
+                    return registered
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] add local sys_operation failed: %s",
+                    result.msg(),
+                )
+                logger.info(
+                    "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                    "elapsed_ms=%.1f reason=add_err",
+                    self._agent_id,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return None
+            sysop_obj = Runner.resource_mgr.get_sys_operation(sysop_card.id)
+            if sysop_obj is not None:
+                self._retain_sys_operation(str(sysop_obj.id))
+            self._local_sys_operation = sysop_obj
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=%s "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                1 if sysop_obj is not None else 0,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return sysop_obj
+        except Exception as exc:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] create local sys_operation failed: %s", exc
+            )
+            logger.info(
+                "[SandboxPerf] create_local_sys_operation: agent_id=%s ok=0 "
+                "elapsed_ms=%.1f reason=exc",
+                self._agent_id,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return None
+
+    def _iter_adapter_rails(self) -> list[Any]:
+        """收集 adapter 上持有的 rail 实例。"""
+        rail_attrs = (
+            "_filesystem_rail",
+            "_skill_rail",
+            "_stream_event_rail",
+            "_task_execution_rail",
+            "_task_planning_rail",
+            "_context_assemble_rail",
+            "_context_processor_rail",
+            "_runtime_prompt_rail",
+            "_response_prompt_rail",
+            "_skill_protocol_prompt_rail",
+            "_security_rail",
+            "_memory_rail",
+            "_external_memory_rail",
+            "_heartbeat_rail",
+            "_skill_evolution_rail",
+            "_subagent_rail",
+            "_disabled_tools_rail",
+            "_permission_rail",
+            "_avatar_rail",
+            "_progressive_tool_rail",
+            "_skill_authorization_rail",
+            "_skill_active_state_rail",
+            "_skill_credential_injection_rail",
+            "_llm_retry_rail",
+            "_skill_create_rail",
+            "_ask_user_rail",
+        )
+        rails: list[Any] = []
+        for attr in rail_attrs:
+            rail = getattr(self, attr, None)
+            if rail is not None:
+                rails.append(rail)
+        return rails
+
+    @staticmethod
+    def _is_sandbox_bound_rail(rail: Any) -> bool:
+        """动手类 rail：必须跟 deep_config / 沙箱 sysop，不能强制本地。"""
+        if isinstance(rail, (SysOperationRail, SkillUseRail)):
+            return True
+        try:
+            if isinstance(rail, ConcurrentSafeSysOperationRail):
+                return True
+        except Exception:
+            pass
+        return type(rail).__name__ in {
+            "SysOperationRail",
+            "FileSystemRail",
+            "ConcurrentSafeFileSystemRail",
+            "ConcurrentSafeSysOperationRail",
+            "SkillUseRail",
+        }
+
+    @staticmethod
+    def _set_rail_sys_operation(rail: Any, sysop: SysOperation) -> bool:
+        """给单个 rail 写入 sys_operation；成功返回 True。"""
+        setter = getattr(rail, "set_sys_operation", None)
+        if callable(setter):
+            setter(sysop)
+            return True
+        if hasattr(rail, "sys_operation"):
+            rail.sys_operation = sysop
+            return True
+        return False
+
+    def _apply_local_sysop_to_all_rails(self) -> None:
+        """按 ``AGENT_FILE_READ_BACKEND`` 把读文件类 rail 切到本地 sysop。"""
+        _t0 = time.monotonic()
+        backend = get_agent_file_read_backend()
+        if not agent_file_read_backend_is_local():
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] AGENT_FILE_READ_BACKEND=%s, skip local "
+                "sysop rail override (agent_id=%s)",
+                backend,
+                self._agent_id,
+            )
+            logger.info(
+                "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s skipped=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        local_sysop = self._create_local_sys_operation()
+        if local_sysop is None:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] skip applying local sysop to rails: "
+                "local sysop unavailable"
+            )
+            logger.info(
+                "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s skipped=1 "
+                "elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        agent_sysop = self._sys_operation
+        if self._instance is not None:
+            deep_cfg = getattr(self._instance, "deep_config", None)
+            if deep_cfg is not None and agent_sysop is not None:
+                deep_cfg.sys_operation = agent_sysop
+
+        rails: list[Any] = []
+        if self._instance is not None:
+            configured = getattr(self._instance, "configured_rails", None)
+            if callable(configured):
+                try:
+                    rails.extend(configured() or [])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[JiuWenSwarmDeepAdapter] configured_rails() failed: %s", exc
+                    )
+        rails.extend(self._iter_adapter_rails())
+
+        seen: set[int] = set()
+        local_applied = 0
+        sandbox_kept = 0
+        for rail in rails:
+            rid = id(rail)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            if self._is_sandbox_bound_rail(rail):
+                if agent_sysop is not None and self._set_rail_sys_operation(
+                    rail, agent_sysop
+                ):
+                    sandbox_kept += 1
+                continue
+            if self._set_rail_sys_operation(rail, local_sysop):
+                local_applied += 1
+
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] rail sysop: backend=%s local=%d sandbox_bound=%d "
+            "(deep_config keeps agent sysop)",
+            backend,
+            local_applied,
+            sandbox_kept,
+        )
+        logger.info(
+            "[SandboxPerf] apply_rail_sysop: agent_id=%s backend=%s local=%d "
+            "sandbox_bound=%d elapsed_ms=%.1f",
+            self._agent_id,
+            backend,
+            local_applied,
+            sandbox_kept,
+            (time.monotonic() - _t0) * 1000,
+        )
+
+    async def _init_workspace_on_host(self) -> None:
+        """在宿主机初始化工作区，避免沙箱 DirectoryBuilder 串行建目录。
+
+        仅当 ``AGENT_FILE_READ_BACKEND=local``（默认）时执行。
+        整段落盘丢 ``asyncio.to_thread``，避免堵事件循环。
+        """
+        _t0 = time.monotonic()
+        backend = get_agent_file_read_backend()
+        if not agent_file_read_backend_is_local():
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s "
+                "skipped=1 reason=backend_sandbox elapsed_ms=%.1f",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+            return
+
+        instance = self._instance
+        if instance is None:
+            return
+        deep_cfg = getattr(instance, "deep_config", None)
+        if deep_cfg is None:
+            return
+        if not getattr(deep_cfg, "auto_create_workspace", True):
+            return
+        workspace = getattr(deep_cfg, "workspace", None)
+        if workspace is None:
+            return
+
+        root_path = getattr(workspace, "root_path", None) or self._workspace_dir
+        if not root_path:
+            return
+
+        directories = list(getattr(workspace, "directories", None) or [])
+        language = str(
+            getattr(workspace, "language", None)
+            or self._resolve_runtime_language()
+            or "cn"
+        )
+        try:
+            from jiuwenswarm.server.runtime.agent_adapter.workspace_host_init import (
+                host_init_workspace_sync,
+            )
+
+            result = await asyncio.to_thread(
+                host_init_workspace_sync,
+                str(root_path),
+                directories,
+                language=language,
+            )
+            status = str((result or {}).get("status") or "")
+            if status == "skipped_marker":
+                logger.info(
+                    "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s "
+                    "skipped=1 reason=marker_exists elapsed_ms=%.1f",
+                    self._agent_id,
+                    backend,
+                    (time.monotonic() - _t0) * 1000,
+                )
+                return
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s ok=1 "
+                "mode=%s dirs=%d elapsed_ms=%.1f path=%s",
+                self._agent_id,
+                backend,
+                status,
+                int((result or {}).get("dirs") or len(directories)),
+                (time.monotonic() - _t0) * 1000,
+                root_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] init_workspace_on_host failed: %s",
+                exc,
+            )
+            logger.info(
+                "[SandboxPerf] init_workspace_on_host: agent_id=%s backend=%s ok=0 "
+                "elapsed_ms=%.1f reason=exc",
+                self._agent_id,
+                backend,
+                (time.monotonic() - _t0) * 1000,
+            )
+
 
     async def apply_sandbox_runtime_patch(
         self, runtime: dict[str, Any], *, files_changed: bool
@@ -7155,6 +7954,206 @@ class JiuWenSwarmDeepAdapter:
             logger.warning("[JiuWenSwarmDeepAdapter] SkillEvolutionRail create failed: %s", exc)
             skill_evolution_rail = None
         return skill_evolution_rail
+
+    def _ttse_bank_path(self) -> str:
+        """FACT/TIP bank is always ``workspace/.ttse/bank.json``; not a user knob.
+
+        Uses ``self._workspace_dir`` (same tenant root as memory rails). Sync
+        and reload do not bind ``_TENANT_JIUWENCLAW_WS_CV``, so
+        :func:`get_agent_workspace_dir` would fall back to the default-tenant
+        shared workspace and mix FACT/TIP banks across tenants.
+        """
+        root = Path(self._workspace_dir) if self._workspace_dir else get_agent_workspace_dir()
+        return str(root / ".ttse" / "bank.json")
+
+    def _resolved_ttse_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """User yaml ``react.ttse`` plus adapter cache (runtime cache wins).
+
+        File yaml supplies defaults. The adapter cache / passed config overlays
+        it so a runtime ``enabled: false`` is not clobbered by the on-disk
+        default. ``store_path`` is not a user setting; the bank is always under
+        workspace. FACT/TIP disclosure is always catalog + ``ttse_consult``.
+        """
+        return _merge_ttse_config(config if config is not None else self._config_cache)
+
+    def _build_ttse_rail(self, config: dict[str, Any]) -> Any | None:
+        """Build TTSERail for FACT/TIP dual-track self-evolution.
+
+        Returns None when agent-core lacks TTSE, construction fails, or
+        the feature is unavailable. Does not register the rail.
+        """
+        if TTSERail is None or TTSEConfig is None:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] TTSERail unavailable: agent-core missing ttse"
+            )
+            return None
+        try:
+            from openjiuwen.core.memory.lite.embeddings import OpenAICompatibleEmbeddingProvider
+
+            ttse_cfg = self._resolved_ttse_config(config)
+            store_path = self._ttse_bank_path()
+            evolve_enabled = coerce_config_bool(ttse_cfg.get("evolve_enabled"), True)
+            inject_enabled = coerce_config_bool(ttse_cfg.get("inject_enabled"), True)
+            trajectory_export_enabled = coerce_config_bool(
+                ttse_cfg.get("trajectory_export_enabled"), False
+            )
+            trajectory_export_path = str(ttse_cfg.get("trajectory_export_path") or "").strip()
+            dream_enabled = coerce_config_bool(ttse_cfg.get("dream_enabled"), True)
+            try:
+                dream_interval = int(ttse_cfg.get("dream_interval", 50))
+            except (TypeError, ValueError):
+                dream_interval = 50
+            try:
+                dream_min_hours = float(ttse_cfg.get("dream_min_hours", 24.0))
+            except (TypeError, ValueError):
+                dream_min_hours = 24.0
+            try:
+                dream_ttl_days = int(ttse_cfg.get("dream_ttl_days", 90))
+            except (TypeError, ValueError):
+                dream_ttl_days = 90
+            try:
+                consult_top_k = int(ttse_cfg.get("consult_top_k", 8) or 8)
+            except (TypeError, ValueError):
+                consult_top_k = 8
+            try:
+                consult_rrf_k = int(ttse_cfg.get("consult_rrf_k", 60) or 60)
+            except (TypeError, ValueError):
+                consult_rrf_k = 60
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] TTSEConfig: store_path=%s evolve_enabled=%s "
+                "inject_enabled=%s trajectory_export_enabled=%s dream_enabled=%s "
+                "dream_interval=%s dream_min_hours=%s dream_ttl_days=%s",
+                store_path,
+                evolve_enabled,
+                inject_enabled,
+                trajectory_export_enabled,
+                dream_enabled,
+                dream_interval,
+                dream_min_hours,
+                dream_ttl_days,
+            )
+            emb_cfg = get_ttse_embedding_config({"react": {"ttse": ttse_cfg}})
+            embedding = None
+            if emb_cfg:
+                embedding = OpenAICompatibleEmbeddingProvider(
+                    api_key=emb_cfg["api_key"],
+                    base_url=emb_cfg["base_url"],
+                    model=emb_cfg["model"],
+                )
+            from jiuwenswarm.agents.harness.observability_runtime import (
+                get_trajectory_span_processor,
+            )
+
+            trajectory_span_processor = get_trajectory_span_processor()
+            if trajectory_span_processor is None:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] TTSERail create skipped: "
+                    "TrajectorySpanProcessor unavailable"
+                )
+                return None
+            # TTSERail defaults to SignalBasedSuccessDetector(llm=..., model=..., config=...).
+            # Do not construct the detector without those required kwargs.
+            ttse_rail = TTSERail(
+                llm=self._model,
+                model=self._default_model_name or config.get("model_name", "gpt-4"),
+                ttse_config=TTSEConfig(
+                    store_path=store_path,
+                    evolve_enabled=evolve_enabled,
+                    inject_enabled=inject_enabled,
+                    trajectory_export_enabled=trajectory_export_enabled,
+                    trajectory_export_path=trajectory_export_path,
+                    embedding=embedding,
+                    dream_enabled=bool(dream_enabled),
+                    dream_interval=dream_interval,
+                    dream_min_hours=dream_min_hours,
+                    dream_ttl_days=dream_ttl_days,
+                    consult_top_k=consult_top_k,
+                    consult_rrf_k=consult_rrf_k,
+                ),
+                trajectory_span_processor=trajectory_span_processor,
+            )
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] TTSERail create success, "
+                "store_path=%s evolve_enabled=%s inject_enabled=%s has_embedding=%s",
+                store_path,
+                evolve_enabled,
+                inject_enabled,
+                embedding is not None,
+            )
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] TTSERail create failed: %s", exc)
+            ttse_rail = None
+        return ttse_rail
+
+    def _sync_ttse_rail_config(self, config: dict[str, Any] | None = None) -> None:
+        """Refresh live TTSERail flags/store from current react.ttse (no remount)."""
+        rail = self._ttse_rail
+        if rail is None:
+            return
+        ttse_cfg = self._resolved_ttse_config(config)
+        store_path = self._ttse_bank_path()
+        evolve_enabled = coerce_config_bool(ttse_cfg.get("evolve_enabled"), True)
+        inject_enabled = coerce_config_bool(ttse_cfg.get("inject_enabled"), True)
+        trajectory_export_enabled = coerce_config_bool(
+            ttse_cfg.get("trajectory_export_enabled"), False
+        )
+        trajectory_export_path = str(ttse_cfg.get("trajectory_export_path") or "").strip()
+        apply_config = getattr(rail, "apply_runtime_config", None)
+        if callable(apply_config):
+            # Older agent-core apply_runtime_config only accepts store/evolve/inject.
+            # Trajectory export flags are synced via _ttse_config below.
+            apply_config(
+                store_path=store_path,
+                evolve_enabled=evolve_enabled,
+                inject_enabled=inject_enabled,
+            )
+        cfg_obj = getattr(rail, "_ttse_config", None)
+        if cfg_obj is not None:
+            cfg_obj.trajectory_export_enabled = trajectory_export_enabled
+            cfg_obj.trajectory_export_path = trajectory_export_path
+        else:
+            logger.debug(
+                "[JiuWenSwarmDeepAdapter] TTSERail._ttse_config missing; "
+                "trajectory export flags not synced"
+            )
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] TTSERail config synced: "
+            "store_path=%s evolve_enabled=%s inject_enabled=%s "
+            "trajectory_export_enabled=%s",
+            store_path,
+            evolve_enabled,
+            inject_enabled,
+            trajectory_export_enabled,
+        )
+
+    async def _ensure_ttse_rail_registered(self) -> None:
+        """Build and register TTSERail when missing; else refresh flags from yaml."""
+        if self._instance is None:
+            return
+        if self._ttse_rail is not None:
+            self._sync_ttse_rail_config(self._config_cache)
+            return
+        rail = self._build_ttse_rail(self._config_cache)
+        if rail is None:
+            return
+        await self._instance.register_rail(rail)
+        self._ttse_rail = rail
+        logger.info("[JiuWenSwarmDeepAdapter] TTSERail registered for agent mode")
+
+    async def _unconfigure_ttse_rail(self) -> None:
+        """Unregister TTSERail if it is currently mounted."""
+        rail = self._ttse_rail
+        self._ttse_rail = None
+        if self._instance is None or rail is None:
+            return
+        unregister = getattr(self._instance, "unregister_rail", None)
+        if not callable(unregister):
+            return
+        try:
+            await unregister(rail)
+            logger.info("[JiuWenSwarmDeepAdapter] TTSERail unregistered")
+        except Exception as exc:
+            logger.warning("[JiuWenSwarmDeepAdapter] TTSERail unregister failed: %s", exc)
 
     async def _ensure_active_evolution_rails_registered(self) -> None:
         """Configure, register, and cache single-agent skill evolution rails."""
@@ -8229,8 +9228,8 @@ class JiuWenSwarmDeepAdapter:
             ),
         ]
 
-        # SkillEvolutionRail 不在冷启动时挂载，由 _update_rails_for_mode 按 mode 按需注册/注销
-        # 智能模式下关闭自演进，plan 模式下按配置启用
+        # SkillEvolutionRail / TTSERail 不在冷启动时挂载，由 _update_rails_for_mode
+        # 经 _reconcile_evolution_rails 按配置按需注册/注销
 
         # MemoryRail 不在冷启动时挂载，由 _update_rails_for_mode 按 mode 按需注册/注销
 
@@ -8587,6 +9586,14 @@ class JiuWenSwarmDeepAdapter:
                 review_trigger=evolution_triggers["review_trigger"],
                 signal_trigger=evolution_triggers["signal_trigger"],
             )
+
+        if self._ttse_rail is not None:
+            update_llm = getattr(self._ttse_rail, "update_llm", None)
+            if callable(update_llm):
+                update_llm(
+                    self._model,
+                    self._default_model_name or config.get("model_name", "gpt-4"),
+                )
 
         # Reuse existing SkillUseRail to preserve dynamically loaded skills
         # from activate_package() / load_harness_config().  When agentic
@@ -9102,9 +10109,15 @@ class JiuWenSwarmDeepAdapter:
         lazily by :meth:`ensure_instance`, which the non-chat RPCs that need a
         DeepAgent handle call first.
 
+        A True skip still runs checkpoint setup, env overlay, dotenv, and
+        enterprise config/model merge so the config snapshot
+        (``_config_base_cache``, agent/project/workspace overrides) is
+        populated. It returns before multimodal refresh, skill prebuilt
+        sync, prompt layout, and DeepAgent construction. Do not add more
+        work in front of the skip; put it on the ``ensure_instance`` path.
+
         Returns:
-            True when the caller should return after the cheap config-cache
-            section, leaving ``self._instance`` unset.
+            True when ``create_instance`` should leave ``self._instance`` unset.
         """
         return not self._is_session_scoped_adapter and not self._root_instance_requested
 
@@ -9164,6 +10177,11 @@ class JiuWenSwarmDeepAdapter:
         self._session_instance_mode = mode
         self._session_instance_sub_mode = sub_mode
 
+        bootstrap_request = None
+        if isinstance(config, dict):
+            bootstrap_request = config.get("request")
+        _rid = getattr(bootstrap_request, "request_id", None) or _LLM_TRACE_REQUEST_ID.get() or "?"
+
         await self.set_checkpoint()
         await asyncio.sleep(0)
 
@@ -9192,12 +10210,26 @@ class JiuWenSwarmDeepAdapter:
             try:
                 self._config_base_cache = config_base.copy()
                 self._startup_config_base = config_base.copy()
-                self._refresh_multimodal_configs(config_base)
                 config = config_base.get("react", {}).copy()
                 self._config_cache = config.copy()
                 self._agent_name = self._instance_overrides.get(
                     "agent_name", config.get("agent_name", "main_agent")
                 )
+                self._project_dir = self._instance_overrides.get(
+                    "project_dir", config.get("project_dir")
+                )
+                # Keep constructor-injected tenant workspace by default.
+                # Apply create_instance(config) workspace_dir before skill
+                # prebuilt sync so skills land where this instance will run.
+                configured_workspace = self._instance_overrides.get("workspace_dir")
+                if configured_workspace is not None:
+                    self._workspace_dir = configured_workspace
+
+                if self._skip_own_instance_build():
+                    await asyncio.sleep(0)
+                    return
+
+                self._refresh_multimodal_configs(config_base)
 
                 if (
                     is_skill_prebuilt_tenant(self._agent_id, self._service_id)
@@ -9232,19 +10264,8 @@ class JiuWenSwarmDeepAdapter:
                         for name in (sync_result.prebuilt_skill_dirs or [])
                         if str(name).strip()
                     }
-                self._project_dir = self._instance_overrides.get(
-                    "project_dir", config.get("project_dir")
-                )
-                # Keep constructor-injected tenant workspace by default.
-                # Only override when request explicitly provides workspace_dir.
-                configured_workspace = self._instance_overrides.get("workspace_dir")
-                if configured_workspace is not None:
-                    self._workspace_dir = configured_workspace
                 self._prompt_attachment_loader = PromptAttachmentLoader(self._prompt_attachment_root())
                 self._prompt_attachment_loader.ensure_layout()
-
-                if self._skip_own_instance_build():
-                    return
 
                 self._log_active_model_on_startup(phase=f"create_instance:{mode}")
                 try:
@@ -9304,7 +10325,7 @@ class JiuWenSwarmDeepAdapter:
                     ),
                     sys_operation=sys_operation,
                     language=self._resolve_runtime_language(),
-                    auto_create_workspace=False,
+                    auto_create_workspace=is_enterprise(),
                     trajectory_span_processor=get_trajectory_span_processor(),
                 )
 
@@ -9328,8 +10349,23 @@ class JiuWenSwarmDeepAdapter:
 
                 _apply_llm_io_trace_patch()
 
+                # AGENT_FILE_READ_BACKEND=local：读盘 rail 切本地 sysop；宿主机先建工作区
+                _t_sysop_apply0 = time.monotonic()
+                self._apply_local_sysop_to_all_rails()
+                await self._init_workspace_on_host()
+                self._apply_local_sysop_to_all_rails()
+
                 await asyncio.sleep(0)
                 await self._instance.ensure_initialized()
+                self._apply_local_sysop_to_all_rails()
+                logger.info(
+                    "[SandboxPerf] rail_sysop_bind+ensure_init: request_id=%s agent=%s "
+                    "backend=%s elapsed_ms=%.1f",
+                    _rid,
+                    self._agent_name,
+                    get_agent_file_read_backend(),
+                    (time.monotonic() - _t_sysop_apply0) * 1000,
+                )
                 initial_runtime_workspace = self._project_dir or str(
                     get_default_project_session_workspace_dir()
                 )
@@ -9587,7 +10623,9 @@ class JiuWenSwarmDeepAdapter:
         elif not isinstance(config_base, dict):
             raise TypeError("config_base must be a dict when provided")
         else:
-            config_base = resolve_env_vars(config_base)
+            # Sparse officeclaw snapshots omit template keys (e.g. react.ttse).
+            # Match create_instance so _config_cache keeps the same defaults.
+            config_base = _resolve_instance_config_base(config_base)
 
         live_skill_envs = (
             self._skill_credential_injection_rail.get_skill_envs()
@@ -10228,6 +11266,15 @@ class JiuWenSwarmDeepAdapter:
             or self._evolution_interrupt_rail is not None
         ):
             await self._unconfigure_active_evolution_rails()
+
+        ttse_wrap = {"react": {"ttse": self._resolved_ttse_config()}}
+        if get_ttse_enabled(ttse_wrap):
+            if self._ttse_rail is None:
+                await self._ensure_ttse_rail_registered()
+            else:
+                self._sync_ttse_rail_config(self._config_cache)
+        elif self._ttse_rail is not None:
+            await self._unconfigure_ttse_rail()
 
     @staticmethod
     def _user_interaction_rail_attribute() -> str:
@@ -11196,17 +12243,11 @@ class JiuWenSwarmDeepAdapter:
                 logger.info("[JiuWenSwarmDeepAdapter] SkillTurbo disabled, skipping tool registration")
                 return
 
-            from openjiuwen.core.runner import Runner as RunnerClass
             from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import get_skill_turbo_tools
 
             for tool in get_skill_turbo_tools():
-                try:
-                    RunnerClass.resource_mgr.add_tool(tool)
-                except Exception as e:
-                    if "already exist" not in str(e):
-                        logger.warning("[JiuWenSwarmDeepAdapter] Failed to register skill_turbo tool: %s", e)
-                        continue
-                self._instance.ability_manager.add(tool.card)
+                registered = self._register_shared_tool(tool)
+                self._instance.ability_manager.add(registered.card)
 
             # 注入 adapter 到 StreamEventRail
             if self._stream_event_rail is not None:
@@ -13399,6 +14440,30 @@ class JiuWenSwarmDeepAdapter:
         return self._is_ack_only_dispatch(params) or self._is_interrupt_resume_dispatch(
             params
         )
+
+    def _should_steal_output_lease(self, params: Any, *, req_method: Any = None) -> bool:
+        """Whether a fresh chat.send may take over another host's output lease.
+
+        Exclusive attach is correct for Goal attach, steer/follow_up, HITL
+        resume, proactive recommendation, and team turns. Ordinary user turns
+        must steal so a second Gateway replica can replace an in-flight stream
+        instead of returning runtime.accepted and ending the frontend SSE.
+        """
+        method = getattr(req_method, "value", req_method)
+        if str(method or "") == "command.goal":
+            return False
+        if self._should_inject_into_existing_interaction(params):
+            return False
+        if self._wants_attach_goal(params):
+            return False
+        if not isinstance(params, dict):
+            return True
+        if str(params.get("source") or "").strip() == "proactive_recommendation":
+            return False
+        mode = str(params.get("mode") or "").strip().lower()
+        if mode in {"team", "code.team", "team.plan"}:
+            return False
+        return True
 
     @staticmethod
     def _structured_goal_op_from_request(
@@ -16606,7 +17671,24 @@ class JiuWenSwarmDeepAdapter:
             session_adapter = await self._get_or_create_session_adapter(
                 request.session_id, request=request
             )
-            request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+            # 同流式路径：team 模式控制续接跳过 request-scoped MCP 注册，
+            # 避免与持有生命周期锁的被中断原始请求死锁。
+            from jiuwenswarm.server.runtime.agent_adapter.team_helpers import (
+                is_team_control_continuation,
+            )
+
+            request_mcp = None
+            if not is_team_control_continuation(request, inputs.get("query")):
+                try:
+                    request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+                except McpRegistryChatError as mcp_err:
+                    return AgentResponse(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        ok=False,
+                        payload={"error": str(mcp_err)},
+                        metadata=request.metadata,
+                    )
             try:
                 with bind_active_office_claw_mcp_tools(
                     request_mcp.tool_ids if request_mcp is not None else ()
@@ -16987,7 +18069,13 @@ class JiuWenSwarmDeepAdapter:
                     )
                 )
             else:
-                interaction_stream = await self._instance.attach_output()
+                steal_output = self._should_steal_output_lease(
+                    request.params, req_method=request.req_method
+                )
+                if steal_output:
+                    interaction_stream = await self._instance.attach_output(steal=True)
+                else:
+                    interaction_stream = await self._instance.attach_output()
                 if interaction_stream is not None:
                     await self._instance.send_input(
                         SendInputRequest(
@@ -17289,7 +18377,27 @@ class JiuWenSwarmDeepAdapter:
             session_adapter = await self._get_or_create_session_adapter(
                 request.session_id, request=request
             )
-            request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+            # team 模式控制续接（ask_user/permission 作答）只负责把答案经
+            # interact() 投递给存活的 runtime，自身不执行工具；被中断的原始
+            # 请求仍持有 request-scoped MCP 生命周期锁，此处再注册会与其
+            # 互相等待形成死锁，故跳过注册、沿用原始请求的注册。
+            from jiuwenswarm.server.runtime.agent_adapter.team_helpers import (
+                is_team_control_continuation,
+            )
+
+            request_mcp = None
+            if not is_team_control_continuation(request, inputs.get("query")):
+                try:
+                    request_mcp = await session_adapter.register_request_scoped_office_claw_mcp(request)
+                except McpRegistryChatError as mcp_err:
+                    yield AgentResponseChunk(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        payload={"event_type": "chat.error", "error": str(mcp_err)},
+                        is_complete=True,
+                        metadata=request.metadata or {},
+                    )
+                    return
             try:
                 with bind_active_office_claw_mcp_tools(
                     request_mcp.tool_ids if request_mcp is not None else ()
@@ -17472,7 +18580,11 @@ class JiuWenSwarmDeepAdapter:
                 )
                 team_stream_kwargs = {
                     "config_base": self._config_base_cache,
-                    "sessions_root": resolve_tenant_sessions_dir(workspace_key),
+                    "sessions_root": resolve_tenant_sessions_dir(
+                        workspace_key,
+                        service_id=_tenant_service_id,
+                        agent_id=_tenant_agent_id,
+                    ),
                 }
                 if (
                     evolution_slash_command_name(str(inputs.get("query") or ""))
@@ -18252,7 +19364,13 @@ class JiuWenSwarmDeepAdapter:
                     interaction_stream_abort = False
                     return
             else:
-                interaction_stream = await self._instance.attach_output()
+                steal_output = self._should_steal_output_lease(
+                    request.params, req_method=request.req_method
+                )
+                if steal_output:
+                    interaction_stream = await self._instance.attach_output(steal=True)
+                else:
+                    interaction_stream = await self._instance.attach_output()
                 if interaction_stream is None:
                     async for chunk in _yield_runtime_accepted():
                         yield chunk
@@ -18768,6 +19886,12 @@ class JiuWenSwarmDeepAdapter:
                 )
                 task.add_done_callback(self._on_evolution_watcher_done)
                 self._evolution_watcher_tasks.add(task)
+            if self._ttse_rail is not None:
+                ttse_task = asyncio.create_task(
+                    self._cleanup_ttse_background_tasks(rid, session_id)
+                )
+                ttse_task.add_done_callback(self._on_evolution_watcher_done)
+                self._evolution_watcher_tasks.add(ttse_task)
             if _debug_logger is not None:
                 if run_failure is not None:
                     _debug_logger.end_run(
@@ -19258,6 +20382,27 @@ class JiuWenSwarmDeepAdapter:
                                 "任务执行失败",
                             )
                         return {"event_type": "chat.error", "error": error or "任务执行失败"}
+                    if inner_val == "task_interaction":
+                        # native-harness ask_user interrupts
+                        # surface here without __interaction__ payloads reaching
+                        # the stream. Parse the embedded interrupt result so the
+                        # question card still reaches the frontend.
+                        from jiuwenswarm.server.utils.stream_utils import (
+                            parse_task_interaction_payload,
+                        )
+                        try:
+                            interaction_event = parse_task_interaction_payload(payload)
+                        except Exception:
+                            logger.exception(
+                                "[interface_deep] failed to parse task_interaction payload"
+                            )
+                            interaction_event = None
+                        if interaction_event is not None:
+                            return interaction_event
+                        logger.warning(
+                            "[interface_deep] task_interaction without parsable ask_user payload;"
+                            " no question card could be built"
+                        )
                     # Close the controller_output enum: HITL cards are emitted via
                     # ``__interaction__``; remaining types are control-plane metadata.
                     # Never fall through to ``str(payload)`` → chat.delta (ISSUE #3892).
@@ -20803,6 +21948,24 @@ class JiuWenSwarmDeepAdapter:
                 await _push_status("end", "hidden", "")
             except Exception:
                 pass
+
+    async def _cleanup_ttse_background_tasks(self, rid: str, session_id: str) -> None:
+        """Wait for TTSE background induction without draining approval events."""
+        rail = self._ttse_rail
+        if rail is None:
+            return
+        try:
+            cleanup = getattr(rail, "cleanup_background_tasks", None)
+            if cleanup is not None:
+                await cleanup()
+        except Exception as exc:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] TTSE cleanup failed: request_id=%s "
+                "session_id=%s error=%s",
+                rid,
+                session_id,
+                exc,
+            )
 
     def _on_evolution_watcher_done(self, task: asyncio.Task) -> None:
         """Callback when an evolution watcher task completes.

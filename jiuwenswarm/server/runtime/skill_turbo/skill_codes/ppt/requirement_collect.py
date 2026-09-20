@@ -44,6 +44,32 @@ _EXPLICIT_NO_SEARCH_RE = re.compile(
     r"(不要搜索|不搜索|无需搜索|禁止搜索|不用搜索|无需联网|不要联网)"
 )
 
+# ── 图片意图确定性词表（代码域，不进 prompt）── 对齐 SKILL.md §1.2.E
+# 禁图词最高优先：用户明确不要图 → forbidden
+_FORBIDDEN_IMAGE_RE = re.compile(
+    r"无图版"
+    r"|不(?:要|用|需|加|得|可|许|想)(?:[\u4e00-\u9fff]{0,3}?)"
+    r"(?:图|配图|插图|插画|图片|背景图|封面图|海报|照片|视觉素材)"
+    r"|无(?:需|须|要)(?:[\u4e00-\u9fff]{0,3}?)"
+    r"(?:图|配图|插图|插画|图片)"
+    r"|禁(?:止|用)(?:[\u4e00-\u9fff]{0,3}?)"
+    r"(?:图|配图|插图|插画|图片|背景图|封面图|海报)"
+)
+# 配图意图提示词：用户原文出现这些词 → desired（即使 LLM 采样判 false 也翻正）
+_IMAGE_INTENT_HINT_RE = re.compile(
+    r"画面|配图|插图|插画|背景图|封面图|海报|视觉|意象|组合画面|"
+    r"image|illustration|background|imagery",
+    re.IGNORECASE,
+)
+# 否定前缀：hint 词前 5 字内出现这些词 → forbidden（防止"不要配图"翻正为 desired）
+_NEGATION_PREFIX_RE = re.compile(
+    r"不(?:要|用|需|加|得|可|许|想)|无(?:需|须|要)|禁(?:止|用)|别|勿|免"
+)
+# 内容约束抽取：如"不出现人像""背景必须是森林"
+_IMAGE_CONSTRAINT_RE = re.compile(
+    r"(不(?:出现|要|得有)[^，。、；\n]{0,20}|必须(?:是|有|包含)[^，。、；\n]{0,20})"
+)
+
 _STYLE_LABEL_TO_ID: dict[str, str] = {
     "商务经典": "business-classic",
     "华为": "business-classic",
@@ -75,16 +101,21 @@ _P21_SLOT_SYSTEM_PROMPT = ("""你是 PPT 需求槽位分析助手。从用户消
 
 提取字段：
 - topic: 演示主题（字符串；未知则 ""）
-- page_count: 内容页数（整数；不含封面/结束页，也不含目录/章节等中间结构页；总页数 = page_count + 2 + 中间结构页数；未知则 null）。
+- page_count: 内容页数（整数；不含封面/结束页，也不含目录/章节等中间结构页；默认总页数 = page_count + 2 + 中间结构页数；exclude_cover_ending=true 时总页数 = page_count + 中间结构页数；未知则 null）。
   判断规则：①用户说"生成N页PPT"/"做N页汇报"/"PPT共N页"/"总页数N页"/"总共N页"/"一共N页"/"N页"/"做N页PPT"/"N页以内"/"不超过N页"/"最多N页"/"不大于N页"等未特指内容页的表达 → N 表示总页数：
     - page_count_basis 填 "total"；
-    - 无中间结构页要求：page_count = max(N - 2, 1)；
-    - 用户指定了中间结构页数量 K：page_count = max(N - 2 - K, 1)；
-    - 要求中间结构页但未指定数量：page_count = max(N - 2, 1)，structural_page_count=null；**禁止**自行猜测结构页扣减或试算 ceil（由系统按 outline-planner 反推）。
-  ②用户明确说"N个内容页"/"N页正文"，或正在回答"需要多少页内容页"时 → page_count = N，page_count_basis 填 "content"（中间结构页另行添加，不占此配额）。
-  示例："10页以内"→8/total；"总页数严格为8页"→6/total；"8页"→6/total；"做8页PPT"→6/total；"共7页"+要求目录页→5/total（只扣封面结束）；"8页PPT"+3个章节页→3/total；"8个内容页"+章节页→8/content
+    - exclude_cover_ending=false（默认）：无中间结构页要求 → page_count = max(N - 2, 1)；用户指定中间结构页数量 K → page_count = max(N - 2 - K, 1)；要求中间结构页但未指定数量 → page_count = max(N - 2, 1)，structural_page_count=null；**禁止**自行猜测结构页扣减或试算 ceil（由系统按 outline-planner 反推）。
+    - exclude_cover_ending=true：无中间结构页要求 → page_count = N；用户指定中间结构页数量 K → page_count = max(N - K, 1)；要求中间结构页但未指定数量 → page_count = N，structural_page_count=null（系统反推）。
+  ②用户明确说"N个内容页"/"N页正文"，或正在回答"需要多少页内容页"时 → page_count = N，page_count_basis 填 "content"（中间结构页另行添加，不占此配额；exclude_cover_ending 不影响此口径）。
+  示例："10页以内"→8/total；"总页数严格为8页"→6/total；"8页"→6/total；"做8页PPT"→6/total；"共7页"+要求目录页→5/total（只扣封面结束）；"8页PPT"+3个章节页→3/total；"8个内容页"+章节页→8/content；"做8页PPT，不要封面和结束页"→8/total + exclude_cover_ending=true
 - page_count_basis: "total"（规则①）/ "content"（规则②）/ ""（未知）
 - page_count_user_specified: 用户原文是否明确给出页数（含总页数/内容页表达）；有则为 true，否则 false
+- page_structure_mode: "default"（默认）或 "explicit_sequence"。用户给出有序逐页清单（如"第1页封面、第2页背景…"）时填 explicit_sequence；否则 default。explicit_sequence 时清单即总页数与顺序权威，不得自动加封面/结束/目录/章节；此时 exclude_cover_ending 填 false，structural_page_request 填 "none"；total_pages 填清单条目数，page_count 填清单中非结构页（非封面/目录/章节/结束）的项数。
+- exclude_cover_ending: 是否不生成封面页和结束页。布尔；默认 false。
+  仅 page_structure_mode=default 且用户**明确否定**首尾页（如"不要封面和结束页""不需要首尾页/致谢页"）时为 true；沉默不推断。
+  用户单独否定其中一页并明确保留另一页时，尊重表述保留那一页，本字段仍为 false。
+  page_structure_mode=explicit_sequence 时本字段不适用，填 false。
+- total_pages: 仅 page_structure_mode=explicit_sequence 时必填（清单条目数）；default 模式填 null（由系统按 page_count 公式计算）。
 - audience: 目标受众（字符串；未知则 ""）
 - presentation_purpose: 汇报目的，如「工作汇报」「产品展示」「教学分享」「auto」；未知则 ""
 - style_id: 用户明确提及风格时填写：business-classic / tech-minimal / elegant-narrative / industrial-tech / custom；“自由发挥”统一填写 custom；未知则 ""
@@ -121,14 +152,17 @@ _P21_SLOT_SYSTEM_PROMPT = ("""你是 PPT 需求槽位分析助手。从用户消
 4. 不要输出 search_mode / source_type。
 5. topic 缺失时由下游 LLM 生成 4 个主题候选并 ask 用户选择，不要生成询问文案。
 6. pack_dir 存在时 style_id 填 "custom"（模板包优先于预设风格），need_ask_style 设 false。
-7. page_count 为内容页数（不含封面/结束页，也不含目录/章节等中间结构页），总页数 = page_count + 2 + 中间结构页数。
-   用户说"生成N页PPT"等未特指内容页的表达 → N 为总页数：page_count_basis="total"；无结构页或未指定结构数量时 page_count=max(N-2,1)；指定结构数量 K 时 page_count=max(N-2-K,1)；未指定结构数量时禁止自行扣减结构页（系统反推）。
+7. page_count 为内容页数（不含封面/结束页，也不含目录/章节等中间结构页）。exclude_cover_ending=false 时总页数 = page_count + 2 + 中间结构页数；true 时总页数 = page_count + 中间结构页数。
+   用户说"生成N页PPT"等未特指内容页的表达 → N 为总页数：page_count_basis="total"；exclude=false 且无结构页或未指定结构数量时 page_count=max(N-2,1)；exclude=true 且无结构页或未指定结构数量时 page_count=N；指定结构数量 K 时按是否 exclude 扣 2 或 0 再扣 K；未指定结构数量时禁止自行扣减结构页（系统反推）。
    用户明确说"N个内容页"/"N页正文"或正在回答"需要多少页内容页"时，page_count=N，page_count_basis="content"。
 8. style_constraints / user_dimensions / user_structure 不进 outline.md，只供下游透传。
+9. exclude_cover_ending 仅从明确否定首尾的原话提取；不得因“简洁/少页”等理由自行置 true。
+10. page_structure_mode=explicit_sequence 时以清单为准：exclude_cover_ending=false，structural_page_request="none"。
 
 必须只输出 JSON："""
     + '{"topic":"","page_count":null,"page_count_basis":"",'
-    + '"page_count_user_specified":false,'
+    + '"page_count_user_specified":false,"page_structure_mode":"default",'
+    + '"exclude_cover_ending":false,"total_pages":null,'
     + '"audience":"","presentation_purpose":"",'
     + '"style_id":"","style_description":"","style_constraints":"",'
     + '"user_dimensions":[],"user_structure":"","notes_requirements":"",'
@@ -179,7 +213,12 @@ research_depth 规则（与 search_mode、page_count 联动；L1/L2/L3 含义见
 - page_count 在 8~15 → L2
 - 其余（含 auto 且页数 ≤7）→ L1
 
-need_imagegen 规则：用户 query 明确要求 AI 生图/生成配图 → true，否则 → false
+need_imagegen 规则（对齐 skill SKILL.md §1.2.E 图片意图归一：本地图片之外是否需要 ai 兜底来源）：
+- 用户提出配图要求 → true：明确要求 AI 生图/生成配图/插图/插画；或描述了希望出现的
+  具体画面/场景/元素（如"画面包含X、Y、Z""X组合画面""要配风电场景图"）；
+  或对画面内容有具体约束（如"不出现人像""背景必须是森林"）
+- 仅泛泛的主题词或风格词（如"科技风""简约大气"），未提出任何配图要求 → false
+- 用户未提配图要求时不得因生图工具存在而置 true
 
 必须只输出单行 JSON，四个字段均必填且取值必须在枚举内；禁止 markdown 围栏、禁止前后附加说明：
 {"search_mode":"auto","source_type":"topic","research_depth":"L2","need_imagegen":false}"""
@@ -425,6 +464,55 @@ def _require_batch_fields_collected(inputs: dict[str, Any]) -> None:
     raise RequirementCollectError(f"需求收集未完成：缺少 {names}")
 
 
+def _coerce_bool_flag(value: Any, *, default: bool = False) -> bool:
+    """Normalize LLM/JSON bool-ish values for exclude_cover_ending etc."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no", ""):
+            return False
+    return default
+
+
+def _normalize_page_structure_mode(value: Any) -> str:
+    mode = str(value or "default").strip().lower()
+    if mode not in ("default", "explicit_sequence"):
+        return "default"
+    return mode
+
+
+def _apply_structure_mode_guards(inputs: dict[str, Any]) -> None:
+    """explicit_sequence：exclude 不适用；不驱动 mid（对齐 outline-planner）。"""
+    if str(inputs.get("page_structure_mode") or "default") != "explicit_sequence":
+        return
+    inputs["exclude_cover_ending"] = False
+    inputs["structural_page_request"] = "none"
+    inputs["structural_page_count"] = None
+
+
+def _sync_target_total_pages(inputs: dict[str, Any]) -> None:
+    """按 pptx-craft 公式写入目标 total_pages（P4 消费，禁止下游猜）。"""
+    page_count = inputs.get("page_count")
+    if not isinstance(page_count, int) or page_count <= 0:
+        return
+    mode = str(inputs.get("page_structure_mode") or "default").strip().lower()
+    if mode == "explicit_sequence":
+        # 清单条目数应由上游槽位给出；本函数不得替 explicit 推算
+        return
+    mid = PptCommon.resolve_mid_structural_page_count(
+        page_count,
+        inputs.get("structural_page_request"),
+        inputs.get("structural_page_count"),
+    )
+    cover_ending = 0 if bool(inputs.get("exclude_cover_ending")) else 2
+    inputs["total_pages"] = page_count + cover_ending + mid
+
+
 def _prune_satisfied_batch_missing_fields(inputs: dict[str, Any]) -> None:
     _reconcile_missing_fields(inputs)
 
@@ -580,7 +668,32 @@ def _merge_slot_payload(
     else:
         inputs.setdefault("structural_page_count", None)
 
+    # pptx-craft §1.2：page_structure_mode / exclude_cover_ending
+    if "page_structure_mode" in payload:
+        inputs["page_structure_mode"] = _normalize_page_structure_mode(
+            payload.get("page_structure_mode")
+        )
+    else:
+        inputs.setdefault("page_structure_mode", "default")
+
+    if "exclude_cover_ending" in payload:
+        inputs["exclude_cover_ending"] = _coerce_bool_flag(
+            payload.get("exclude_cover_ending"), default=False
+        )
+    else:
+        inputs.setdefault("exclude_cover_ending", False)
+
+    # explicit：total_pages = 清单条目数（由 LLM 填）
+    if str(inputs.get("page_structure_mode")) == "explicit_sequence":
+        tp = payload.get("total_pages")
+        if isinstance(tp, int) and tp > 0:
+            inputs["total_pages"] = tp
+        elif isinstance(tp, float) and tp > 0 and tp == int(tp):
+            inputs["total_pages"] = int(tp)
+
+    _apply_structure_mode_guards(inputs)
     _normalize_total_derived_page_count(inputs, payload)
+    _sync_target_total_pages(inputs)
 
     need_ask_style = payload.get("need_ask_style")
     if isinstance(need_ask_style, bool) and not inputs.get("pack_dir"):
@@ -601,7 +714,10 @@ def _normalize_total_derived_page_count(
     """总页数表达 + 未指定结构数量：由代码按 outline-planner 反推 page_count。
 
     LLM 只填 max(N-2,1)，禁止在 prompt 里试算 ceil，避免鸡生蛋。
+    explicit_sequence 不适用本归一。
     """
+    if str(inputs.get("page_structure_mode") or "default") == "explicit_sequence":
+        return
     basis = str(payload.get("page_count_basis") or "").strip().lower()
     if basis != "total":
         return
@@ -611,7 +727,7 @@ def _normalize_total_derived_page_count(
     spr = str(inputs.get("structural_page_request") or "none").strip().lower()
     spc = inputs.get("structural_page_count")
     if isinstance(spc, int) and spc > 0:
-        # 指定 K 时 LLM 已按 max(N-2-K,1) 填好
+        # 指定 K 时 LLM 已按 max(N-2-K,1) 或 exclude 口径填好
         return
     if spr in ("", "none"):
         return
@@ -817,6 +933,46 @@ def _parse_derive_params_response(raw: str) -> dict[str, str]:
     }
 
 
+def _extract_image_constraints(user_text: str) -> list[str]:
+    """从用户原文抽取图片内容约束（如"不出现人像""背景必须是森林"）。"""
+    if not user_text:
+        return []
+    constraints: list[str] = []
+    for m in _IMAGE_CONSTRAINT_RE.finditer(user_text):
+        s = m.group(1).strip()
+        if s and s not in constraints:
+            constraints.append(s)
+    return constraints
+
+
+def _resolve_image_mode(
+    user_text: str, llm_need_imagegen: bool
+) -> tuple[str, str]:
+    """意图归一：forbidden_keyword > llm > keyword_fallback（带否定守卫）。
+
+    返回 (mode, decision_source)。mode ∈ {desired, forbidden, none}。
+    对齐 SKILL.md §1.2.E：用户提出配图要求 → desired；禁图 → forbidden；无诉求 → none。
+    """
+    if _FORBIDDEN_IMAGE_RE.search(user_text):
+        return "forbidden", "forbidden_keyword"
+    if llm_need_imagegen:
+        return "desired", "llm"
+    # keyword_fallback：hint 命中但前 5 字内有否定前缀 → forbidden，否则 desired
+    any_hint = False
+    any_non_negated = False
+    for m in _IMAGE_INTENT_HINT_RE.finditer(user_text):
+        any_hint = True
+        prefix = user_text[max(0, m.start() - 5):m.start()]
+        if not _NEGATION_PREFIX_RE.search(prefix):
+            any_non_negated = True
+            break
+    if any_hint:
+        if any_non_negated:
+            return "desired", "keyword_fallback"
+        return "forbidden", "forbidden_keyword"
+    return "none", "llm"
+
+
 def _extract_reference_urls(text: str) -> list[str]:
     if not text:
         return []
@@ -925,6 +1081,7 @@ def _apply_answer_item(
         if count is not None:
             inputs["page_count"] = count
             inputs["page_count_user_specified"] = True
+            _sync_target_total_pages(inputs)
     elif field == "audience":
         inputs["audience"] = _audience_from_label(label, other_text)
     elif field == "presentation_purpose":
@@ -1258,6 +1415,7 @@ async def _llm_default_batch_fields(
         # 超时/空答兜底视为「页数收集已完成」，否则 HITL resume 会因
         # page_count_user_specified=False 再次进入 P2.2，形成页数↔风格死循环。
         inputs["page_count_user_specified"] = True
+        _sync_target_total_pages(inputs)
     if "audience" in missing_fields:
         audience = payload.get("audience")
         inputs["audience"] = (
@@ -1666,41 +1824,43 @@ class P24DeriveParamsNode(PlanNode):
         derived = await _derive_params_via_llm(self, inputs)
         inputs.update(derived)
 
-        # 写 imagegen_status.json（供 P6.5 读取）
-        need_imagegen = derived.get("need_imagegen", False)
+        # 写 image_requirements.json（意图信号；对齐 SKILL.md §1.2.E）
+        # 能力信号 imagegen_status.json 归 P6.5（has_tool 探测），不在 P2 写
+        user_text = _collect_user_text(inputs)
         output_dir = str(inputs.get("output_dir", "")).strip()
-        if need_imagegen and output_dir:
+        image_mode, decision_source = _resolve_image_mode(
+            user_text, derived.get("need_imagegen", False)
+        )
+        # 回写权威值：P4.3 content_plan._has_no_image_source 与 P6.5 读同一信号
+        inputs["need_imagegen"] = image_mode == "desired"
+        if decision_source == "keyword_fallback":
+            logger.info(
+                "[P2.4] need_imagegen 由关键词兜底翻正"
+                "（LLM 采样判定与原文视觉诉求冲突）"
+            )
+        if output_dir:
             try:
                 content = json.dumps(
-                    {"supported": True},
+                    {
+                        "mode": image_mode,
+                        "decision_source": decision_source,
+                        "constraints": _extract_image_constraints(user_text),
+                    },
                     ensure_ascii=False,
                 )
                 await PptCommon.write_file(
-                    self, f"{output_dir}/imagegen_status.json",
-                    content, label="imagegen_status",
+                    self, f"{output_dir}/image_requirements.json",
+                    content, label="image_requirements",
                     error_type=RequirementCollectError,
                 )
-                logger.info("[P2.4] imagegen_status.json 已写入 (supported=true)")
+                logger.info(
+                    "[P2.4] image_requirements.json 已写入 (mode=%s, source=%s)",
+                    image_mode, decision_source,
+                )
             except Exception as e:
                 if isinstance(e, AbortError):
                     raise
-                logger.warning("[P2.4] 写 imagegen_status.json 失败: %s", e)
-        elif not need_imagegen and output_dir:
-            try:
-                content = json.dumps(
-                    {"supported": False},
-                    ensure_ascii=False,
-                )
-                await PptCommon.write_file(
-                    self, f"{output_dir}/imagegen_status.json",
-                    content, label="imagegen_status",
-                    error_type=RequirementCollectError,
-                )
-                logger.info("[P2.4] imagegen_status.json 已写入 (supported=false)")
-            except Exception as e:
-                if isinstance(e, AbortError):
-                    raise
-                logger.warning("[P2.4] 写 imagegen_status.json 失败: %s", e)
+                logger.warning("[P2.4] 写 image_requirements.json 失败: %s", e)
 
         return inputs
 
@@ -1795,7 +1955,7 @@ class RequirementCollectNode(PlanNode):
     def _ensure_image_vars(self, ctx: dict[str, Any]) -> None:
         """图片变量兜底：image_paths 空数组 + image_sources 默认 local。
 
-        ai 源由 P6.5 读取 imagegen_status.json 动态启用，不在此处判断。
+        ai 源由 P6.5 读取 image_requirements.json（意图）+ has_tool 探测（能力）双信号启用，不在此处判断。
         """
         ctx.setdefault("image_paths", [])
         ctx.setdefault("image_sources", ["local"])
@@ -1867,6 +2027,21 @@ class RequirementCollectNode(PlanNode):
             else:
                 ctx.setdefault("structural_page_count", None)
 
+            mode = _normalize_page_structure_mode(pre_slots.get("page_structure_mode"))
+            ctx["page_structure_mode"] = mode
+            if "exclude_cover_ending" in pre_slots:
+                ctx["exclude_cover_ending"] = _coerce_bool_flag(
+                    pre_slots.get("exclude_cover_ending"), default=False
+                )
+            else:
+                ctx.setdefault("exclude_cover_ending", False)
+            if mode == "explicit_sequence":
+                tp = pre_slots.get("total_pages")
+                if isinstance(tp, int) and tp > 0:
+                    ctx["total_pages"] = tp
+            _apply_structure_mode_guards(ctx)
+            _sync_target_total_pages(ctx)
+
             # 快捷路径仍跑一次轻量 P2.1，补齐 constraints/dims/structure
             await self.execute_subplan(self.sub_plans[0], ctx)
             await self.skip_subplan(self.sub_plans[1], ctx, message="slots pre-filled from query")
@@ -1907,6 +2082,23 @@ class RequirementCollectNode(PlanNode):
                     ctx["structural_page_count"] = _spc
                 else:
                     ctx.setdefault("structural_page_count", None)
+            if "page_structure_mode" not in ctx and "page_structure_mode" in pre_slots:
+                ctx["page_structure_mode"] = _normalize_page_structure_mode(
+                    pre_slots.get("page_structure_mode")
+                )
+            if "exclude_cover_ending" not in ctx and "exclude_cover_ending" in pre_slots:
+                ctx["exclude_cover_ending"] = _coerce_bool_flag(
+                    pre_slots.get("exclude_cover_ending"), default=False
+                )
+            if (
+                str(ctx.get("page_structure_mode") or "") == "explicit_sequence"
+                and not (isinstance(ctx.get("total_pages"), int) and ctx["total_pages"] > 0)
+            ):
+                tp = pre_slots.get("total_pages")
+                if isinstance(tp, int) and tp > 0:
+                    ctx["total_pages"] = tp
+            _apply_structure_mode_guards(ctx)
+            _sync_target_total_pages(ctx)
 
         if _p21_should_skip(ctx):
             _reconcile_missing_fields(ctx)

@@ -98,6 +98,7 @@ main() {
     read_env_from_file "${CUSTOM_ENV_FILE}" "DEPLOY_VARS"
     parse_args "$@"
     link_mtls_check
+    set_user_context
     detect_os
     check_dependency
     process_${CMD}

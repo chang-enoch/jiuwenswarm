@@ -3164,7 +3164,7 @@ class MessageHandler(FileTransferMixin, ABC):
         try:
             if resource_identity_invalid:
                 raise A2AOutboundError(A2AOutboundErrorCode.AGENT_NOT_AUTHORIZED)
-            if is_enterprise() and method != A2A_TOOL_FIND_AGENTS and not source_user_id:
+            if is_enterprise() and not source_user_id:
                 raise A2AOutboundError(A2AOutboundErrorCode.USER_IDENTITY_REQUIRED)
             if manager is None:
                 raise A2AOutboundError(A2AOutboundErrorCode.MANAGER_UNAVAILABLE)
@@ -3182,6 +3182,8 @@ class MessageHandler(FileTransferMixin, ABC):
                 }
                 if source_resource_id:
                     call_params["source_resource_id"] = source_resource_id
+                if source_user_id:
+                    call_params["source_user_id"] = source_user_id
                 result = await manager.outbound_find_agents(**call_params)
             elif method == A2A_TOOL_DISPATCH_TASK:
                 call_params = {
@@ -5199,6 +5201,7 @@ class MessageHandler(FileTransferMixin, ABC):
             payload={
                 "event_type": "chat.processing_status",
                 "session_id": session_id,
+                "request_id": request_id,
                 "is_processing": is_processing,
                 "is_complete": not is_processing
             },

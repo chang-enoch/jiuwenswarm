@@ -136,6 +136,9 @@ class OutlineReviewNode(PlanNode):
                 structural_page_request=str(inputs.get("structural_page_request") or "none"),
                 structural_page_count=inputs.get("structural_page_count"),
                 expand_page_mode=PptCommon.is_expand_page_mode(inputs),
+                page_structure_mode=str(inputs.get("page_structure_mode") or "default"),
+                exclude_cover_ending=bool(inputs.get("exclude_cover_ending")),
+                total_pages=inputs.get("total_pages"),
             )
             _validate_notes_leakage(text)
             return ""
@@ -174,19 +177,9 @@ class OutlineReviewNode(PlanNode):
         }
 
     async def _read_outline(self, outline_path: str) -> str:
-        if not outline_path:
-            return ""
-        if not self.has_tool("read_file"):
-            logger.warning("[P5] read_file 工具不可用，无法读取 outline.md")
-            return ""
-        try:
-            result = await self.call_tool("read_file", file_path=outline_path)
-            return PptCommon.parse_tool_file_content(result)
-        except Exception as e:
-            if isinstance(e, AbortError):
-                raise
-            logger.warning("[P5] 读取 outline.md 失败: %s", e)
-            return ""
+        return await PptCommon.read_file_with_retry(
+            self, outline_path, log_prefix="[P5]"
+        )
 
     async def _write_outline(self, outline_path: str, content: str) -> None:
         if not self.has_tool("write_file"):

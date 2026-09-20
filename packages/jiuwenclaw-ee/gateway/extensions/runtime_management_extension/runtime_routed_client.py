@@ -20,6 +20,7 @@ from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 from jiuwenswarm.gateway.routing.agent_client import AgentServerClient
 from jiuwenswarm.gateway.routing.http_agent_client import HttpSseAgentServerClient
 
+from .agent_authorization import authorize_agent
 from .invoke_ids import apply_invoke_ids_to_envelope
 from .session_route_client import (
     FatalRouteError,
@@ -119,7 +120,11 @@ def _default_http_base() -> str:
     return f"http://{host}:{port}"
 
 
-def identity_from_envelope(envelope: E2AEnvelope) -> tuple[str, str, str, str, str | None]:
+def identity_from_envelope(
+    envelope: E2AEnvelope,
+    *,
+    authorized_identity: tuple[str, str, str] | None = None,
+) -> tuple[str, str, str, str, str | None]:
     """返回 ``session_id, group_id, bot_id, request_id, user_id``。"""
     params = envelope.params if isinstance(envelope.params, dict) else {}
     ctx = envelope.channel_context if isinstance(envelope.channel_context, dict) else {}
@@ -148,6 +153,9 @@ def identity_from_envelope(envelope: E2AEnvelope) -> tuple[str, str, str, str, s
         group_id = "default"
     if not bot_id:
         bot_id = "default"
+    # 授权身份必须在合成 session key 前生效，不能仅覆盖最终路由参数。
+    if authorized_identity is not None:
+        group_id, bot_id, user_id = authorized_identity
     session_id = _first_text(envelope.session_id, params.get("session_id"))
     if not session_id and group_id and bot_id:
         session_id = f"{group_id}:{bot_id}:{user_id or '_'}"
@@ -188,6 +196,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         self._pod_clients: dict[str, HttpSseAgentServerClient] = {}
         self._pod_connect_lock = asyncio.Lock()
         self._rpc_origins: dict[tuple[str, str], str] = {}
+        self._drop_tasks: set[asyncio.Task[None]] = set()
 
     def set_server_push_handler(
         self, handler: Callable[[dict[str, Any]], Awaitable[None]] | None
@@ -217,11 +226,16 @@ class RuntimeRoutedAgentClient(AgentServerClient):
     async def _ensure_pod_push(self, base_url: str) -> None:
         if self._on_server_push is None:
             return
+        stale: HttpSseAgentServerClient | None = None
         async with self._pod_connect_lock:
             self._ensure_connected()
             client = self._pod_clients.get(base_url)
+            # Fallback if push-done drop hasn't run yet (same IP reused).
+            if client is not None and not getattr(client, "_running", True):
+                stale = self._pod_clients.pop(base_url)
+                client = None
             if client is None:
-                client = HttpSseAgentServerClient()
+                client = HttpSseAgentServerClient(retry_push_connect=False)
                 client.set_server_push_handler(
                     lambda wire: self._handle_pod_push(base_url, wire)
                 )
@@ -232,7 +246,56 @@ class RuntimeRoutedAgentClient(AgentServerClient):
                     await client.disconnect()
                     raise
                 self._pod_clients[base_url] = client
+                client.add_push_done_callback(
+                    lambda _task, url=base_url, bound=client: self._schedule_drop_pod_client(
+                        url, bound
+                    )
+                )
+        if stale is not None:
+            try:
+                await stale.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RuntimeRouted] 断开旧 Pod 推送客户端失败: %s (%s)",
+                    base_url,
+                    exc,
+                )
         await client.wait_push_ready()
+
+    def _schedule_drop_pod_client(
+        self, base_url: str, client: HttpSseAgentServerClient
+    ) -> None:
+        if not self._connected:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._drop_pod_client(base_url, client),
+                name="runtime-drop-pod-push",
+            )
+        except RuntimeError:
+            return
+        self._drop_tasks.add(task)
+        task.add_done_callback(self._drop_tasks.discard)
+
+    async def _drop_pod_client(
+        self, base_url: str, client: HttpSseAgentServerClient
+    ) -> None:
+        async with self._pod_connect_lock:
+            if self._pod_clients.get(base_url) is not client:
+                return
+            self._pod_clients.pop(base_url, None)
+        logger.warning(
+            "[RuntimeRouted] 推送循环已结束，丢弃客户端: %s",
+            base_url,
+        )
+        try:
+            await client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RuntimeRouted] 断开旧 Pod 推送客户端失败: %s (%s)",
+                base_url,
+                exc,
+            )
 
     async def connect(self, uri: str) -> None:
         _ = uri
@@ -248,6 +311,10 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         async with self._pod_connect_lock:
             clients = list(self._pod_clients.values())
             self._pod_clients.clear()
+        drop_tasks = list(self._drop_tasks)
+        self._drop_tasks.clear()
+        if drop_tasks:
+            await asyncio.gather(*drop_tasks, return_exceptions=True)
         results = await asyncio.gather(
             *(client.disconnect() for client in clients),
             return_exceptions=True,
@@ -281,6 +348,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
 
     async def send_request(self, envelope: E2AEnvelope) -> AgentResponse:
         self._ensure_connected()
+        authorized_identity = await authorize_agent(envelope)
         if envelope.method == "acp.tool_response":
             params = envelope.params or {}
             key = (
@@ -298,7 +366,9 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         if _is_routeless_envelope(envelope):
             result = await self._http.send_request(envelope, base_url=_default_http_base())
             return result
-        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(envelope)
+        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(
+            envelope, authorized_identity=authorized_identity,
+        )
         base_url, route_id = await self._route_with_retry(
             session_id=session_id,
             group_id=group_id,
@@ -333,6 +403,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         self, envelope: E2AEnvelope
     ) -> AsyncIterator[AgentResponseChunk]:
         self._ensure_connected()
+        authorized_identity = await authorize_agent(envelope)
         if _is_heartbeat_envelope(envelope):
             yield AgentResponseChunk(
                 request_id=str(envelope.request_id or ""),
@@ -349,7 +420,9 @@ class RuntimeRoutedAgentClient(AgentServerClient):
             ):
                 yield chunk
             return
-        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(envelope)
+        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(
+            envelope, authorized_identity=authorized_identity,
+        )
         base_url, route_id = await self._route_with_retry(
             session_id=session_id,
             group_id=group_id,

@@ -23,7 +23,8 @@ from openjiuwen.agent_teams.observability import (
     init_observability,
     shutdown_observability,
 )
-from openjiuwen.agent_teams.observability.rail import ObservabilityRail
+from openjiuwen.agent_teams.observability.rail import TeamObservabilityRail
+from openjiuwen.harness.observability.rail import AgentObservabilityRail
 from openjiuwen.agent_teams.schema.blueprint import TeamAgentSpec
 from openjiuwen.agent_teams.schema.team import TeamRole
 from openjiuwen.core.foundation.llm import AssistantMessage, ToolCall, UsageMetadata
@@ -32,7 +33,6 @@ from openjiuwen.core.runner import Runner
 from openjiuwen.core.runner.callback import LLMCallEvents, ToolCallEvents
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackContext,
-    AgentCallbackEvent,
     TaskIterationInputs,
 )
 
@@ -153,15 +153,9 @@ async def test_code_agent_tree_keeps_core_spans_and_adds_rich_attributes(
     )
     assert handle is not None
 
-    rail = ObservabilityRail()
-    # The facade delegates to its sub-rails only through the event map
-    # (get_callbacks); calling before_task_iteration directly lands on the
-    # no-op DeepAgentRail base, so drive it the way production dispatch does.
-    rail_callbacks = rail.get_callbacks()
-
-    async def fire(event: AgentCallbackEvent, ctx: AgentCallbackContext) -> None:
-        await rail_callbacks[event](ctx)
-
+    # ObservabilityRail is now a facade whose hooks live on the inner rails.
+    team_rail = TeamObservabilityRail()
+    agent_rail = AgentObservabilityRail()
     inputs = TaskIterationInputs(
         iteration=1,
         loop_event=None,
@@ -174,7 +168,11 @@ async def test_code_agent_tree_keeps_core_spans_and_adds_rich_attributes(
         role=TeamRole.LEADER,
         deep_config=SimpleNamespace(enable_task_loop=True),
     )
-    context = AgentCallbackContext(agent=agent, inputs=inputs)
+    context = AgentCallbackContext(
+        agent=agent,
+        inputs=inputs,
+        session=SimpleNamespace(get_session_id=lambda: "session-code"),
+    )
     business_result = SimpleNamespace(
         content="sunny",
         finish_reason="stop",
@@ -188,7 +186,8 @@ async def test_code_agent_tree_keeps_core_spans_and_adds_rich_attributes(
         ),
     )
     try:
-        await fire(AgentCallbackEvent.BEFORE_TASK_ITERATION, context)
+        await team_rail.before_task_iteration(context)
+        await agent_rail.before_task_iteration(context)
         await fusion_env.framework.trigger(
             LLMCallEvents.LLM_INVOKE_INPUT,
             messages=[{"role": "user", "content": "weather in Paris"}],
@@ -214,7 +213,8 @@ async def test_code_agent_tree_keeps_core_spans_and_adds_rich_attributes(
             result=business_result,
         )
         inputs.result = {"output": "sunny"}
-        await fire(AgentCallbackEvent.AFTER_TASK_ITERATION, context)
+        await team_rail.after_task_iteration(context)
+        await agent_rail.after_task_iteration(context)
     finally:
         agent_observability.close_agent_run_span(
             handle,
@@ -498,16 +498,7 @@ async def test_real_team_runner_uses_same_provider_and_has_no_orphans(
     spans = list(fusion_env.exporter.get_finished_spans())
     gateway_spans = [span for span in spans if span.name == "channel.request"]
     team_spans = [span for span in spans if span.name == f"team.{team_name}"]
-    agent_spans = [
-        span
-        for span in spans
-        if span.name.startswith("agent.") and ".task_iteration." in span.name
-    ]
-    react_spans = [
-        span
-        for span in spans
-        if span.name.startswith("agent.") and ".react_iteration." in span.name
-    ]
+    agent_spans = [span for span in spans if span.name.startswith("agent.")]
     member_spans = [span for span in spans if span.name.startswith("member.")]
     task_spans = [span for span in spans if span.name.startswith("task.")]
     message_spans = [span for span in spans if span.name.startswith("msg.")]
@@ -520,10 +511,10 @@ async def test_real_team_runner_uses_same_provider_and_has_no_orphans(
 
     assert [span.name for span in gateway_spans] == ["channel.request"]
     assert [span.name for span in team_spans] == [f"team.{team_name}"]
-    assert len(agent_spans) == 1
-    # One react step per physical model request (4 stream calls here).
-    assert len(react_spans) == 4
-    assert len({span.context.span_id for span in react_spans}) == 4
+    # Agent-core now opens one agent.* span per iteration/invoke, not a single
+    # fused agent span for the whole team run.
+    assert agent_spans
+    assert all(span.name.startswith("agent.leader.") for span in agent_spans)
     assert [span.name for span in member_spans].count("member.observer.spawned") == 1
     assert [span.name for span in task_spans].count("task.team-task-1") == 1
     assert [span.name for span in task_spans].count("task.team-task-1.created") == 1
@@ -578,8 +569,15 @@ async def test_real_team_runner_uses_same_provider_and_has_no_orphans(
     assert task_root.parent.span_id == team_span_id
     assert task_created.parent.span_id == task_root.context.span_id
     assert all(span.parent.span_id == team_span_id for span in message_spans)
-    assert all(span.parent.span_id == team_span_id for span in agent_spans)
-    agent_ids = {span.context.span_id for span in agent_spans + react_spans}
+    agent_ids = {span.context.span_id for span in agent_spans}
+    assert all(
+        span.parent is not None
+        and (
+            span.parent.span_id == team_span_id
+            or span.parent.span_id in agent_ids
+        )
+        for span in agent_spans
+    )
     assert all(span.parent.span_id in agent_ids for span in llm_spans + tool_spans)
     _assert_parent_chain(spans)
     _assert_no_duplicate_enterprise_spans(spans)

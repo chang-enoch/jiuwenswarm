@@ -1113,8 +1113,11 @@ def _extract_questions_from_value(value_obj: Any) -> list | None:
 
     # 2. questions embedded in tool_args (StructuredAskUserRail path)
     # ToolCallInterruptRequest.tool_args preserves the original tool call
-    # arguments, including the `questions` parameter.
+    # arguments, including the `questions` parameter. task_interaction 载荷
+    # 到达时值已是 model_dump 的 dict,tool_args 是键而非属性。
     tool_args = getattr(value_obj, 'tool_args', None)
+    if tool_args is None and isinstance(value_obj, dict):
+        tool_args = value_obj.get('tool_args')
     if tool_args is not None:
         if isinstance(tool_args, str):
             try:

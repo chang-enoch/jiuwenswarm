@@ -42,6 +42,8 @@ from jiuwenswarm.server.runtime.session.session_history import (
 from jiuwenswarm.server.runtime.session.session_manager import SessionManager
 from jiuwenswarm.server.runtime.session.permission_response_ledger import (
     PermissionResponseLedger,
+    reset_team_permission_resume_landed,
+    settle_permission_reservation,
 )
 from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
 from jiuwenswarm.server.runtime.skill.workspace_provider import SkillWorkspaceProvider
@@ -108,6 +110,19 @@ def _permission_response_key(request: AgentRequest) -> str | None:
     if not isinstance(request_id, str):
         return None
     return request_id or None
+
+
+def _is_team_permission_interactive_resume(
+    request: AgentRequest,
+    inputs: dict[str, Any],
+) -> bool:
+    """Return whether this request is a Team InteractiveInput permission click."""
+    params = request.params if isinstance(request.params, dict) else None
+    if not is_team_params(params):
+        return False
+    from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+
+    return isinstance(inputs.get("query"), InteractiveInput)
 
 
 def _duplicate_permission_response(request: AgentRequest) -> AgentResponse:
@@ -191,6 +206,15 @@ def _should_record_user_history(params: Any) -> bool:
     if is_interrupt_resume_payload(params):
         return False
     return str(params.get("source") or "") != "proactive_recommendation"
+
+
+def _ask_user_answer_request_id(params: dict[str, Any], fallback: str) -> str:
+    rid = str(params.get("request_id") or "").strip()
+    if isinstance(rid, str):
+        matched = re.search(r"^(?P<base>.+)#\d+$", rid)
+        if matched and matched.group("base").strip():
+            rid = matched.group("base").strip()
+    return rid or str(fallback or "").strip()
 
 
 def _history_media_string(item: dict[str, Any], *keys: str) -> str | None:
@@ -1110,9 +1134,50 @@ class JiuWenSwarm:
             return {"sessions_root": self._sessions_dir}
         return {}
 
-    def _append_history_record(self, **kwargs: Any) -> None:
-        kwargs.update(self._history_kwargs())
+    def _append_history_record(self, *, request: Any | None = None, **kwargs: Any) -> None:
+        if kwargs.get("sessions_root") is None:
+            enterprise_root = self._history_kwargs().get("sessions_root")
+            if enterprise_root is not None:
+                kwargs["sessions_root"] = enterprise_root
+            elif request is not None:
+                from jiuwenswarm.server.handlers._shared import _sessions_dir_for_request
+
+                kwargs["sessions_root"] = _sessions_dir_for_request(request)
         append_history_record(**kwargs)
+
+    def _append_ask_user_answered_history(
+        self,
+        *,
+        request: AgentRequest,
+        session_id: str,
+    ) -> None:
+        """Record HITL resume so refresh does not revive an already-answered card."""
+        params = request.params if isinstance(request.params, dict) else {}
+        answers = params.get("answers")
+        status = params.get("status")
+        has_answers = isinstance(answers, list) and bool(answers)
+        has_status = isinstance(status, str) and bool(status.strip())
+        if not has_answers and not has_status:
+            return
+        rid = _ask_user_answer_request_id(params, request.request_id)
+        if not rid:
+            return
+        extra: dict[str, Any] = {"request_id": rid}
+        source = str(params.get("source") or "").strip()
+        if source:
+            extra["source"] = source
+        extra["status"] = str(status).strip() if has_status else "answered"
+        self._append_history_record(
+            session_id=session_id,
+            request_id=rid,
+            channel_id=request.channel_id,
+            role="assistant",
+            event_type="chat.ask_user_answered",
+            content="",
+            timestamp=time.time(),
+            extra=extra,
+            mode=params.get("mode", "unknown"),
+        )
 
     def _get_skilldev_service(self):
         """懒初始化并返回 SkillDevService 实例.
@@ -1331,6 +1396,8 @@ class JiuWenSwarm:
                 return "code"
             if mode == "code" or mode.startswith("code."):
                 return "code"
+            if mode == "flash" or mode.startswith("flash."):
+                return "flash"
         return "agent"
 
     async def create_instance(
@@ -2521,6 +2588,7 @@ class JiuWenSwarm:
                                 else None
                             )
                             self._append_history_record(
+                                request=request,
                                 session_id=session_id,
                                 request_id=request.request_id,
                                 channel_id=request.channel_id,
@@ -2611,6 +2679,7 @@ class JiuWenSwarm:
         # history——否则刷新页面会显示"[主动推荐指令] xxx"这种用户没说过的消息。
         if _should_record_user_history(request.params):
             self._append_history_record(
+                request=request,
                 session_id=session_id,
                 request_id=request.request_id,
                 channel_id=request.channel_id,
@@ -2621,6 +2690,8 @@ class JiuWenSwarm:
                 channel_metadata=request.metadata,
                 mode=request.params.get("mode", "unknown"),
             )
+        else:
+            self._append_ask_user_answered_history(request=request, session_id=session_id)
 
         logger.info(
             "[JiuWenSwarm] 处理请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
@@ -2726,6 +2797,10 @@ class JiuWenSwarm:
                         request.request_id,
                     )
                     return _duplicate_permission_response(request)
+            settle_by_team_landing = (
+                permission_reservation is not None
+                and _is_team_permission_interactive_resume(request, inputs)
+            )
 
             async def run_agent_task():
                 if (
@@ -2733,11 +2808,29 @@ class JiuWenSwarm:
                     and not permission_reservation.start()
                 ):
                     return _duplicate_permission_response(request)
+                if settle_by_team_landing:
+                    reset_team_permission_resume_landed()
                 try:
                     return await adapter.process_message_impl(request, inputs)
+                except Exception as exc:
+                    # unary 任务异常：只记日志并返回 ok=False。
+                    # 错误落盘统一由下方 ``elif not result.ok`` 分支处理（当普通 assistant 回复写入）。
+                    logger.exception(
+                        "[JiuWenSwarm] unary 任务异常: request_id=%s session_id=%s error=%s",
+                        request.request_id, session_id, exc,
+                    )
+                    return AgentResponse(
+                        request_id=request.request_id,
+                        channel_id=request.channel_id,
+                        ok=False,
+                        payload={"error": str(exc)},
+                        metadata=request.metadata,
+                    )
                 finally:
-                    if permission_reservation is not None:
-                        permission_reservation.complete()
+                    settle_permission_reservation(
+                        permission_reservation,
+                        settle_by_team_landing=settle_by_team_landing,
+                    )
 
             try:
                 result = await self._session_manager.submit_and_wait(
@@ -2766,6 +2859,8 @@ class JiuWenSwarm:
                 )
                 if isinstance(content, str):
                     result.payload["content"] = content_str
+                from jiuwenswarm.server.handlers._shared import _sessions_dir_for_request
+
                 append_history_record(
                     session_id=session_id,
                     request_id=request.request_id,
@@ -2775,6 +2870,7 @@ class JiuWenSwarm:
                     content=content_str,
                     timestamp=time.time(),
                     mode=request.params.get("mode", "unknown"),
+                    sessions_root=_sessions_dir_for_request(request),
                 )
 
                 # cloud memory: after chat hook
@@ -2796,6 +2892,22 @@ class JiuWenSwarm:
                 config = get_config()
                 if is_auto_memory_enabled(mode, config) and is_memory_enabled(mode, config):
                     _trigger_auto_memory_extraction(adapter, request, session_id, is_stream=False)
+            elif not result.ok and is_enterprise():
+                # 失败时也当普通 assistant 回复追加进历史（event_type=chat.final），
+                # 与成功回复走同一条历史恢复链路，刷新后即可在前端看到错误提示。
+                err = None
+                if isinstance(result.payload, dict):
+                    err = result.payload.get("error") or result.payload.get("message")
+                append_history_record(
+                    session_id=session_id,
+                    request_id=request.request_id,
+                    channel_id=request.channel_id,
+                    role="assistant",
+                    event_type="chat.final",
+                    content=str(err or "任务执行失败"),
+                    timestamp=time.time(),
+                    mode=request.params.get("mode", "unknown"),
+                )
 
             _schedule_symphony_session_feedback(session_id, request.request_id)
             await self._try_apply_adapter_pending_reload()
@@ -2948,6 +3060,7 @@ class JiuWenSwarm:
             and _should_record_user_history(params_for_history)
         ):
             self._append_history_record(
+                request=request,
                 session_id=session_id,
                 request_id=request.request_id,
                 channel_id=request.channel_id,
@@ -2958,6 +3071,8 @@ class JiuWenSwarm:
                 channel_metadata=request.metadata,
                 mode=params_for_history.get("mode", "unknown"),
             )
+        elif request.req_method != ReqMethod.COMMAND_GOAL:
+            self._append_ask_user_answered_history(request=request, session_id=session_id)
 
         logger.info(
             "[JiuWenSwarm] 处理流式请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
@@ -3107,6 +3222,11 @@ class JiuWenSwarm:
                 )
                 yield _duplicate_permission_chunk(request)
                 return
+        settle_by_team_landing = bool(
+            permission_reservation is not None
+            and is_team_mode
+            and team_query_is_interactive_input
+        )
 
         stream_queue = asyncio.Queue()
         stream_done = asyncio.Event()
@@ -3138,6 +3258,7 @@ class JiuWenSwarm:
             if not pending_text or pending_text == durable_final_content:
                 return
             self._append_history_record(
+                request=request,
                 session_id=session_id,
                 request_id=rid,
                 channel_id=cid,
@@ -3169,6 +3290,8 @@ class JiuWenSwarm:
                             ("chunk", _duplicate_permission_chunk(request))
                         )
                         return
+                    if settle_by_team_landing:
+                        reset_team_permission_resume_landed()
                     async for chunk in adapter.process_message_stream_impl(request, inputs):
                         _put_count += 1
                         _pl = getattr(chunk, "payload", None) or {}
@@ -3201,8 +3324,10 @@ class JiuWenSwarm:
                     logger.exception("[JiuWenSwarm] 流式任务异常: %s", exc)
                     await stream_queue.put(("error", exc))
                 finally:
-                    if permission_reservation is not None:
-                        permission_reservation.complete()
+                    settle_permission_reservation(
+                        permission_reservation,
+                        settle_by_team_landing=settle_by_team_landing,
+                    )
                     logger.info(
                         "[JiuWenSwarm] run_stream_task finished: request_id=%s total_chunks=%s",
                         rid, _put_count,
@@ -3287,6 +3412,7 @@ class JiuWenSwarm:
                     if error_type:
                         error_payload["error_type"] = error_type
                     self._append_history_record(
+                        request=request,
                         session_id=session_id,
                         request_id=rid,
                         channel_id=cid,
@@ -3487,6 +3613,7 @@ class JiuWenSwarm:
                                     if pk not in extra_fields and pk in request.params:
                                         extra_fields[pk] = request.params[pk]
                                 self._append_history_record(
+                                    request=request,
                                     session_id=session_id,
                                     request_id=rid,
                                     channel_id=cid,
@@ -3668,6 +3795,7 @@ class JiuWenSwarm:
                                 if pk not in extra_fields and pk in request.params:
                                     extra_fields[pk] = request.params[pk]
                             self._append_history_record(
+                                request=request,
                                 session_id=session_id,
                                 request_id=rid,
                                 channel_id=cid,
@@ -3735,6 +3863,7 @@ class JiuWenSwarm:
                 finalized_assistant_message != assistant_message or suppress_a2ui_stream
         ):
             self._append_history_record(
+                request=request,
                 session_id=session_id,
                 request_id=rid,
                 channel_id=cid,

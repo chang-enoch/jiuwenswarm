@@ -400,6 +400,23 @@ def _get_bool_env(value: str | None) -> bool | None:
     return value.lower() in ("true", "1", "yes")
 
 
+def coerce_config_bool(value: Any, default: bool) -> bool:
+    """Parse yaml/json/env booleans; treat ``"false"`` / ``"0"`` as False."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
 def _get_evolution_config(config: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(config, dict):
         return {}
@@ -492,6 +509,47 @@ def get_evolution_enabled(config: dict[str, Any] | None) -> bool:
     Prefer :func:`get_skill_evolution_enabled`; kept for backward compatibility.
     """
     return get_skill_evolution_enabled(config)
+
+
+def _get_ttse_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the TTSE config block from a full yaml or a react-section cache."""
+    if not isinstance(config, dict):
+        return {}
+    react_config = config.get("react")
+    if isinstance(react_config, dict) and isinstance(react_config.get("ttse"), dict):
+        return react_config["ttse"]
+    ttse_config = config.get("ttse")
+    if isinstance(ttse_config, dict):
+        return ttse_config
+    return {}
+
+
+def get_ttse_enabled(config: dict[str, Any] | None) -> bool:
+    """Return whether TTSE (FACT/TIP) rail should be mounted.
+
+    Opt-in: missing / unset ``enabled`` is False (shipped template and docs 2.7).
+    Reads ``react.ttse.enabled`` first, then top-level ``ttse.enabled``.
+    """
+    return coerce_config_bool(_get_ttse_config(config).get("enabled"), False)
+
+
+def get_ttse_embedding_config(config: dict[str, Any] | None) -> dict[str, str]:
+    """Return normalized ``react.ttse.embedding`` fields for TTSE retrieval.
+
+    Expects ``api_key`` / ``base_url`` / ``model``. Returns an empty dict when
+    the block is missing or any required field is blank after strip (caller
+    should leave embedding disabled and fall back to whole-bank injection).
+    """
+    ttse = _get_ttse_config(config)
+    raw = ttse.get("embedding")
+    if not isinstance(raw, dict):
+        return {}
+    api_key = str(raw.get("api_key") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    if not (api_key and base_url and model):
+        return {}
+    return {"api_key": api_key, "base_url": base_url, "model": model}
 
 
 def get_skill_create_enabled(config: dict[str, Any] | None) -> bool:
@@ -2709,6 +2767,55 @@ def get_sandbox_runtime() -> dict[str, Any]:
         return _ensure_sandbox_runtime_shape(None)
     raw = {key: sandbox[key] for key in _SANDBOX_RUNTIME_KEYS if key in sandbox}
     return _ensure_sandbox_runtime_shape(raw)
+
+
+
+# =====================================================================
+# Agent 内部读文件后端：local（本机 FS） / sandbox（跟 agent sysop）
+#
+# ``AGENT_FILE_READ_BACKEND``:
+#   - ``local``（默认）: 读人设/上下文等 rail 强制挂本地 sysop；动手工具仍跟
+#     deep_config / agent 原 sysop（开沙箱时为沙箱）。并在 ensure_initialized
+#     前于宿主机初始化工作区，避免沙箱逐个 upload ``.workspace``。
+#   - ``sandbox``: 关闭上述分流与本机 workspace init，全部跟 agent sysop /
+#     上游沙箱 DirectoryBuilder。
+# 非法值回落 ``local`` 并打 warning。
+# =====================================================================
+
+_AGENT_FILE_READ_BACKEND_ENV: str = "AGENT_FILE_READ_BACKEND"
+_AGENT_FILE_READ_BACKEND_LOCAL: str = "local"
+_AGENT_FILE_READ_BACKEND_SANDBOX: str = "sandbox"
+_VALID_AGENT_FILE_READ_BACKENDS: frozenset[str] = frozenset(
+    {_AGENT_FILE_READ_BACKEND_LOCAL, _AGENT_FILE_READ_BACKEND_SANDBOX}
+)
+
+
+def get_agent_file_read_backend() -> str:
+    """返回 agent 内部读文件走本地还是沙箱。
+
+    Returns:
+        ``"local"`` 或 ``"sandbox"``；缺省 / 非法均为 ``"local"``。
+    """
+    raw = get_local_config(_AGENT_FILE_READ_BACKEND_ENV)
+    if raw is None:
+        return _AGENT_FILE_READ_BACKEND_LOCAL
+    text = str(raw).strip().lower()
+    if not text:
+        return _AGENT_FILE_READ_BACKEND_LOCAL
+    if text not in _VALID_AGENT_FILE_READ_BACKENDS:
+        logger.warning(
+            "[config] invalid %s=%r, fallback to %s",
+            _AGENT_FILE_READ_BACKEND_ENV,
+            raw,
+            _AGENT_FILE_READ_BACKEND_LOCAL,
+        )
+        return _AGENT_FILE_READ_BACKEND_LOCAL
+    return text
+
+
+def agent_file_read_backend_is_local() -> bool:
+    """``AGENT_FILE_READ_BACKEND`` 是否为本地直连（默认 True）。"""
+    return get_agent_file_read_backend() == _AGENT_FILE_READ_BACKEND_LOCAL
 
 
 # ``preserve_file_sharing_mode`` 当前合法取值集合 = ``{"mount"}``; 空值表示

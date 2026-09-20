@@ -467,6 +467,14 @@ check_web_up_dependency(){
 }
 
 check_manager_up_dependency(){
+    if [ -z "${DEPLOY_VARS["IDENTITY_ADMIN_PASSWORD"]:-}" ]; then
+        error "IDENTITY_ADMIN_PASSWORD cannot be empty."
+    fi
+
+    if [ -z "${DEPLOY_VARS["IDENTITY_USER1_PASSWORD"]:-}" ]; then
+        error "IDENTITY_USER1_PASSWORD cannot be empty."
+    fi
+
     check_if_db_up
 }
 

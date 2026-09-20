@@ -26,6 +26,7 @@ import {
   formatAgentContextLabel,
   useEnterpriseContext,
 } from '../../services/enterpriseContext';
+import { isEnterprise } from '../../edition';
 import { isClickOutside } from './clickOutside';
 import { EditableCombobox } from './EditableCombobox';
 import type { MainNavKey } from '../../features/mainNavigationState';
@@ -129,7 +130,10 @@ function AdvancedConfigPanel({
   }, [isOpen, onClose, buttonRef]);
 
   const handleLanguageChange = (lang: 'zh' | 'en') => {
+    // i18n LanguageDetector 会写入 localStorage，刷新后靠它恢复。
     i18n.changeLanguage(lang);
+    // 企业版 set_conf 只能回写共享只读/全局 config.yaml，既不可靠又会串用户，跳过。
+    if (isEnterprise()) return;
     void webRequest('locale.set_conf', { preferred_language: lang }).catch(() => {});
   };
 
@@ -189,6 +193,7 @@ export function SessionSidebar({
   const [customBotId, setCustomBotId] = useState('');
   const [customGroupId, setCustomGroupId] = useState('');
   const [customUserId, setCustomUserId] = useState('');
+  const [customJiuwenclawId, setCustomJiuwenclawId] = useState('');
   const contextButtonRef = useRef<HTMLButtonElement>(null);
   const contextPanelRef = useRef<HTMLDivElement>(null);
 
@@ -251,6 +256,7 @@ export function SessionSidebar({
     setCustomBotId(enterprise.selected.bot_id);
     setCustomGroupId(enterprise.selected.group_id);
     setCustomUserId(enterprise.selected.user_id);
+    setCustomJiuwenclawId(enterprise.selected.jiuwenclaw_id);
   }, [contextOpen, enterprise?.selected]);
 
   const activeMode: ContextMode = useMemo(() => {
@@ -279,6 +285,7 @@ export function SessionSidebar({
     enterprise?.selected.bot_id,
     enterprise?.selected.group_id,
     enterprise?.selected.user_id,
+    enterprise?.selected.jiuwenclaw_id,
   ]);
 
   const agentContextOptions = useMemo(
@@ -455,6 +462,16 @@ export function SessionSidebar({
                   aria-label={t('sessionSidebar.enterpriseContext.userId')}
                 />
               </label>
+              <label>
+                {t('sessionSidebar.enterpriseContext.jiuwenclawId')}
+                <input
+                  className="enterprise-context-popover__input"
+                  value={customJiuwenclawId}
+                  disabled={enterprise.contextSwitching}
+                  onChange={event => setCustomJiuwenclawId(event.target.value)}
+                  aria-label={t('sessionSidebar.enterpriseContext.jiuwenclawId')}
+                />
+              </label>
               <button
                 type="button"
                 className="enterprise-context-popover__apply"
@@ -464,6 +481,7 @@ export function SessionSidebar({
                     botId: customBotId,
                     groupId: customGroupId,
                     userId: customUserId,
+                    jiuwenclawId: customJiuwenclawId,
                   })
                 }
               >

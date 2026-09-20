@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import grp
 import hashlib
 import json
 import logging
 import os
-import pwd
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +31,7 @@ from jiuwenswarm.common.utils import (
     get_agent_root_dir,
     get_config_file,
 )
+from jiuwenswarm.edition import is_enterprise
 
 logger = logging.getLogger(__name__)
 
@@ -252,9 +252,18 @@ def _resolve_project_dir(override: str | Path | None) -> Path | None:
     return None
 
 
-def _sandbox_isolation_custom_id(project_dir: str | Path | None) -> str:
+def _sandbox_isolation_custom_id(
+    project_dir: str | Path | None, *, shared_dir: str | Path | None = None,
+) -> str:
     """Stable SysOperation isolation key suffix for per-project sandbox sharing."""
     resolved = _resolve_project_dir(project_dir)
+    if is_enterprise():
+        # Match the trusted workspace mounted for this tenant. A default
+        # project must not reuse another tenant's cached sandbox client.
+        root = Path(shared_dir if shared_dir is not None else get_agent_root_dir()).expanduser().resolve()
+        scope = json.dumps([str(root), str(resolved) if resolved is not None else None])
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+        return f"workspace_project_{digest}"
     if resolved is None:
         return "project_default"
     digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
@@ -586,9 +595,15 @@ def build_filesystem_policy(
 def build_process_policy() -> dict[str, Any]:
     """获取当前进程的有效用户名与用户组名。
 
-    使用 ``geteuid`` / ``getegid`` 解析有效身份；若 passwd/group 中无对应条目,
-    则回退为 UID/GID 的字符串形式。
+    仅企业版（Linux 容器）调用：使用 ``geteuid`` / ``getegid`` 解析有效身份；
+    若 passwd/group 中无对应条目, 则回退为 UID/GID 的字符串形式。
+    非 POSIX 平台（如 Windows 单机版）返回空 dict，调用方跳过 process 段。
     """
+    if not hasattr(os, "geteuid"):
+        return {}
+    import grp
+    import pwd
+
     uid = os.geteuid()
     gid = os.getegid()
     try:
@@ -622,14 +637,16 @@ def create_sandbox_sysop_card(
     shared_dir: str | Path | None = None,
 ) -> SysOperationCard | None:
     """Create sandbox SysOperationCard (jiuwenbox or yuanrong)."""
+    _t0 = time.monotonic()
     # 触发 sandbox provider 注册（@SandboxRegistry.provider 装饰器副作用）
     import openjiuwen.extensions.sys_operation.sandbox.providers  # noqa: F401
 
     normalized_type = str(sandbox_type or "").strip().lower()
+    isolation_custom_id = ""
     try:
         if normalized_type == "yuanrong":
             extra_params = _build_yuanrong_extra_params()
-            isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+            isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
             gateway_config = SandboxGatewayConfig(
                 isolation=SandboxIsolationConfig(
                     container_scope=ContainerScope.CUSTOM,
@@ -662,8 +679,15 @@ def create_sandbox_sysop_card(
                 len(extra_params.get("mounts") or []),
                 extra_params.get("mounts") or [],
             )
+            logger.info(
+                "[SandboxPerf] sysop_builder.create_sandbox_card: agent_id=%s "
+                "sandbox_type=yuanrong total_ms=%.1f",
+                isolation_custom_id,
+                (time.monotonic() - _t0) * 1000,
+            )
             return sysop_card
 
+        _t_policy0 = time.monotonic()
         policy, upload_list = build_filesystem_policy(
             files_runtime,
             project_dir=project_dir,
@@ -671,7 +695,11 @@ def create_sandbox_sysop_card(
             startup_mode=startup_mode,
             shared_dir=shared_dir,
         )
-        policy['process'] = build_process_policy()
+        policy_ms = (time.monotonic() - _t_policy0) * 1000
+        if is_enterprise():
+            process_policy = build_process_policy()
+            if process_policy:
+                policy['process'] = process_policy
         extra_params = {
             "policy": policy,
             "policy_mode": "append",
@@ -684,7 +712,7 @@ def create_sandbox_sysop_card(
         if idle_check_interval is not None:
             extra_params["idle_check_interval"] = idle_check_interval
 
-        isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+        isolation_custom_id = _sandbox_isolation_custom_id(project_dir, shared_dir=shared_dir)
         gateway_config = SandboxGatewayConfig(
             isolation=SandboxIsolationConfig(
                 container_scope=ContainerScope.CUSTOM,
@@ -726,18 +754,50 @@ def create_sandbox_sysop_card(
             upload_list or [],
             extra_params["policy_mode"],
         )
+        logger.info(
+            "[SandboxPerf] sysop_builder.create_sandbox_card: agent_id=%s "
+            "policy_ms=%.1f total_ms=%.1f",
+            isolation_custom_id,
+            policy_ms,
+            (time.monotonic() - _t0) * 1000,
+        )
         return sysop_card
     except Exception as exc:  # noqa: BLE001
         logger.warning("[sysop_builder] create sandbox sysop card failed: %s", exc)
+        logger.info(
+            "[SandboxPerf] sysop_builder.create_sandbox_card: agent_id=%s ok=0 "
+            "total_ms=%.1f",
+            isolation_custom_id or "-",
+            (time.monotonic() - _t0) * 1000,
+        )
         return None
 
 
-def create_local_sysop_card() -> SysOperationCard:
-    """构造本地模式 SysOperationCard."""
-    logger.info("[sysop_builder] local SysOperationCard created (mode=LOCAL)")
+def create_local_sysop_card(work_dir: str | None = None) -> SysOperationCard:
+    """构造本地模式 SysOperationCard.
+
+    Args:
+        work_dir: 本地 work_dir；为空时不在 ``LocalWorkConfig`` 中显式设置。
+    """
+    _t0 = time.monotonic()
+    work_config = (
+        LocalWorkConfig(work_dir=work_dir, shell_allowlist=None)
+        if work_dir
+        else LocalWorkConfig(shell_allowlist=None)
+    )
+    logger.info(
+        "[sysop_builder] local SysOperationCard created (mode=LOCAL, work_dir=%s)",
+        work_dir or "<default>",
+    )
+    logger.info(
+        "[SandboxPerf] sysop_builder.create_local_sysop_card: work_dir=%s "
+        "elapsed_ms=%.1f",
+        work_dir or "<default>",
+        (time.monotonic() - _t0) * 1000,
+    )
     return SysOperationCard(
         mode=OperationMode.LOCAL,
-        work_config=LocalWorkConfig(shell_allowlist=None),
+        work_config=work_config,
     )
 
 
