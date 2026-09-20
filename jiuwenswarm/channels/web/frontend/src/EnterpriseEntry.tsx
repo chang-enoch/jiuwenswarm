@@ -13,6 +13,7 @@ import {
 } from './services/enterpriseContext';
 import {
   requestExtEntries,
+  getRuntimeScope,
   parseRuntimeScope,
   setRuntimeScope,
   type RuntimeScope,
@@ -350,7 +351,9 @@ export function EnterpriseEntry({ children }: { children: ReactNode }) {
         void (async () => {
           try {
             const clusterChanged = await ensureActiveCluster(provider, selected.jiuwenclaw_id);
-            activateContext(selected, true, false, clusterChanged);
+            // 透传字段是宿主注入的会话级参数：切换上下文必须随 launchScope 写回
+            // 刷新后的 URL（activateContext 的 navigate 路径整页 reload），否则静默丢失。
+            activateContext(selected, true, false, clusterChanged, { ext: getRuntimeScope().ext });
           } catch (switchError) {
             setContextSwitching(false);
             setContextError(errorText(switchError));
@@ -386,6 +389,7 @@ export function EnterpriseEntry({ children }: { children: ReactNode }) {
               true,
               true,
               clusterChanged,
+              { ext: getRuntimeScope().ext },
             );
           } catch (switchError) {
             setContextSwitching(false);
