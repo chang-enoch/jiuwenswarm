@@ -605,7 +605,7 @@ class TestStructuredAskUserRailResolveInterrupt:
 
     @staticmethod
     @pytest.mark.asyncio
-    async def test_four_questions_are_allowed():
+    async def test_max_batch_questions_are_allowed():
         """The maximum supported batch should still produce an interrupt."""
         rail = StructuredAskUserRail()
         tc = _make_tool_call(arguments={
@@ -623,7 +623,7 @@ class TestStructuredAskUserRailResolveInterrupt:
 
     @staticmethod
     @pytest.mark.asyncio
-    async def test_more_than_four_questions_are_rejected():
+    async def test_more_than_max_questions_are_rejected():
         """An oversized batch should return an argument error without prompting."""
         rail = StructuredAskUserRail()
         tc = _make_tool_call(arguments={
