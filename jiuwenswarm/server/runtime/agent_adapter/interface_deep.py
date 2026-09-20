@@ -1085,18 +1085,6 @@ async def ensure_persistent_checkpointer() -> None:
             lock.release()
 
 
-_MODE_DISPLAY_MAP: dict[str, dict[str, str]] = {
-    "agent": {"cn": "智能体模式", "en": "Agent Mode"},
-    # Web 的 work 单 agent 计划模式（mode=agent.plan + work_mode=work）。
-    "agent.plan": {"cn": "计划模式", "en": "Plan Mode"},
-    # 历史 token 归一到合并后的 agent 显示名（兼容旧会话 / 旧请求）。
-    "agent.fast": {"cn": "智能体模式", "en": "Agent Mode"},
-    "team": {"cn": "集群模式", "en": "Cluster Mode"},
-    "team.plan": {"cn": "集群计划模式", "en": "Cluster Plan Mode"},
-    "code.team": {"cn": "代码集群模式", "en": "Code Team Mode"},
-}
-
-
 def _try_add_cache_control(msg: Any) -> None:
     """Add cache_control to the last content block of a message.
 
@@ -2464,12 +2452,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 except Exception:
                     pass
 
-            mode_display = _MODE_DISPLAY_MAP.get(mode, {}).get(language, mode)
-
             state = {
                 "model": self._resolve_model_name(),
                 "available_models": get_model_names(),
-                "mode": mode_display,
+                # Persist the stable machine value. Localized mode labels are UI
+                # copy and must not create a false runtime-state change.
+                "mode": mode,
                 "language": language,
                 "channel": channel,
                 "agent": self._agent_name,

@@ -1065,12 +1065,46 @@ async def test_runtime_attachment_tracks_live_code_agent_mode(tmp_path, monkeypa
     assert "Current mode: code.plan" in rendered
     assert "Current mode: code.normal" not in rendered
 
+    await runtime_rail.before_model_call(ctx)
+    items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+    rendered = agent.prompt_attachment_manager.render(items)
+    assert "Current mode:" not in rendered
+
     agent.mode = "normal"
     await runtime_rail.before_model_call(ctx)
     items = await agent.prompt_attachment_manager.collect_for_session("sess1")
     rendered = agent.prompt_attachment_manager.render(items)
     assert "Current mode: code.normal" in rendered
     assert "Current mode: code.plan" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_runtime_attachment_localizes_mode_in_chinese(tmp_path, monkeypatch):
+    monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
+    runtime_state = tmp_path / "runtime_state" / "default.yaml"
+    runtime_state.parent.mkdir(parents=True, exist_ok=True)
+    # Older runtime-state files may still contain a localized display value.
+    runtime_state.write_text("model: model-x\nmode: 智能体模式\n", encoding="utf-8")
+    builder = SystemPromptBuilder(language="cn")
+    agent = _FakeAgent(builder)
+    runtime_rail = RuntimePromptRail(language="cn", channel="web")
+    runtime_rail.init(agent)
+    ctx = AgentCallbackContext(
+        agent=agent,
+        inputs=None,
+        session=_FakeSession(),
+        extra={},
+    )
+
+    await runtime_rail.before_model_call(ctx)
+    items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+    rendered = agent.prompt_attachment_manager.render(items)
+    assert "当前模式：智能体模式" in rendered
+
+    await runtime_rail.before_model_call(ctx)
+    items = await agent.prompt_attachment_manager.collect_for_session("sess1")
+    rendered = agent.prompt_attachment_manager.render(items)
+    assert "当前模式：" not in rendered
 
 
 @pytest.mark.asyncio
