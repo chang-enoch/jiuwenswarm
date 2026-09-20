@@ -1,0 +1,5 @@
+id: provider-probe
+name: Provider Probe
+version: 1.0.0
+description: PathProvider and ConfigProvider verification extension
+author: local-test

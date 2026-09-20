@@ -109,6 +109,10 @@ def register_path_provider(provider: PathProvider) -> None:
     if _provider is not None:
         logger.warning("Replacing registered path provider")
     _provider = provider
+    logger.info(
+        "zqh1 stage=path_provider_registration outcome=registered provider=%s",
+        getattr(provider, "name", type(provider).__name__),
+    )
 
 
 def get_path_provider() -> PathProvider | None:

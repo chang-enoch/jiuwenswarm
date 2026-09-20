@@ -310,6 +310,7 @@ def get_config():
     config_base = None
     provider = get_config_provider()
     if provider is not None:
+        provider_name = getattr(provider, "name", type(provider).__name__)
         try:
             supplied = provider.get_process_config()
             if supplied is not None:
@@ -318,13 +319,37 @@ def get_config():
                 )
                 config_base = resolve_env_vars(config_base)
                 _normalize_config(config_base)
+                logger.info(
+                    "zqh1 stage=process_config provider=%s outcome=dict "
+                    "input_keys=%d resolved_keys=%d fallback=none",
+                    provider_name,
+                    len(supplied),
+                    len(config_base),
+                )
+            else:
+                logger.info(
+                    "zqh1 stage=process_config provider=%s outcome=none "
+                    "fallback=yaml",
+                    provider_name,
+                )
         except Exception:
-            logger.warning("config provider failed, fallback to yaml", exc_info=True)
+            logger.warning(
+                "zqh1 stage=process_config provider=%s outcome=error "
+                "fallback=yaml (fallback to yaml)",
+                provider_name,
+                exc_info=True,
+            )
             config_base = None
     if config_base is None:
         config_base = get_merged_config_dict()
         config_base = resolve_env_vars(config_base)
         _normalize_config(config_base)
+        if provider is None:
+            logger.info(
+                "zqh1 stage=process_config provider=none outcome=yaml_fallback "
+                "resolved_keys=%d",
+                len(config_base),
+            )
 
     with _config_lock:
         if _config_version == read_version:

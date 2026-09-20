@@ -98,6 +98,10 @@ def register_config_provider(provider: ConfigProvider) -> None:
     if _provider is not None:
         logger.warning("Replacing registered config provider")
     _provider = provider
+    logger.info(
+        "zqh1 stage=config_provider_registration outcome=registered provider=%s",
+        getattr(provider, "name", type(provider).__name__),
+    )
 
 
 def get_config_provider() -> ConfigProvider | None:
@@ -228,25 +232,70 @@ async def resolve_agent_config(
     )
     provider = get_config_provider()
     if provider is not None:
+        provider_name = getattr(provider, "name", type(provider).__name__)
         try:
             result = await provider.load_agent_config(ctx, base=base)
             if result is not None:
+                result_config_keys = (
+                    len(result.config) if isinstance(result.config, dict) else -1
+                )
+                logger.info(
+                    "zqh1 stage=agent_config provider=%s outcome=provider "
+                    "source=%s result_keys=%d",
+                    provider_name,
+                    resolve_config_source().value,
+                    result_config_keys,
+                )
                 return result
+            logger.info(
+                "zqh1 stage=agent_config provider=%s outcome=none "
+                "fallback=default source=%s",
+                provider_name,
+                resolve_config_source().value,
+            )
         except Exception:
-            logger.warning("config provider failed, fallback to default", exc_info=True)
+            logger.warning(
+                "zqh1 stage=agent_config provider=%s outcome=error "
+                "fallback=default source=%s",
+                provider_name,
+                resolve_config_source().value,
+                exc_info=True,
+            )
+    else:
+        logger.info(
+            "zqh1 stage=agent_config provider=none outcome=default "
+            "source=%s",
+            resolve_config_source().value,
+        )
     result = await _DEFAULT_PROVIDER.load_agent_config(ctx, base=base)
     resolved = result or AgentConfigResult(config=base, policy=None)
+    logger.info(
+        "zqh1 stage=agent_config provider=default outcome=%s policy=%s "
+        "result_keys=%d",
+        "default_result" if result is not None else "base",
+        result is not None and result.policy is not None,
+        len(resolved.config) if isinstance(resolved.config, dict) else -1,
+    )
     return resolved
 
 
 async def refresh_config_source() -> None:
     provider = get_config_provider()
     if provider is not None:
+        provider_name = getattr(provider, "name", type(provider).__name__)
         try:
             await provider.refresh()
+            logger.info(
+                "zqh1 stage=config_refresh provider=%s outcome=provider",
+                provider_name,
+            )
             return
         except Exception:
             logger.warning(
-                "config provider refresh failed, fallback to default", exc_info=True
+                "zqh1 stage=config_refresh provider=%s outcome=error fallback=default",
+                provider_name,
+                exc_info=True,
             )
+    else:
+        logger.info("zqh1 stage=config_refresh provider=none outcome=default")
     await _DEFAULT_PROVIDER.refresh()

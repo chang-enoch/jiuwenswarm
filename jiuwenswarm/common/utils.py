@@ -1846,27 +1846,70 @@ def get_root_dir() -> Path:
 def _dispatch_path(category, *, node=None, session_id=None, explicit=None):
     """Resolve optional overrides without displacing explicit tenant paths."""
     if explicit is not None:
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=skipped "
+            "outcome=explicit_default",
+            category.value,
+        )
         return None
     provider = get_path_provider()
     if provider is None:
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=none "
+            "outcome=builtin_default",
+            category.value,
+        )
         return None
+    provider_name = getattr(provider, "name", type(provider).__name__)
     try:
         ctx = current_path_context(session_id=session_id)
         if category == PathCategory.SHARED_SKILLS_DIRS:
             paths = provider.resolve_path_list(category, ctx)
             if paths is None:
+                logger.info(
+                    "zqh1 stage=path_dispatch category=%s provider=%s "
+                    "outcome=provider_none",
+                    category.value,
+                    provider_name,
+                )
                 return None
             resolved_paths = [Path(path) for path in paths]
+            logger.info(
+                "zqh1 stage=path_dispatch category=%s provider=%s "
+                "outcome=provider_list path_count=%d",
+                category.value,
+                provider_name,
+                len(resolved_paths),
+            )
             return resolved_paths
         path = provider.resolve_path(
             category, ctx, node=node, session_id=ctx.session_id,
         )
         if path is None:
+            logger.info(
+                "zqh1 stage=path_dispatch category=%s provider=%s "
+                "outcome=provider_none",
+                category.value,
+                provider_name,
+            )
             return None
-        return Path(path)
+        resolved_path = Path(path)
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=%s "
+            "outcome=provider_path path=%s",
+            category.value,
+            provider_name,
+            resolved_path,
+        )
+        return resolved_path
     except Exception:
         logger.warning(
-            "path provider resolve failed, fallback to default", exc_info=True
+            "zqh1 stage=path_dispatch category=%s provider=%s "
+            "outcome=error fallback=builtin_default "
+            "(fallback to default)",
+            category.value,
+            provider_name,
+            exc_info=True,
         )
         return None
 
@@ -3263,6 +3306,12 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
 
     # 保留 dev-stable 既有的源头脱敏（与 handler 层 SensitiveDataFilter 双保险）
     install_source_record_masking()
+    logger.info(
+        "zqh1 stage=log_init logs_root=%s file_enabled=%s console_enabled=%s",
+        logs_root,
+        file_enabled,
+        console_enabled,
+    )
     return root
 
 

@@ -255,6 +255,7 @@ async def _run_with_telemetry(host: str, port: int, telemetry_lifecycle) -> None
     telemetry_lifecycle.bind_extension_manager(extension_manager)
     await extension_manager.load_all_extensions()
     from jiuwenswarm.common.config import clear_config_cache
+    from jiuwenswarm.common.config_provider import get_config_provider
     from jiuwenswarm.common.path_provider import PathCategory, get_path_provider
     from jiuwenswarm.common.utils import _dispatch_path, setup_logger
 
@@ -264,6 +265,18 @@ async def _run_with_telemetry(host: str, port: int, telemetry_lifecycle) -> None
     if rebuild_logger:
         setup_logger()
         bootstrap_openjiuwen_logging()
+    config_provider = get_config_provider()
+    path_provider = get_path_provider()
+    logger.info(
+        "zqh1 stage=provider_registration config_provider=%s path_provider=%s "
+        "extension_count=%d logs_root=%s",
+        getattr(config_provider, "name", "none") if config_provider else "none",
+        getattr(path_provider, "name", "none") if path_provider else "none",
+        len(extension_manager.list_extensions()),
+        logs_override if logs_override is not None else (
+            get_logs_dir() if path_provider is None else "builtin_default"
+        ),
+    )
     logger.info("[AgentServer] 扩展加载完成，共 %d 个", len(extension_manager.list_extensions()))
     await telemetry_lifecycle.start(
         process_role="agentserver",

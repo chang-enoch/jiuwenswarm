@@ -8387,6 +8387,8 @@ class JiuWenSwarmDeepAdapter:
         root = self._workspace_dir or "./"
         directories = None
         provider = get_path_provider()
+        root_source = "explicit" if self._workspace_dir is not None else "builtin"
+        directory_outcome = "not_requested"
         if provider is not None:
             try:
                 ctx = current_path_context()
@@ -8394,9 +8396,29 @@ class JiuWenSwarmDeepAdapter:
                     overridden = provider.resolve_path(PathCategory.WORKSPACE, ctx)
                     if overridden is not None:
                         root = str(overridden)
+                        root_source = "provider"
                 directories = provider.build_workspace_directories(ctx)
+                directory_outcome = (
+                    "provider_list" if directories is not None else "provider_none"
+                )
             except Exception:
-                logger.warning("path provider workspace build failed", exc_info=True)
+                directory_outcome = "error"
+                logger.warning(
+                    "zqh1 stage=workspace_build provider=%s outcome=error "
+                    "fallback=builtin",
+                    getattr(provider, "name", type(provider).__name__),
+                    exc_info=True,
+                )
+        else:
+            directory_outcome = "no_provider"
+        logger.info(
+            "zqh1 stage=workspace_build root_source=%s root=%s "
+            "directory_outcome=%s directory_count=%d",
+            root_source,
+            root,
+            directory_outcome,
+            len(directories or []),
+        )
         workspace = Workspace(
             root_path=root, language=language or self._resolve_runtime_language(),
         )
