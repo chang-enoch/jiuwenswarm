@@ -193,10 +193,14 @@ class DefaultConfigProvider:
     async def refresh(self) -> None:
         source = resolve_config_source()
         if source is ConfigSource.ENTERPRISE and is_enterprise():
+            from jiuwenswarm.server.runtime.enterprise_config import (
+                invalidate_enterprise_config_caches,
+            )
             from jiuwenswarm.agents.harness.common.memory.config import (
                 reload_memory_config_from_gateway_db,
             )
 
+            invalidate_enterprise_config_caches()
             await reload_memory_config_from_gateway_db()
             return
 
@@ -281,10 +285,14 @@ async def resolve_agent_config(
 
 async def refresh_config_source() -> None:
     provider = get_config_provider()
-    if provider is not None:
+    refresh = getattr(provider, "refresh", None) if provider is not None else None
+    if (
+        callable(refresh)
+        and getattr(refresh, "__func__", refresh) is not ConfigProvider.refresh
+    ):
         provider_name = getattr(provider, "name", type(provider).__name__)
         try:
-            await provider.refresh()
+            await refresh()
             logger.info(
                 "zqh1 stage=config_refresh provider=%s outcome=provider",
                 provider_name,
@@ -297,5 +305,8 @@ async def refresh_config_source() -> None:
                 exc_info=True,
             )
     else:
-        logger.info("zqh1 stage=config_refresh provider=none outcome=default")
+        logger.info(
+            "zqh1 stage=config_refresh provider=%s outcome=default",
+            getattr(provider, "name", "none"),
+        )
     await _DEFAULT_PROVIDER.refresh()

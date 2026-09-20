@@ -37,6 +37,8 @@ try:
 except ImportError:
     pass
 
+from jiuwenswarm.edition import is_enterprise
+
 _HTTP_MCP_TRANSPORTS = frozenset({"sse", "http", "streamable-http", "streamable_http"})
 
 
@@ -140,6 +142,14 @@ def build_mcp_server_config(
         payload["server_id"] = explicit_server_id
 
     if transport == "stdio":
+        # 个人版可用本地 stdio（mcp.servers / mcp.server）；企业版仅远程模板。
+        if is_enterprise():
+            logger.warning(
+                "enterprise edition rejects local stdio MCP server %r; "
+                "use remote MCP template from management console",
+                name,
+            )
+            return None
         command = str(entry.get("command", "")).strip()
         if not command:
             return None
@@ -583,9 +593,14 @@ def _validate_request_scoped_remote_mcp(tool_name: str, cfg: dict) -> None:
 def create_mcp_tool(config_str: str) -> McpServerConfig:
     """从 JSON 字符串解析并构造 ``McpServerConfig``。
 
-    用户连接器支持 stdio（node/python/npx/uvx 白名单）以及远程
-    sse / streamable-http / playwright / openapi（方案 §5.2 / §10.1）。
+    个人版用户连接器支持本地 stdio（node/python/npx/uvx 白名单，供
+    ``mcp.server`` / 请求级连接器）以及远程 sse / streamable-http /
+    playwright / openapi（方案 §5.2 / §10.1）。
+    企业版禁止用户可配本地 stdio，仅允许远程类型（本地 /mcp 与
+    ``mcp.server.*`` 管理面另有入口拦截）。
     远程鉴权经 ``_resolve_remote_mcp_auth`` 写入 SDK ``auth_headers``。
+    OfficeClaw Relay 自带 bundle 走 ``validate_office_claw_mcp_config``，
+    不经过本入口的 stdio 分支。
     """
     try:
         config = json.loads(config_str)
@@ -683,8 +698,27 @@ def create_mcp_tool(config_str: str) -> McpServerConfig:
             params=params,
         )
 
+    # 仅缺省 type / 显式 stdio 才走本地进程；未知 type 单独报错，避免企业版误报成 stdio。
+    if client_type != "stdio":
+        if is_enterprise():
+            raise ValueError(
+                f"工具 '{tool_name}' 不支持 type={tool_config.get('type')!r}；"
+                "企业版仅支持 sse / streamable-http / playwright / openapi"
+            )
+        raise ValueError(
+            f"工具 '{tool_name}' 不支持 type={tool_config.get('type')!r}；"
+            "请使用 sse / streamable-http / playwright / openapi / stdio"
+        )
+
     if not isinstance(args, list):
         raise ValueError(f"工具 '{tool_name}' 的 args 必须是列表类型")
+
+    if is_enterprise():
+        raise ValueError(
+            f"工具 '{tool_name}' 不支持本地 stdio；"
+            "企业版仅允许远程 MCP（sse / streamable-http / playwright / openapi），"
+            "请通过管理端模板下发"
+        )
 
     _check_dangerous_args(tool_name, args)
 
@@ -1082,7 +1116,36 @@ async def _enter_remote_mcp_session(
         _MCP_CONNECTOR_DISCOVERY_TIMEOUT_S,
         call_timeout_s,
     )
-    connected = await client.connect(timeout=discovery_timeout)
+    # remote transport（sse/streamable-http）的 client.connect 内部 enter async
+    # context manager（streamable-http 尤其用 anyio TaskGroup + cancel scope）。
+    # connect 失败时 anyio cancel()+uncancel() 本 task，抛出 CancelledError；它是
+    # BaseException（Py3.8+），外层 ``except Exception`` 抓不住，会一路泄漏杀死流式
+    # 任务。用 asyncio.wait_for 套住防卡死，再显式 except CancelledError + cancelling()
+    # 区分：anyio 内部取消（cancelling()==0）→ 当连接失败跳过；外层真取消 → re-raise。
+    try:
+        connected = await asyncio.wait_for(
+            client.connect(timeout=discovery_timeout),
+            timeout=discovery_timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(  # pylint: disable=raise-missing-from
+            f"remote MCP client connect timed out after {discovery_timeout}s: "
+            f"{rebuild_cfg.server_path}"
+        )
+    except asyncio.CancelledError:
+        if is_asyncio_outer_cancellation():
+            raise
+        logger.warning(
+            "request-scoped MCP worker init cancelled (anyio internal), "
+            "isolating as connect failure: server=%s transport=%s path=%s",
+            rebuild_cfg.server_name,
+            client_type,
+            rebuild_cfg.server_path,
+        )
+        raise RuntimeError(  # pylint: disable=raise-missing-from
+            f"remote MCP client connect cancelled (anyio internal): "
+            f"{rebuild_cfg.server_path}"
+        )
     if not connected:
         raise RuntimeError(
             f"remote MCP client connect returned false: {rebuild_cfg.server_path}"
@@ -1958,6 +2021,21 @@ async def _list_remote_mcp_connector_tools(
                 discovery_timeout,
             )
             return [], {}
+        except asyncio.CancelledError:
+            # connect 失败时 anyio TaskGroup cancel()+uncancel() 本 task 抛
+            # CancelledError（BaseException，Py3.8+）；``except Exception`` 在下方
+            # 抓不住，会泄漏杀死流式任务。cancelling()==0 → anyio 内部取消 → 当
+            # 该连接器连接失败跳过（返回空）；cancelling()>0 → 外层真取消 → re-raise。
+            if is_asyncio_outer_cancellation():
+                raise
+            logger.warning(
+                "request-scoped MCP connector '%s' connect cancelled (anyio "
+                "internal), isolating as connect failure: transport=%s path=%s",
+                server_name,
+                client_type,
+                connect_params["server_path"],
+            )
+            return [], {}
         if not connected:
             logger.warning(
                 "request-scoped MCP connector '%s' (%s) connect failed: %s",
@@ -1979,6 +2057,20 @@ async def _list_remote_mcp_connector_tools(
                 "request-scoped MCP connector '%s' list_tools timed out after %.0fs",
                 server_name,
                 discovery_timeout,
+            )
+            return [], {}
+        except asyncio.CancelledError:
+            # list_tools 与 connect 共用 anyio TaskGroup，失败时同样 cancel() 本
+            # task 抛 CancelledError。隔离语义同 connect：内部取消跳过该连接器，
+            # 外层真取消 re-raise。
+            if is_asyncio_outer_cancellation():
+                raise
+            logger.warning(
+                "request-scoped MCP connector '%s' list_tools cancelled (anyio "
+                "internal), isolating as discovery failure: transport=%s path=%s",
+                server_name,
+                client_type,
+                connect_params["server_path"],
             )
             return [], {}
         tool_defs = [

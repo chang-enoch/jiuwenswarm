@@ -220,6 +220,10 @@ async def _run(host: str, port: int) -> None:
 async def _run_with_telemetry(host: str, port: int, telemetry_lifecycle) -> None:
     from jiuwenswarm.common.security.link_mtls import LinkMTLSConfig
     link_mtls = LinkMTLSConfig.from_env(role="agentserver")  # fail before starting any listener
+    from jiuwenswarm.common.model_client_extensions import load_extra_model_clients
+
+    load_extra_model_clients()
+
     from openjiuwen.core.runner import Runner
     from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
     from jiuwenswarm.agents.harness.team.remote_member_bootstrap import run_teammate_bootstrap_daemon

@@ -20,6 +20,7 @@ from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 from jiuwenswarm.gateway.routing.agent_client import AgentServerClient
 from jiuwenswarm.gateway.routing.http_agent_client import HttpSseAgentServerClient
 
+from .agent_authorization import authorize_agent
 from .invoke_ids import apply_invoke_ids_to_envelope
 from .session_route_client import (
     FatalRouteError,
@@ -119,7 +120,11 @@ def _default_http_base() -> str:
     return f"http://{host}:{port}"
 
 
-def identity_from_envelope(envelope: E2AEnvelope) -> tuple[str, str, str, str, str | None]:
+def identity_from_envelope(
+    envelope: E2AEnvelope,
+    *,
+    authorized_identity: tuple[str, str, str] | None = None,
+) -> tuple[str, str, str, str, str | None]:
     """返回 ``session_id, group_id, bot_id, request_id, user_id``。"""
     params = envelope.params if isinstance(envelope.params, dict) else {}
     ctx = envelope.channel_context if isinstance(envelope.channel_context, dict) else {}
@@ -148,6 +153,9 @@ def identity_from_envelope(envelope: E2AEnvelope) -> tuple[str, str, str, str, s
         group_id = "default"
     if not bot_id:
         bot_id = "default"
+    # 授权身份必须在合成 session key 前生效，不能仅覆盖最终路由参数。
+    if authorized_identity is not None:
+        group_id, bot_id, user_id = authorized_identity
     session_id = _first_text(envelope.session_id, params.get("session_id"))
     if not session_id and group_id and bot_id:
         session_id = f"{group_id}:{bot_id}:{user_id or '_'}"
@@ -340,6 +348,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
 
     async def send_request(self, envelope: E2AEnvelope) -> AgentResponse:
         self._ensure_connected()
+        authorized_identity = await authorize_agent(envelope)
         if envelope.method == "acp.tool_response":
             params = envelope.params or {}
             key = (
@@ -357,7 +366,9 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         if _is_routeless_envelope(envelope):
             result = await self._http.send_request(envelope, base_url=_default_http_base())
             return result
-        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(envelope)
+        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(
+            envelope, authorized_identity=authorized_identity,
+        )
         base_url, route_id = await self._route_with_retry(
             session_id=session_id,
             group_id=group_id,
@@ -392,6 +403,7 @@ class RuntimeRoutedAgentClient(AgentServerClient):
         self, envelope: E2AEnvelope
     ) -> AsyncIterator[AgentResponseChunk]:
         self._ensure_connected()
+        authorized_identity = await authorize_agent(envelope)
         if _is_heartbeat_envelope(envelope):
             yield AgentResponseChunk(
                 request_id=str(envelope.request_id or ""),
@@ -408,7 +420,9 @@ class RuntimeRoutedAgentClient(AgentServerClient):
             ):
                 yield chunk
             return
-        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(envelope)
+        session_id, group_id, bot_id, request_id, user_id = identity_from_envelope(
+            envelope, authorized_identity=authorized_identity,
+        )
         base_url, route_id = await self._route_with_retry(
             session_id=session_id,
             group_id=group_id,
