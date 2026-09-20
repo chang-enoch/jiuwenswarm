@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -127,8 +128,13 @@ def test_process_provider_exception_falls_back_to_yaml(monkeypatch, caplog):
     monkeypatch.setattr(config_module, "_normalize_config", lambda config: None)
     providers.register_config_provider(Provider())
 
-    assert config_module.get_config() == {"from_yaml": True}
-    assert "fallback to yaml" in caplog.text
+    logger = logging.getLogger("jiuwenswarm.common.config")
+    logger.addHandler(caplog.handler)
+    try:
+        assert config_module.get_config() == {"from_yaml": True}
+        assert "fallback to yaml" in caplog.text
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 def test_set_config_uses_optional_provider_writer():
