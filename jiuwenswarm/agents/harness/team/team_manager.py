@@ -873,6 +873,15 @@ class TeamManager:
             assembly is fully declarative, no imperative post-processing).
         """
         from jiuwenswarm.agents.swarm import enrich_team_spec_for_swarm
+        # 团队 leader/成员初始化走 openjiuwen 的 spec.mcps 注册（fail-fast），
+        # 与 session adapter 生命周期解耦——在此幂等兜底确保本进程已打
+        # fail-soft patch（不可达的 HTTP server 由下方 preflight 过滤拦截，
+        # 其余注册期失败由该 patch 降级为跳过）。
+        from jiuwenswarm.common.mcp_register_failsoft_patch import (
+            apply_mcp_register_failsoft_patch,
+        )
+
+        apply_mcp_register_failsoft_patch()
 
         config_base = get_config()
         await self._ensure_postgresql_for_leader(config_base)
@@ -906,8 +915,48 @@ class TeamManager:
             agent_group_name=agent_group_name,
             agent_group_package_dir=agent_group_package_dir,
         )
+        await self._preflight_filter_team_mcps(spec)
         self._apply_trace_context(spec, request_metadata=request_metadata)
         return spec
+
+    @staticmethod
+    async def _preflight_filter_team_mcps(spec: TeamAgentSpec) -> None:
+        """Drop unreachable HTTP MCP servers from every member's spec.mcps.
+
+        Members register spec.mcps via openjiuwen's fail-fast
+        ``DeepAgent._register_pending_mcps`` — one dead endpoint raises and
+        sinks the whole member init (leader: entire team round fails;
+        subprocess teammate: restart storm; in-process teammate: silent
+        absence). Runs at this async boundary (assembly is sync and cannot
+        await — same pattern as the ``agent_group_package_dir`` prefetch
+        above). The filter itself is fail-open: any internal error only logs.
+        """
+        from jiuwenswarm.common.mcp_config import filter_unreachable_mcp_servers
+
+        for member_key, member_spec in (getattr(spec, "agents", None) or {}).items():
+            mcps = getattr(member_spec, "mcps", None)
+            if not mcps:
+                continue
+            try:
+                kept, dropped = await filter_unreachable_mcp_servers(list(mcps))
+            except Exception as exc:
+                logger.warning(
+                    "[TeamManager] MCP preflight filter failed for member %s "
+                    "(mcps kept as-is): %r",
+                    member_key, exc,
+                )
+                continue
+            if dropped:
+                member_spec.mcps = kept
+                for cfg, reason in dropped:
+                    logger.warning(
+                        "[TeamManager] dropped unreachable MCP server from member %s: "
+                        "server_name=%s server_path=%s reason=%s",
+                        member_key,
+                        getattr(cfg, "server_name", "?"),
+                        getattr(cfg, "server_path", "?"),
+                        reason,
+                    )
 
     @staticmethod
     def apply_team_plan_mode(
@@ -1477,6 +1526,7 @@ class TeamManager:
             channel_id=channel_id,
             request_metadata=request_metadata,
         )
+        await self._preflight_filter_team_mcps(spec)
         self._apply_trace_context(spec, request_metadata=request_metadata)
 
         logger.info("[TeamManager] TeamAgentSpec ready: team_name=%s", spec.team_name)

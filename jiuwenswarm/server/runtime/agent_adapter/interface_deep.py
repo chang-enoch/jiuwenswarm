@@ -332,6 +332,7 @@ from jiuwenswarm.common.mcp_config import (
     preflight_mcp_server_reachable,
 )
 from jiuwenswarm.common.mcp_call_timeout_patch import apply_mcp_call_timeout_patch
+from jiuwenswarm.common.mcp_register_failsoft_patch import apply_mcp_register_failsoft_patch
 from jiuwenswarm.common.reasoning_injector import build_reasoning_model_request_kwargs
 from jiuwenswarm.server.runtime.agent_adapter.sysop_builder import (
     build_filesystem_policy,
@@ -1191,6 +1192,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # killed remote MCP server fails fast instead of hanging on the MCP
         # SDK's 300s SSE read timeout. Idempotent (module-level _PATCHED guard).
         apply_mcp_call_timeout_patch()
+        # Fail-soft patch for openjiuwen's DeepAgent._register_pending_mcps:
+        # stock behavior raises on the first failing MCP server, which sinks
+        # the whole team round when a team member's spec.mcps is broken.
+        # Idempotent (module-level _PATCHED guard).
+        apply_mcp_register_failsoft_patch()
         self._instance: DeepAgent | None = None
         self._project_dir: str | None = None
         self._workspace_dir: str = str(get_agent_workspace_dir())
