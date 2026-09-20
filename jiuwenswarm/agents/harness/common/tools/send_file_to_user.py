@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -36,6 +37,42 @@ _SENT_FILE_PATHS_BY_SESSION: dict[str, set[str]] = {}
 
 def _normalize_sent_file_path(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/").lower()
+
+
+def _normalize_abs_file_path_list(value: Any) -> list[str]:
+    """把 send_file_to_user 的入参归一化成路径列表。
+
+    模型实际会给出四种形态，全部接受：
+      1. 数组（``["a.pdf", "b.xlsx"]``）—— 模型最自然的写法，优先引导；
+      2. 双引号 JSON 数组字符串（``'["a.pdf", "b.xlsx"]'``）；
+      3. 单引号 Python 字面量字符串（``"['a.pdf', 'b.xlsx']"``）——
+         兼容历史工具描述里的示例写法：``json.loads`` 解析不了，用 literal_eval 兜住，
+         否则整串会被当成一个路径、最后报「文件不存在」；
+      4. 单个绝对路径字符串。
+
+    非字符串/列表的值（None、数字等）按字符串处理，行为与原实现一致。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text[0] in "[(" and text[-1] in ")]":
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    parsed = loader(text)
+                except (TypeError, ValueError, SyntaxError):
+                    continue
+                if isinstance(parsed, (list, tuple)):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+                if isinstance(parsed, str):
+                    return [parsed.strip()] if parsed.strip() else []
+                break
+        return [text]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value)]
 
 
 def artifact_id_for_path(path: str) -> str:
@@ -200,20 +237,8 @@ class SendFileToolkit:
                 "[SendFileToolkit] send_file target_channels=%s session_id=%s",
                 target_channel_list, self.session_id,
             )
-        if isinstance(abs_file_path_list, str):
-            try:
-                parsed = json.loads(abs_file_path_list)
-                if isinstance(parsed, list):
-                    abs_file_path_list = parsed
-                elif isinstance(parsed, str):
-                    abs_file_path_list = [parsed]
-                else:
-                    abs_file_path_list = [abs_file_path_list]
-            except (TypeError, ValueError):
-                abs_file_path_list = [abs_file_path_list]
-
-        if not isinstance(abs_file_path_list, list):
-            abs_file_path_list = [str(abs_file_path_list)]
+        # 数组 / JSON 数组串 / 单引号字面量串 / 单路径字符串 → 统一成 list[str]
+        abs_file_path_list = _normalize_abs_file_path_list(abs_file_path_list)
 
         valid_files = []
         missing_files = []
@@ -410,12 +435,17 @@ class SendFileToolkit:
                     "or other deliverables need to be sent to the user. Typical scenarios: the "
                     "user asks to export/download files, deliverables must be handed over after "
                     "the task, or a report/document has been generated and should be sent. "
-                    "Parameter format: abs_file_path_list accepts a single path string or an "
-                    "array of paths; paths must be absolute. "
-                    "Examples: '/tmp/report.pdf' or ['/tmp/file1.csv', '/tmp/file2.xlsx']. "
+                    "Parameter format: put the file(s) in abs_file_path_list as a JSON array of "
+                    "absolute paths, e.g. [\"/tmp/report.pdf\"] or "
+                    "[\"/tmp/file1.csv\", \"/tmp/file2.xlsx\"]; a single absolute path string "
+                    "like \"/tmp/report.pdf\" is also accepted when there is exactly one file. "
+                    "Paths must be absolute, and quotes inside the JSON array must be double "
+                    "quotes (do not use single quotes or Python-style list syntax). "
+                    "When several deliverables are ready at the same time, send them in ONE call "
+                    "instead of calling this tool once per file. "
                     "target_channels is optional: delivery targets for the files; each item "
                     "can be a channel id (e.g. 'web') or a team human seat name "
-                    "(e.g. 'human-player-1'). "
+                    "(e.g. 'human-player-1'); a single channel id string is also accepted. "
                     "When omitted, files are delivered to the human member who issued the most "
                     "recent request (the initiator recorded on the session); if the request came "
                     "from web or no human member exists, deliver to web. "
@@ -428,21 +458,38 @@ class SendFileToolkit:
                     "type": "object",
                     "properties": {
                         "abs_file_path_list": {
-                            "type": "string",
+                            # 两种形态都收：模型常直接给数组，声明成 string 会在参数校验层
+                            # 直接以 [189001] 失败（tools 实现本来就有 list 分支）。
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            ],
                             "description": (
                                 "Absolute path(s) of the files to send. "
-                                "Accepts a single path string such as '/path/to/file.pdf', "
-                                "or a JSON array string such as "
-                                "'[\"/path/file1.csv\", \"/path/file2.xlsx\"]'. "
+                                "Prefer a JSON array of absolute paths, e.g. "
+                                "[\"/path/file1.csv\", \"/path/file2.xlsx\"] "
+                                "(double quotes only, no single quotes / Python list syntax); "
+                                "a single absolute path string such as "
+                                "\"/path/to/file.pdf\" is also accepted. "
                                 "Any file type is supported (pdf, xlsx, docx, png, zip, etc.)."
                             ),
                         },
                         "target_channels": {
-                            "type": "array",
-                            "items": {"type": "string"},
+                            # 实现侧 _normalize_target_channels 字符串/数组都吃，声明保持一致
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            ],
                             "description": (
                                 "Optional: delivery target list. Each item can be a channel id "
                                 "(e.g. 'web') or a team human seat name (e.g. 'human-player-1'). "
+                                "A single channel id string (e.g. 'web') is also accepted. "
                                 "When omitted, delivered to the human member who issued the most "
                                 "recent request; if the request came from web or no human member "
                                 "exists, deliver to web. "
