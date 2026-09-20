@@ -2635,6 +2635,14 @@ class XiaoyiChannel(BaseChannel):
         if file_attachments:
             logger.info(f"XiaoYi: Processed {len(file_attachments)} file(s): {', '.join(file_attachments)}")
 
+        # 工作空间必须在下载前解析：入站附件写入绑定目录，而不是固定 tmp。
+        client_workspace = resolve_client_workspace(client_variables.get("workspace"))
+        if client_variables.get("workspace") and not client_workspace:
+            logger.warning(
+                f"XiaoYi: clientVariables.workspace 无效或目录不存在，按未携带处理: "
+                f"{client_variables.get('workspace')}"
+            )
+
         # ==================== DOWNLOAD AND SAVE MEDIA FILES ====================
         media_payload: dict[str, Any] = {}
         if media_files:
@@ -2650,7 +2658,9 @@ class XiaoyiChannel(BaseChannel):
                 for f in media_files
             ]
             options = MediaDownloadOptions(max_bytes=30_000_000, timeout_ms=60_000)
-            downloaded_media = await download_and_save_media_list(files_to_download, options)
+            downloaded_media = await download_and_save_media_list(
+                files_to_download, options, save_dir=client_workspace or None
+            )
             logger.info(f"XiaoYi: Successfully downloaded {len(downloaded_media)}/{len(media_files)} file(s)")
             media_payload = build_xiaoyi_media_payload(downloaded_media)
         # =================================================================
@@ -2799,16 +2809,10 @@ class XiaoyiChannel(BaseChannel):
             self._team_tasks.add((session_id, task_id))
         self._session_task_map[task_id] = session_id
 
-        # ==================== clientVariables：工作空间 + 权限模式 ====================
+        # ==================== clientVariables：权限模式 ====================
         # 手机端在 data part 的 variables.clientVariables 里携带：
-        #   workspace  —— 工作空间路径（WorkspaceQuery 应答条目回传）
+        #   workspace  —— 已在媒体下载前解析（client_workspace）
         #   permission —— 权限模式（default / full_access，兼容中文名）
-        client_workspace = resolve_client_workspace(client_variables.get("workspace"))
-        if client_variables.get("workspace") and not client_workspace:
-            logger.warning(
-                f"XiaoYi: clientVariables.workspace 无效或目录不存在，按未携带处理: "
-                f"{client_variables.get('workspace')}"
-            )
         permission_profile = normalize_permission_profile(client_variables.get("permission"))
         if client_variables.get("permission") and not permission_profile:
             logger.warning(

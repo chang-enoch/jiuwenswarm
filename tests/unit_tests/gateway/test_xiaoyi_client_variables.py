@@ -88,7 +88,7 @@ def _make_channel(captured: list, sent: list) -> XiaoyiChannel:
     return ch
 
 
-def _build_stream_msg(text, client_vars=None, conv="conv-1", top="top-1", task="task-1"):
+def _build_stream_msg(text, client_vars=None, conv="conv-1", top="top-1", task="task-1", files=None):
     parts = []
     if client_vars is not None:
         parts.append({
@@ -100,6 +100,8 @@ def _build_stream_msg(text, client_vars=None, conv="conv-1", top="top-1", task="
         })
     if text:
         parts.append({"kind": "text", "text": text})
+    for f in files or []:
+        parts.append({"kind": "file", "file": f})
     return {
         "conversationId": conv,
         "deviceId": "dev",
@@ -330,6 +332,97 @@ async def test_message_stream_applies_workspace_and_permission(cfg_file, workspa
         n = len(captured)
         await ch._handle_message_stream(_build_stream_msg("", {"workspace": str(workspace)}, task="task-4"))
         assert len(captured) == n
+    finally:
+        _cleanup_tasks(ch)
+
+
+@pytest.mark.asyncio
+async def test_message_stream_downloads_into_workspace(cfg_file, workspace, monkeypatch):
+    captured, sent = [], []
+    ch = _make_channel(captured, sent)
+    seen: dict = {}
+
+    async def fake_download(files, options=None, save_dir=None):
+        from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.media import (
+            DownloadedMedia,
+        )
+
+        seen["save_dir"] = save_dir
+        dest = save_dir or "tmp"
+        return [
+            DownloadedMedia(
+                path=os.path.join(dest, files[0].name),
+                content_type="application/pdf",
+                placeholder="<media:document>",
+                file_name=files[0].name,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.media.download_and_save_media_list",
+        fake_download,
+    )
+    try:
+        await ch._handle_message_stream(
+            _build_stream_msg(
+                "分析一下文档内容",
+                {"workspace": str(workspace), "permission": "full_access"},
+                files=[{
+                    "name": "a.pdf",
+                    "uri": "https://obs.example.com/a.pdf",
+                    "mimeType": "application/pdf",
+                }],
+            )
+        )
+        ws = os.path.abspath(str(workspace))
+        assert seen["save_dir"] == ws
+        assert captured[-1].params["files"][0]["path"] == os.path.join(ws, "a.pdf")
+        assert captured[-1].params["project_dir"] == ws
+    finally:
+        _cleanup_tasks(ch)
+
+
+@pytest.mark.asyncio
+async def test_message_stream_download_without_workspace_omits_save_dir(
+    cfg_file, monkeypatch
+):
+    captured, sent = [], []
+    ch = _make_channel(captured, sent)
+    seen: dict = {}
+
+    async def fake_download(files, options=None, save_dir=None):
+        from jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.media import (
+            DownloadedMedia,
+        )
+
+        seen["save_dir"] = save_dir
+        return [
+            DownloadedMedia(
+                path=os.path.join("tmp", files[0].name),
+                content_type="application/pdf",
+                placeholder="<media:document>",
+                file_name=files[0].name,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "jiuwenswarm.gateway.channel_manager.im_platforms.xiaoyi.xiaoyi_utils.media.download_and_save_media_list",
+        fake_download,
+    )
+    try:
+        await ch._handle_message_stream(
+            _build_stream_msg(
+                "看这个",
+                None,
+                files=[{
+                    "name": "b.pdf",
+                    "uri": "https://obs.example.com/b.pdf",
+                    "mimeType": "application/pdf",
+                }],
+            )
+        )
+        assert seen["save_dir"] is None
+        assert "project_dir" not in captured[-1].params
     finally:
         _cleanup_tasks(ch)
 
