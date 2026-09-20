@@ -213,6 +213,7 @@ def _resolve_default_model_config(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     models_raw = config_base.get("models", {})
     if not isinstance(models_raw, dict):
@@ -220,6 +221,18 @@ def _resolve_default_model_config(
 
     defaults_raw = models_raw.get("defaults")
     if isinstance(defaults_raw, list):
+        requested_ref = (requested_model_ref or "").strip()
+        if requested_ref:
+            selected = resolve_model_identity_reference(requested_ref, config_base)
+            selected_name = str((selected.get("model_client_config") or {}).get("model_name") or "").strip()
+            requested_name = (requested_model_name or "").strip()
+            if requested_name and selected_name != requested_name:
+                raise ValueError(
+                    "team model reference name mismatch: "
+                    f"expected {requested_name!r}, found {selected_name!r}"
+                )
+            return selected
+
         # When the caller (chat page) provides a requested model name, prefer
         # the entry whose ``model_client_config.model_name`` matches it so
         # team members without an explicit ``modes.team.agents.*.model`` fall
@@ -254,10 +267,12 @@ def _build_default_model_dict(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     model_config = _resolve_default_model_config(
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
     model_client_config = dict(model_config.get("model_client_config", {}))
     model_request_config = dict(model_config.get("model_config_obj", {}))
@@ -445,10 +460,12 @@ def _build_agents_config(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     default_model = _build_default_model_dict(
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
     default_workspace, max_iterations, completion_timeout = _build_agent_defaults()
 
@@ -480,7 +497,7 @@ def _build_agents_config(
                 agent_config = {}
         else:
             agent_config = dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
-        if requested_model_name and requested_model_name.strip():
+        if (requested_model_name and requested_model_name.strip()) or (requested_model_ref and requested_model_ref.strip()):
             agent_config["model"] = deepcopy(default_model)
         else:
             referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
@@ -682,6 +699,7 @@ def load_team_spec_dict(
     config_base: dict[str, Any] | None = None,
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
     template_id: str | None = None,
     template_snapshot: dict[str, Any] | None = None,
     strict_template: bool = False,
@@ -718,6 +736,7 @@ def load_team_spec_dict(
         team_raw,
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
     spec_dict = deepcopy(team_raw)
     spec_dict.pop("enable_team_plan", None)

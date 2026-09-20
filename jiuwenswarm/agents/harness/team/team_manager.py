@@ -603,6 +603,7 @@ class TeamManager:
         session_id: str,
         *,
         requested_model_name: str | None = None,
+        requested_model_ref: str | None = None,
         template_id: str | None = None,
         template_snapshot: dict[str, Any] | None = None,
         strict_template: bool = False,
@@ -633,6 +634,7 @@ class TeamManager:
         spec_dict = load_team_spec_dict(
             config_base=runtime_config,
             requested_model_name=requested_model_name,
+            requested_model_ref=requested_model_ref,
             template_id=template_id,
             template_snapshot=template_snapshot,
             strict_template=strict_template,
@@ -644,7 +646,7 @@ class TeamManager:
         # When models.defaults has more than one entry, populate model_pool
         # and set model_pool_strategy to by_model_name so team members
         # can be assigned different model endpoints from the pool.
-        default_models = get_default_models(runtime_config)
+        default_models = [] if requested_model_ref else get_default_models(runtime_config)
         if len(default_models) > 1:
             from openjiuwen.agent_teams.schema.team import ModelPoolEntry
 
@@ -924,6 +926,7 @@ class TeamManager:
         session_id: str,
         *,
         requested_model_name: str | None = None,
+        requested_model_ref: str | None = None,
         config_base: dict[str, Any] | None = None,
         sessions_root: str | Path | None = None,
     ) -> tuple[TeamAgentSpec, bool]:
@@ -941,6 +944,8 @@ class TeamManager:
         load_kwargs: dict[str, Any] = {}
         if requested_model_name is not None:
             load_kwargs["requested_model_name"] = requested_model_name
+        if requested_model_ref is not None:
+            load_kwargs["requested_model_ref"] = requested_model_ref
         if template_id is not None:
             load_kwargs["template_id"] = template_id
             load_kwargs["strict_template"] = template_snapshot is None
@@ -965,6 +970,7 @@ class TeamManager:
         channel_id: str | None = None,
         request_metadata: dict[str, Any] | None = None,
         requested_model_name: str | None = None,
+        requested_model_ref: str | None = None,
         config_base: dict[str, Any] | None = None,
         sessions_root: str | Path | None = None,
     ) -> TeamAgentSpec:
@@ -998,6 +1004,7 @@ class TeamManager:
         spec, has_binding = self._load_session_team_spec(
             session_id,
             requested_model_name=requested_model_name,
+            requested_model_ref=requested_model_ref,
             **session_context,
         )
         if not has_binding:

@@ -1291,3 +1291,92 @@ def test_load_team_spec_dict_preserves_arbitrary_team_top_level_fields(monkeypat
     # The locked agent-core dev-stable may not expose this optional field yet;
     # this test only covers JiuwenSwarm's config preservation contract.
     assert spec["max_debate_rounds"] == 2
+
+def _duplicate_request_model_config() -> dict:
+    return {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://builtin.example/v1/",
+                        "api_key": "sk-builtin",
+                        "model_name": "glm-5.3",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.1},
+                },
+                {
+                    "model_client_config": {
+                        "api_base": "https://third-party.example/v1/",
+                        "api_key": "sk-third-party",
+                        "model_name": "glm-5.3",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.8},
+                },
+            ]
+        },
+        **_wrap_modes_team({"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}),
+    }
+
+
+def test_requested_model_ref_selects_owner_after_defaults_reorder():
+    config = _duplicate_request_model_config()
+    config["models"]["defaults"].reverse()
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1/",
+    )
+
+    spec = load_team_spec_dict(
+        config_base=config,
+        requested_model_name="glm-5.3",
+        requested_model_ref=ref,
+    )
+
+    for agent in spec["agents"].values():
+        assert agent["model"]["model_client_config"]["api_base"] == "https://third-party.example/v1/"
+
+
+def test_requested_model_ref_name_mismatch_fails_closed():
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1/",
+    )
+
+    with pytest.raises(ValueError, match="name mismatch"):
+        load_team_spec_dict(
+            config_base=_duplicate_request_model_config(),
+            requested_model_name="qwen3.7-max",
+            requested_model_ref=ref,
+        )
+
+
+def test_requested_model_ref_unknown_and_ambiguous_fail_closed():
+    unknown_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://unknown.example/v1/",
+    )
+    with pytest.raises(ValueError, match="owner not found"):
+        load_team_spec_dict(
+            config_base=_duplicate_request_model_config(),
+            requested_model_name="glm-5.3",
+            requested_model_ref=unknown_ref,
+        )
+
+    ambiguous_config = _duplicate_request_model_config()
+    ambiguous_config["models"]["defaults"].append(dict(ambiguous_config["models"]["defaults"][0]))
+    shared_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://builtin.example/v1/",
+    )
+    with pytest.raises(ValueError, match="owner is ambiguous"):
+        load_team_spec_dict(
+            config_base=ambiguous_config,
+            requested_model_name="glm-5.3",
+            requested_model_ref=shared_ref,
+        )
