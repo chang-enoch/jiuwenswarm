@@ -133,7 +133,6 @@ from jiuwenswarm.common.version import __version__
 from jiuwenswarm.common.local_env_config import (
     SPAWN_ENV_KEYS,
     decrypt,
-    encrypt,
     read_env,
     read_env_if_set,
     set_os_environ,
@@ -1823,7 +1822,6 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel_manager = bind.channel_manager
     on_config_saved = bind.on_config_saved
     heartbeat_service = bind.heartbeat_service
-    cron_controller = bind.cron_controller
     cron_registry = bind.cron_registry or bind.cron_controller
     updater_service = bind.updater_service
     a2a_manager = bind.a2a_manager
@@ -1965,12 +1963,13 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     async def _a2a_outbound_settings_update(ws, req_id, params, session_id):
         allow_loopback = params.get("allow_loopback")
         allow_http = params.get("allow_http")
-        if not isinstance(allow_loopback, bool) or not isinstance(allow_http, bool):
+        allow_private_network = params.get("allow_private_network", False)
+        if not all(isinstance(value, bool) for value in (allow_loopback, allow_http, allow_private_network)):
             await channel.send_response(
                 ws,
                 req_id,
                 ok=False,
-                error="allow_loopback and allow_http must be booleans",
+                error="allow_loopback, allow_http and allow_private_network must be booleans",
                 code="A2A_CONFIG_INVALID",
             )
             return
@@ -1978,7 +1977,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             ws,
             req_id,
             lambda: a2a_manager.outbound_update_settings(
-                allow_loopback=allow_loopback, allow_http=allow_http
+                allow_loopback=allow_loopback, allow_http=allow_http, allow_private_network=allow_private_network
             ),
         )
 
