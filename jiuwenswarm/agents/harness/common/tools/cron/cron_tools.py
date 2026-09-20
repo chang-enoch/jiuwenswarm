@@ -393,6 +393,12 @@ class CronTools:
 
     async def update_job(self, job_id: str, patch: dict[str, Any]) -> Any:
         normalized_patch = dict(patch or {})
+        # 剔除值为 None 的键：LLM 扁平 update 经 pydantic schema 格式化后，
+        # 未传字段以 None 出现在 patch 里（如 cron_expr=None）。"cron_expr"
+        # in patch 为真会走 normalize_cron_expr(str(None)) → "None" 字符串
+        # 直接抛表达式异常；其余 None 键也会被 store 误判为清空意图。
+        # None 不是合法更新值（清空类字段有显式路径），统一丢弃。
+        normalized_patch = {k: v for k, v in normalized_patch.items() if v is not None}
         normalized_patch.pop("session_id", None)
         existing = await self._local_store.get_job(job_id)
         if existing is None:
