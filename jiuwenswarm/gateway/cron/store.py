@@ -417,6 +417,11 @@ class CronJobStore:
         if not job_id:
             raise ValueError("id is required")
         patch = dict(patch or {})
+        # 剔除值为 None 的键：LLM 工具链路经 pydantic schema 格式化后，未传的
+        # 字段会以 None 出现在 patch 里（如 name=None/description=None）。若不
+        # 剔除，下方 `"description" in patch` 会误判为更新意图，把字段清成空
+        # 值，末尾 from_dict 校验抛 "description is required" 等错误，update 失败。
+        patch = {k: v for k, v in patch.items() if v is not None}
         existing = await self.get_job(job_id)
         if existing is None:
             raise KeyError("job not found")
