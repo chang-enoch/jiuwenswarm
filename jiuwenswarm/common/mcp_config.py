@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,9 +40,9 @@ def extract_enabled_mcp_server_entries(config_base: dict[str, Any]) -> list[dict
 
 
 def build_mcp_server_config(
-    entry: dict[str, Any],
-    *,
-    server_id_scope: str | None = None,
+        entry: dict[str, Any],
+        *,
+        server_id_scope: str | None = None,
 ) -> McpServerConfig | None:
     """Build a ``McpServerConfig`` from one ``mcp.servers`` entry.
 
@@ -106,9 +107,9 @@ def build_mcp_server_config(
 
 
 def build_enabled_mcp_server_configs(
-    config_base: dict[str, Any],
-    *,
-    server_id_scope: str | None = None,
+        config_base: dict[str, Any],
+        *,
+        server_id_scope: str | None = None,
 ) -> list[McpServerConfig]:
     """Build all enabled MCP server configs, skipping invalid entries."""
     configs: list[McpServerConfig] = []
@@ -120,7 +121,7 @@ def build_enabled_mcp_server_configs(
 
 
 async def preflight_mcp_server_reachable(
-    cfg: McpServerConfig, *, timeout: float = 3.0
+        cfg: McpServerConfig, *, timeout: float = 3.0
 ) -> tuple[bool, str]:
     """Cheap reachability probe for HTTP-based MCP servers.
 
@@ -168,6 +169,102 @@ async def preflight_mcp_server_reachable(
     return True, ""
 
 
+#: TTL (seconds) for cached preflight verdicts in ``filter_unreachable_mcp_servers``.
+PREFLIGHT_CACHE_TTL_S = 60.0
+#: Hard cap on cached verdicts — the cache is write-only otherwise, and team
+#: scenarios can mint fresh server_paths per team/expert, which would leak
+#: entries for the process lifetime.
+PREFLIGHT_CACHE_MAX_ENTRIES = 256
+#: (server_path -> (reachable, reason, monotonic_ts)) shared verdict cache, so a
+#: team with N members sharing one config.yaml pays one probe per endpoint.
+#: Expired entries are purged lazily on every filter call; no background task.
+_preflight_cache: dict[str, tuple[bool, str, float]] = {}
+
+
+def _prune_preflight_cache(
+        store: dict[str, tuple[bool, str, float]],
+        *,
+        now: float,
+        cache_ttl_s: float,
+) -> None:
+    """Drop expired entries; if still over cap, evict oldest first."""
+    expired = [key for key, (_, _, ts) in store.items() if now - ts >= cache_ttl_s]
+    for key in expired:
+        del store[key]
+    overflow = len(store) - PREFLIGHT_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest = sorted(store, key=lambda key: store[key][2])[:overflow]
+        for key in oldest:
+            del store[key]
+
+
+async def filter_unreachable_mcp_servers(
+        mcps: list[McpServerConfig],
+        *,
+        timeout: float = 3.0,
+        cache: dict[str, tuple[bool, str, float]] | None = None,
+        cache_ttl_s: float = PREFLIGHT_CACHE_TTL_S,
+) -> tuple[list[McpServerConfig], list[tuple[McpServerConfig, str]]]:
+    """Split *mcps* into ``(kept, dropped)`` by HTTP reachability preflight.
+
+    Team members register ``spec.mcps`` through openjiuwen's fail-fast
+    ``DeepAgent._register_pending_mcps`` — one unreachable server raises and
+    aborts the whole member init (leader: the entire team round fails;
+    subprocess teammate: restart storm; in-process teammate: silent absence).
+    Filtering at the async team-spec boundary keeps a dead endpoint from
+    sinking a team round, and also avoids the anyio orphan-task noise that
+    entering ``streamablehttp_client`` against a dead endpoint produces (see
+    ``preflight_mcp_server_reachable``'s docstring).
+
+    Non-HTTP transports (stdio/playwright/…) always pass — they are spawned
+    locally and have no cheap probe. Probe verdicts are cached by
+    ``server_path`` for ``cache_ttl_s`` seconds so N members sharing one
+    config don't each re-probe the same endpoint; expired entries are purged
+    lazily on every call and the cache is capped at
+    ``PREFLIGHT_CACHE_MAX_ENTRIES`` (oldest-first eviction), so long-lived
+    processes don't accumulate verdicts for dead teams/servers. A probe that
+    itself raises is treated as *reachable* (fail-open): this filter must
+    never break spec assembly, and the fail-soft registration patch is the
+    second line of defense for non-network failures.
+    """
+    if not mcps:
+        return [], []
+    store = cache if cache is not None else _preflight_cache
+    now = time.monotonic()
+    _prune_preflight_cache(store, now=now, cache_ttl_s=cache_ttl_s)
+    verdicts: dict[int, tuple[bool, str]] = {}
+    probes: dict[int, asyncio.Task] = {}
+    for idx, cfg in enumerate(mcps):
+        key = (getattr(cfg, "server_path", "") or "").strip()
+        cached = store.get(key) if key else None
+        if cached is not None and now - cached[2] < cache_ttl_s:
+            verdicts[idx] = (cached[0], cached[1])
+            continue
+        probes[idx] = asyncio.ensure_future(
+            preflight_mcp_server_reachable(cfg, timeout=timeout)
+        )
+    for idx, task in probes.items():
+        try:
+            ok, reason = await task
+        except Exception as exc:
+            # 探测自身永不炸装配链——异常按可达放行，留给注册期 fail-soft 兜底。
+            ok, reason = True, f"preflight probe error (kept): {type(exc).__name__}: {exc}"
+        verdicts[idx] = (ok, reason)
+        key = (getattr(mcps[idx], "server_path", "") or "").strip()
+        if key:
+            store[key] = (ok, reason, now)
+
+    kept: list[McpServerConfig] = []
+    dropped: list[tuple[McpServerConfig, str]] = []
+    for idx, cfg in enumerate(mcps):
+        ok, reason = verdicts[idx]
+        if ok:
+            kept.append(cfg)
+        else:
+            dropped.append((cfg, reason))
+    return kept, dropped
+
+
 def _stable_mcp_server_id(scope: str, name: str, payload: dict[str, Any]) -> str:
     stable_payload = {
         key: value
@@ -196,4 +293,5 @@ __all__ = [
     "build_mcp_server_config",
     "extract_enabled_mcp_server_entries",
     "preflight_mcp_server_reachable",
+    "filter_unreachable_mcp_servers",
 ]
