@@ -90,7 +90,3 @@
 /jiuwenswarm/agents/harness/agent_observability.py @xinyang_bali
 /jiuwenswarm/agents/harness/observability_runtime.py @xinyang_bali
 /jiuwenswarm/agents/swarm/providers/evolution_rails.py @xinyang_bali
-
-
-/jiuwenswarm/agents/harness/flash/ @de4
-/jiuwenswarm/server/runtime/agent_adapter/interface_flash.py @de4
