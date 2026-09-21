@@ -429,10 +429,13 @@ async def test_team_manager_keeps_single_session_per_channel(monkeypatch: pytest
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(fake_load_team_spec))
     # Mock _initialize_team_shared_skill_links to avoid file operations
+    async def _noop_init_links(_spec):
+        return None
+
     monkeypatch.setattr(
         TeamManager,
         "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
+        staticmethod(_noop_init_links),
     )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
@@ -486,10 +489,13 @@ async def test_create_team_does_not_run_global_runtime_cleanup(monkeypatch: pyte
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(fake_load_team_spec))
     # Mock _initialize_team_shared_skill_links to avoid file operations
+    async def _noop_init_links(_spec):
+        return None
+
     monkeypatch.setattr(
         TeamManager,
         "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
+        staticmethod(_noop_init_links),
     )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
@@ -526,10 +532,13 @@ async def test_create_team_appends_session_id_to_team_name(monkeypatch: pytest.M
             return SimpleNamespace()
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
+    async def _noop_init_links(_spec):
+        return None
+
     monkeypatch.setattr(
         TeamManager,
         "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
+        staticmethod(_noop_init_links),
     )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
@@ -565,11 +574,14 @@ async def test_create_team_appends_session_id_to_web_team_name(monkeypatch: pyte
             created_team_names.append(self.team_name)
             return SimpleNamespace()
 
+    async def _noop_init_links(_spec):
+        return None
+
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
     monkeypatch.setattr(
         TeamManager,
         "_initialize_team_shared_skill_links",
-        staticmethod(lambda spec: None),
+        staticmethod(_noop_init_links),
     )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
@@ -2057,10 +2069,13 @@ async def test_create_team_passes_sessions_root_to_load_session_team_spec(
         "jiuwenswarm.common.config.get_config",
         lambda: {},
     )
+    async def _noop_ensure_ready(self, session_id, spec):
+        return None
+
     monkeypatch.setattr(
         TeamManager,
         "ensure_team_shared_skills_ready_for_session",
-        lambda self, session_id, spec: None,
+        _noop_ensure_ready,
     )
     monkeypatch.setattr(
         TeamManager,
