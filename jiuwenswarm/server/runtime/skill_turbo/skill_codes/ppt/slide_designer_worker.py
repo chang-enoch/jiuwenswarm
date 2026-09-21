@@ -67,6 +67,8 @@ _DOM_BROKEN_FILL_REASONS = frozenset({
     "no_placeholders",
     "layout_patch_slot_merge_failed",
 })
+_SOFT_DELIVER_CHART_REASON = "chart_scaffold_not_activated"
+_SOFT_DELIVER_REASONS = frozenset({_SOFT_DELIVER_CHART_REASON})
 
 
 @dataclass
@@ -168,9 +170,6 @@ class SlideDesignerWorker:
 
         if not html:
             # 填槽耗尽：custom 先走既有 free_gen；图表未激活最终仍 soft 交付（不进 missing）
-            soft_deliver_reasons = {
-                "chart_scaffold_not_activated",
-            }
             if self._policy.allow_free_gen_fallback:
                 logger.warning(
                     "[SlideDesignerWorker] 填槽失败，降级 free_generate page=%d reason=%s",
@@ -189,9 +188,9 @@ class SlideDesignerWorker:
                         fail_reason="" if ok else "write_failed",
                         path=path,
                     )
-                if last_reason in soft_deliver_reasons and last_raw.strip():
+                if last_reason in _SOFT_DELIVER_REASONS and last_raw.strip():
                     logger.warning(
-                        "[SlideDesignerWorker] %s，free_gen 失败仍交付 page=%d",
+                        "[SlideDesignerWorker] soft 交付（%s），free_gen 失败仍交付 page=%d",
                         last_reason,
                         ctx.page_num,
                     )
@@ -206,9 +205,9 @@ class SlideDesignerWorker:
                         fail_reason=last_reason or "fill_failed",
                         path=path,
                     )
-            elif last_reason in soft_deliver_reasons and last_raw.strip():
+            elif last_reason in _SOFT_DELIVER_REASONS and last_raw.strip():
                 logger.warning(
-                    "[SlideDesignerWorker] %s，重试耗尽仍交付 page=%d",
+                    "[SlideDesignerWorker] soft 交付（%s），重试耗尽仍交付 page=%d",
                     last_reason,
                     ctx.page_num,
                 )
@@ -246,7 +245,7 @@ class SlideDesignerWorker:
             )
 
         if layout_warning or soft_deliver_warning:
-            warn_reason = layout_reason or last_reason or "chart_scaffold_not_activated"
+            warn_reason = layout_reason or last_reason or _SOFT_DELIVER_CHART_REASON
             logger.warning(
                 "[SlideDesignerWorker] 页面 %d 已标记警告并继续交付: %s",
                 ctx.page_num,
@@ -477,7 +476,7 @@ class SlideDesignerWorker:
             "structural_fill_failed": (
                 "骨架须逐字保留，只替换 seed 中已有 {{PLACEHOLDER}}，勿重写整页 HTML"
             ),
-            "chart_scaffold_not_activated": (
+            _SOFT_DELIVER_CHART_REASON: (
                 "本页已有 chart 容器：必须成对删除 CHART_SCAFFOLD_* 定界符，"
                 "并将 const option = null 替换为配置对象 const option = {…}；"
                 "禁止手写 echarts.init / var optionN"

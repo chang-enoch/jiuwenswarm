@@ -399,14 +399,19 @@ _CONTENT_FILL_DENSITY_CHECKLIST = """### PAGE_CONTENT 密度硬约束（精简�
 
 
 def _extract_content_fill_designer_31_slices(text: str) -> list[str]:
-    """从 designer 主文件抽取 §3.1 C/D/D-2（止于 3.2），供 content-template 填槽注入。"""
+    """从 designer 主文件抽取 §3.1 C/D/D-2（止于 E / 3.2），供 content-template 填槽注入。"""
     if not (text or "").strip():
         return []
-    # 优先整段 C→D-2（含分块要点 + form 表 + 骨架表）；止于 3.2 / 阶段 4。
+    # 优先整段 C→D-2（含分块要点 + form 表 + 骨架表）；止于 E / 3.2，不注入写前版面意图。
     chunk = _extract_bounded_section(
         text,
         "**C. 内容分块",
-        ("\n#### 3.2", "\n### 阶段 4", "\n## "),
+        (
+            "\n**E. 写前版面意图",
+            "\n#### 3.2",
+            "\n### 阶段 4",
+            "\n## ",
+        ),
     )
     if chunk:
         return [chunk]
@@ -1452,23 +1457,6 @@ def _validate_custom_content_template_fill_output(
     if not _validate_chart_height_chain(filled_html):
         return False, "invalid_chart_height_chain"
     return True, ""
-
-
-def _build_content_layout_template(page_type: str) -> str:
-    """自由生成路径仍可用页型参考布局；content-template 填槽勿调用本函数。"""
-    layout = _PAGE_LAYOUT_TEMPLATES.get(page_type, "")
-    if not layout:
-        return ""
-    return (
-        layout
-        .replace('<div class="content-safe flex flex-col">\n', "")
-        .replace('  <header class="flex-shrink-0">4-6 个关键数字卡片，flex</header>\n', "")
-        .replace('  <header class="flex-shrink-0">3 个关键数字卡片</header>\n', "")
-        .replace('  <header class="flex-shrink-0">4 个关键数字卡片</header>\n', "")
-        .replace('  <footer class="flex-shrink-0">数据来源汇总条</footer>\n', "")
-        .replace('  <footer class="flex-shrink-0">案例素材详细描述 + 数据来源页脚</footer>\n', "")
-        .replace("</div>\n```\n", "```\n")
-    )
 
 
 def _build_content_template_fill_prompt(
