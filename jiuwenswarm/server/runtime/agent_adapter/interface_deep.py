@@ -296,6 +296,10 @@ from jiuwenswarm.agents.harness.common.rails.concurrent_safe_rails import (
     ConcurrentSafeTaskPlanningRail,
 )
 from jiuwenswarm.common.config import get_model_names
+from jiuwenswarm.common.model_identity import (
+    build_model_identity_reference,
+    normalize_model_identity_reference,
+)
 from jiuwenswarm.common.hooks_config import load_hooks_config
 from jiuwenswarm.common.log_preview import preview_text
 from jiuwenswarm.common.mode_matrix import (
@@ -2555,6 +2559,7 @@ class JiuWenSwarmDeepAdapter:
         self._is_proactive_memory: bool | None = None
         self._model_cache: dict[str, Model] = {}
         self._model_name_to_keys: dict[str, list[str]] = {}
+        self._model_identity_to_keys: dict[str, list[str]] = {}
         # Optional lite/pro mapping from models.defaults[].tier for task_tool.
         self._tier_model_cache: dict[str, Model] = {}
         # Cache system prompt to avoid re-building on every btw/recap call.
@@ -6327,6 +6332,8 @@ class JiuWenSwarmDeepAdapter:
         if model_name not in self._model_name_to_keys:
             self._model_name_to_keys[model_name] = []
         self._model_name_to_keys[model_name].append(cache_key)
+        model_ref = build_model_identity_reference(model_name, mcc)
+        self._model_identity_to_keys.setdefault(model_ref, []).append(cache_key)
 
         # 同时用纯 model_name 作为 key 指向 is_default=true 的条目
         if entry.get("is_default") is True:
@@ -6351,6 +6358,7 @@ class JiuWenSwarmDeepAdapter:
         同时记录 _model_name_to_keys 映射以便按 model_name 查找。
         """
         self._model_name_to_keys.clear()
+        self._model_identity_to_keys.clear()
         self._tier_model_cache.clear()
         name_counter: dict[str, int] = {}
 
@@ -6378,6 +6386,8 @@ class JiuWenSwarmDeepAdapter:
         )
         try:
             self._model_cache[model_name] = self._build_model_from_entry(mcc, mco)
+            model_ref = build_model_identity_reference(model_name, mcc)
+            self._model_identity_to_keys.setdefault(model_ref, []).append(model_name)
         except Exception as exc:
             logger.warning(
                 "[JiuWenSwarmDeepAdapter] 跳过无效模型条目(legacy) %s: %s",
@@ -6405,6 +6415,7 @@ class JiuWenSwarmDeepAdapter:
 
         self._model_cache.clear()
         self._model_name_to_keys.clear()
+        self._model_identity_to_keys.clear()
         self._tier_model_cache.clear()
         self._inject_attribution_to_config(config)
         self._build_model_cache_from_defaults(config)
@@ -6495,6 +6506,18 @@ class JiuWenSwarmDeepAdapter:
             sort_keys=True, default=str, ensure_ascii=False,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _resolve_model_by_identity(self, model_ref: str) -> Model:
+        normalized_ref = normalize_model_identity_reference(model_ref)
+        keys = self._model_identity_to_keys.get(normalized_ref, [])
+        if not keys:
+            raise ValueError(f"model reference owner not found: {normalized_ref!r}")
+        if len(keys) != 1:
+            raise ValueError(f"model reference owner is ambiguous: {normalized_ref!r}")
+        model = self._model_cache.get(keys[0])
+        if model is None:
+            raise ValueError(f"model reference owner not found: {normalized_ref!r}")
+        return model
 
     def _resolve_model_by_name(self, requested_model_name: str = "") -> Model | None:
         """Resolve the exact model object that will be used."""
@@ -6625,7 +6648,16 @@ class JiuWenSwarmDeepAdapter:
         - {model_name}#{index}：查找指定索引的条目
         """
         requested = (request.params.get("model_name") or "").strip()
-        model = self._resolve_model_by_name(requested)
+        model_ref = str(request.params.get("model_ref") or "").strip()
+        if model_ref:
+            model = self._resolve_model_by_identity(model_ref)
+            actual = str(getattr(model.model_client_config, "model_name", "") or "").strip()
+            if requested and requested != actual:
+                raise ValueError(
+                    f"model_name does not match model_ref: expected {requested!r}, found {actual!r}"
+                )
+        else:
+            model = self._resolve_model_by_name(requested)
         if model is None:
             raise RuntimeError("No model configured for request")
         return model
