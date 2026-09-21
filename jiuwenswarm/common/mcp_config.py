@@ -1866,7 +1866,16 @@ async def list_request_mcp_server_tools(
     本函数是所有工具发现的唯一入口（McpServerRegistry._discover / 周期扫描 /
     旧路径 request-scoped 注册均调用），在入口统一过滤即可让三条消费路径
     同时只暴露启用工具。过滤只影响工具列表，不影响 connect_params。
+
+    空名单（[] / 全空白项）短路：全关工具不依赖连接器可达性
+    （「全关工具 ≠ 断开连接器」）——不建立 MCP 连接、不调 tools/list，
+    返回最小 connect_params 供 registry 入册占位（零工具，不会被 acquire；
+    filter 变化触发 update 重扫时会走真实发现覆盖）。
     """
+    raw = config.get("tool_filter")
+    if isinstance(raw, list) and not {str(name).strip() for name in raw if str(name).strip()}:
+        client_type = _normalize_mcp_client_type(config.get("type")) or "stdio"
+        return [], {"_mcp_client_type": client_type}
     tool_defs, params = await _list_request_mcp_server_tools_inner(server_name, config)
     return _apply_tool_filter(tool_defs, config), params
 

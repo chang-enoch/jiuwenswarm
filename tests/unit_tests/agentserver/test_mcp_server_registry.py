@@ -1534,3 +1534,38 @@ async def test_registry_update_servers_refilters_when_tool_filter_changes(monkey
     assert updated["tools_count"] == 1
     snapshots = await registry.snapshot_for_chat(["conn_x"])
     assert [tool["name"] for tool in snapshots[0][1]] == ["conn_x_b"]
+
+
+@pytest.mark.asyncio
+async def test_list_request_mcp_server_tools_short_circuits_empty_filter(monkeypatch) -> None:
+    """空名单/全空白名单短路：不建立 MCP 连接、不调 tools/list（全关工具不依赖连接器可达性）。"""
+    from jiuwenswarm.common import mcp_config
+
+    called: list[str] = []
+
+    async def _inner(name, config):
+        called.append(name)
+        return [{"name": "x"}], {"_mcp_client_type": "stdio"}
+
+    monkeypatch.setattr(mcp_config, "_list_request_mcp_server_tools_inner", _inner)
+
+    # 空名单 → 短路
+    tools, params = await mcp_config.list_request_mcp_server_tools("srv", {"tool_filter": []})
+    assert tools == []
+    assert params == {"_mcp_client_type": "stdio"}
+    assert called == []
+
+    # 全空白名单 → 同样短路
+    tools, params = await mcp_config.list_request_mcp_server_tools("srv", {"tool_filter": ["  ", ""]})
+    assert tools == []
+    assert called == []
+
+    # 非空名单 → 正常走 inner（过滤后返回）
+    tools, params = await mcp_config.list_request_mcp_server_tools("srv", {"tool_filter": ["x"]})
+    assert called == ["srv"]
+    assert [t["name"] for t in tools] == ["x"]
+
+    # 缺省（无 tool_filter）→ 正常走 inner
+    called.clear()
+    tools, params = await mcp_config.list_request_mcp_server_tools("srv", {})
+    assert called == ["srv"]
