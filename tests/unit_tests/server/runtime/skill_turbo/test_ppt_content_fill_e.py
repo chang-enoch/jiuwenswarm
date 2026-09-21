@@ -115,6 +115,8 @@ def test_extract_designer_for_fill_includes_31_form_not_appendix():
     assert "选定即冻结" in out
     assert "MARKER_DENSITY_FLOOR" in out
     assert "按页面类型的最低信息结构" in out
+    assert "MARKER_E_INTENT" not in out
+    assert "写前版面意图" not in out
     assert "MARKER_32_LEAK" not in out
     assert "MARKER_CONVERT_LEAK" not in out
     assert "MARKER_FLEX_LEAK" not in out
