@@ -135,7 +135,7 @@ def _tool_routing_prompt(
     if language == "cn":
         if bash_available:
             posix_rule = (
-                "- 普通 POSIX 命令、Bash 脚本、`grep`、`find`、`sed`、`awk`、`mkdir -p` 使用 `bash`；"
+                "- 普通 POSIX 命令和 Bash 脚本使用 `bash`；"
                 "`bash` 工具本身已经固定了 Shell，不需要 `shell_type`。"
             )
         else:
@@ -151,12 +151,13 @@ def _tool_routing_prompt(
 - 文件读取、搜索和编辑优先使用 `read_file`、`grep`、`glob`、`edit_file`、`write_file` 等专用工具，不要为了这些操作调用 Shell。
 {posix_rule}
 {windows_rule}
+- `mcp_exec_command` 仅在需要显式参数化 Shell、后台执行或 Shell 专用工具时使用；必须显式提供 `shell_type`，禁止使用 `auto`。
 - 不要在 Bash 中包裹 PowerShell，也不要在 PowerShell 中拼接 Bash 语法。"""
 
     if bash_available:
         posix_rule = (
-            "- Use `bash` for ordinary POSIX commands, Bash scripts, `grep`, `find`, `sed`, `awk`, "
-            "and `mkdir -p`; the `bash` tool already fixes the Shell and does not need `shell_type`."
+            "- Use `bash` for ordinary POSIX commands and Bash scripts; the `bash` tool "
+            "already fixes the Shell and does not need `shell_type`."
         )
     else:
         posix_rule = "- Bash is unavailable; do not issue raw POSIX commands. Use an available Windows Shell or a dedicated tool."
@@ -186,7 +187,7 @@ def build_shell_environment_prompt(language: str, os_type: str) -> str:
 - PATH bash：{_path_bash_status(language, path_bash)}
 
 Shell 选择规则：
-- Windows 且 Git Bash 可用，或 PATH bash 明确不是 WSL stub 时，可以使用 bash/Git Bash 执行 POSIX 命令，例如 `ls`、`grep`、`cat`、`mkdir -p`、bash 脚本。
+- Windows 且 Git Bash 可用，或 PATH bash 明确不是 WSL stub 时，可以使用 bash/Git Bash 执行普通 POSIX 命令和 Bash 脚本，例如 `mkdir -p`。
 - Windows 且 Git Bash 不可用、PATH bash 也不可用或只是 WSL stub 时，不要使用 POSIX 命令；优先使用 PowerShell 或 cmd。
 - PowerShell cmdlet 不要包在 bash 里执行，应直接使用 PowerShell。
 - 安装 Python 依赖时，使用 `python -m pip install` 而非 `pip install`，确保依赖安装到与执行脚本相同的 Python 环境中。
@@ -197,7 +198,7 @@ Shell 选择规则：
 - PATH bash: {_path_bash_status(language, path_bash)}
 
 Shell selection rules:
-- On Windows, when Git Bash is available, or PATH bash is clearly not a WSL stub, use bash/Git Bash for POSIX commands such as `ls`, `grep`, `cat`, `mkdir -p`, and bash scripts.
+- On Windows, when Git Bash is available, or PATH bash is clearly not a WSL stub, use bash/Git Bash for ordinary POSIX commands and Bash scripts, such as `mkdir -p`.
 - On Windows, when Git Bash is unavailable and PATH bash is unavailable or only a WSL stub, do not use POSIX commands; prefer PowerShell or cmd.
 - Do not wrap PowerShell cmdlets in bash; invoke PowerShell directly.
 - When installing Python dependencies, use `python -m pip install` instead of `pip install` to ensure packages are installed into the same Python environment that will execute the scripts.
