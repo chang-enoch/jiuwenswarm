@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional
 import logging
 import queue as _queue
+from jiuwenswarm.common.log_context import NO_SESSION_ID, current_log_session_id
 from logging.handlers import BaseRotatingHandler, QueueHandler, QueueListener
 from collections import OrderedDict
 import yaml
@@ -2757,8 +2758,8 @@ class JsonUserVisibleFormatter(jsonlogger.JsonFormatter if jsonlogger else loggi
     """JSON 格式化日志输出。
 
     继承 pythonjsonlogger.JsonFormatter（缺失时降级为 logging.Formatter）。
-    字段顺序：timestamp → process → level → user_tag → user_id/domain_id/app_id →
-    logger → lineno → message → component → user_visible。
+    字段顺序：timestamp → process → session_id → level → user_tag →
+    user_id/domain_id/app_id → logger → lineno → message → component → user_visible。
     身份字段始终输出（null 便于聚合）。复用 dev-stable 的 _log_component_from_logger_name 与 _sanitize_log_text。
     """
 
@@ -2801,6 +2802,7 @@ class JsonUserVisibleFormatter(jsonlogger.JsonFormatter if jsonlogger else loggi
         if "timestamp" in log_record:
             ordered["timestamp"] = log_record["timestamp"]
         ordered["process"] = record.process
+        ordered["session_id"] = getattr(record, "session_id", None) or NO_SESSION_ID
         if "level" in log_record:
             ordered["level"] = log_record["level"]
         user_tag = getattr(record, "user_tag", None)
@@ -2915,6 +2917,18 @@ class UserVisibleTagFilter(logging.Filter):
         return True
 
 
+class SessionIdFilter(logging.Filter):
+    """从 ``log_session_id`` ContextVar 写入 ``record.session_id``。始终放行。
+
+    须挂在 ``QueueHandler``（emit 调用线程）。挂到 ``QueueListener`` 目标
+    handler 会在独立线程读到空上下文，全部变成 ``<nosid>``。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.session_id = current_log_session_id()
+        return True
+
+
 class IdentityFieldFilter(logging.Filter):
     """从 IdentityStore 读身份，写入字段并预先拼好 ``record.identity``。始终放行。
 
@@ -2944,13 +2958,15 @@ class IdentityFieldFilter(logging.Filter):
 class IdentityTextFormatter(logging.Formatter):
     """文本 Formatter：使用 Filter 阶段已写好的 ``record.identity`` 排版。
 
-    若上游未挂 IdentityFieldFilter（单测直调 Formatter），则按字段现场拼一份
-    兜底 identity，不再在此处做脱敏。
+    若上游未挂 IdentityFieldFilter / SessionIdFilter（单测直调 Formatter），
+    则按字段现场拼一份兜底 identity / session_id，不再在此处做脱敏。
     """
 
     def format(self, record: logging.LogRecord) -> str:
         if not isinstance(getattr(record, "identity", None), str):
             record.identity = build_log_identity(record)
+        if not isinstance(getattr(record, "session_id", None), str):
+            record.session_id = current_log_session_id()
         return super().format(record)
 
 
@@ -3070,7 +3086,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     json_config = _resolve_json_config() if log_format in ("json", "dual") else {}
     # 文本格式串（含 process/identity/user_tag/lineno）
     text_fmt = (
-        "%(asctime)s.%(msecs)03d [%(process)d] %(levelname)s "
+        "%(asctime)s.%(msecs)03d [%(process)d] [%(session_id)s] %(levelname)s "
         "%(identity)s%(user_tag)s%(name)s:%(lineno)d: %(message)s"
     )
 
@@ -3089,6 +3105,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     privacy_filter = SensitiveDataFilter()
     tag_config = LoggingTagConfig() if log_format in ("text", "dual", "json") else None
     identity_filter = IdentityFieldFilter()
+    session_id_filter = SessionIdFilter()
 
     def _add_rotating(
         filename: str,
@@ -3155,8 +3172,10 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     if listener_targets:
         queue_handler = QueueHandler(_log_queue)
         queue_handler.setLevel(logging.NOTSET)
-        # 必须在 emit 线程执行：IdentityStore 基于 contextvars，listener 线程读不到。
+        # 必须在 emit 线程执行：IdentityStore / log_session_id 基于 contextvars，
+        # listener 线程读不到。
         queue_handler.addFilter(identity_filter)
+        queue_handler.addFilter(session_id_filter)
         queue_handler.addFilter(privacy_filter)
         root.addHandler(queue_handler)
         if _SUPPORTS_RESPECT_HANDLER_LEVEL:

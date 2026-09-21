@@ -297,6 +297,7 @@ from jiuwenswarm.agents.harness.common.rails.concurrent_safe_rails import (
 )
 from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.common.hooks_config import load_hooks_config
+from jiuwenswarm.common.log_context import reset_log_session_id, set_log_session_id
 from jiuwenswarm.common.log_preview import preview_text
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
@@ -12016,21 +12017,24 @@ class JiuWenSwarmDeepAdapter:
             card=getattr(self._instance, "card", None),
         )
         await session.pre_run(inputs={})
-        # Bind env overlay so the DeepAgent supervisor task (created by
-        # start() via asyncio.create_task) inherits the correct namespace.
-        # Without this, the supervisor task's context copy lacks the overlay
-        # and reads env from the wrong namespace (default/default).
+        # Bind env overlay and session id so the DeepAgent supervisor task
+        # (created by start() via asyncio.create_task) copies them. One
+        # supervisor serves one session, so this value is not updated later.
+        from jiuwenswarm.common.log_context import bind_log_session, unbind_log_session
+
+        log_bind = bind_log_session(session_id)
         ns_token, overlay_token, wk_token = self._bind_request_env_overlay()
         try:
             await self._instance.start(session=session)
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
+                session_id,
+            )
         finally:
             self._reset_request_env_bindings(ns_token, overlay_token, wk_token)
+            unbind_log_session(*log_bind)
         if getattr(self._instance, "_interaction_started", True) is not True:
             raise RuntimeError(f"DeepAgent interaction did not become ready: {session_id}")
-        logger.info(
-            "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
-            session_id,
-        )
 
     async def prepare_session(
         self,
@@ -13400,6 +13404,7 @@ class JiuWenSwarmDeepAdapter:
 
         async def _resume_impl() -> AsyncIterator[AgentResponseChunk]:
             token_trace_sid = _LLM_TRACE_SESSION_ID.set(request.session_id or "default")
+            token_log_sid = set_log_session_id(request.session_id)
             token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
             token_trace_iter = _LLM_TRACE_ITERATION.set(0)
             token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -13566,6 +13571,7 @@ class JiuWenSwarmDeepAdapter:
             finally:
                 await _skill_turbo_clear_resume_in_flight(session)
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -17716,6 +17722,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -17754,6 +17761,7 @@ class JiuWenSwarmDeepAdapter:
                     return await session_adapter.process_message_impl(request, inputs)
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -17815,6 +17823,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -18013,6 +18022,7 @@ class JiuWenSwarmDeepAdapter:
                     lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter),
                     lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid),
                     lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid),
+                    lambda: reset_log_session_id(token_log_sid),
                 )
             )
             for cleanup_step in cleanup_steps:
@@ -18297,6 +18307,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)
@@ -18422,6 +18433,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -18465,6 +18477,7 @@ class JiuWenSwarmDeepAdapter:
                 return
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -18558,6 +18571,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(rid or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -18677,6 +18691,7 @@ class JiuWenSwarmDeepAdapter:
                     suppress_errors=True,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -18758,6 +18773,7 @@ class JiuWenSwarmDeepAdapter:
                     request_id=request.request_id,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -20131,6 +20147,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)
