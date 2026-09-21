@@ -54,12 +54,21 @@ export function clearManagerTokens(): void {
 
 export function redirectToManagerLogin(): boolean {
   clearManagerTokens();
-  if (typeof window === 'undefined' || /^\/auth\/?$/.test(window.location.pathname)) {
+  if (typeof window === 'undefined' || window.location.pathname.endsWith('/auth')) {
     return false;
   }
   if (!redirectStarted) {
     redirectStarted = true;
-    window.location.replace('/auth');
+    const customUrl = (window as unknown as { __JIUWEN_LOGIN_ENTRY_URL__?: string }).__JIUWEN_LOGIN_ENTRY_URL__;
+    if (customUrl) {
+      window.location.replace(customUrl);
+    } else {
+      const pathname = window.location.pathname;
+      const chatIdx = pathname.indexOf('/chat');
+      const prefix = chatIdx !== -1 ? pathname.slice(0, chatIdx) : pathname.replace(/\/+$/, '');
+      const target = prefix ? `${prefix}/auth` : '/auth';
+      window.location.replace(target);
+    }
   }
   return true;
 }

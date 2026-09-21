@@ -980,7 +980,23 @@ export class WebHttpClient {
   }
 
   private async readJson(response: Response): Promise<unknown> {
+    const contentType = response.headers.get('content-type') || '';
     const text = await response.text();
+    // 接口请求收到 HTML 响应（如门户登录页或反向代理错误页）说明代理未命中后端，
+    // 直接返回结构化错误，避免后续 JSON.parse 抛出难以定位的语法错误。
+    if (
+      contentType.includes('text/html') ||
+      text.trim().startsWith('<!doctype') ||
+      text.trim().startsWith('<html')
+    ) {
+      return {
+        ok: false,
+        error: {
+          code: 'PROXY_ROUTING_ERROR',
+          message: `接口未命中后端服务（返回了 HTML 页面，状态码 ${response.status}）。请检查后端服务是否启动，以及统一门户接口前缀代理是否配置正确。`,
+        },
+      };
+    }
     if (!text.trim()) {
       return {};
     }

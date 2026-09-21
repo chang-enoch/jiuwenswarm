@@ -6,6 +6,7 @@ import {
   splitFilenameParts,
 } from './FileTypeIcon';
 import { stripUploadDocumentBlocks } from '../../utils/documentMessage';
+import { resolveApiUrl } from '../../utils/env';
 
 export { stripUploadDocumentBlocks };
 
@@ -36,10 +37,11 @@ function mediaSrc(item: MediaItem): string | undefined {
   if (base64Data) {
     return `data:${mimeType};base64,${base64Data}`;
   }
-  if (item.url) return item.url;
+  // 服务端返回的相对地址需拼接接口前缀；绝对地址由 resolveApiUrl 原样返回。
+  if (item.url) return resolveApiUrl(item.url);
   // Documents keep local absolute paths for agent @path refs; raw-file is project-scoped.
   if (item.path && isImageItem(item)) {
-    return `/file-api/raw-file?path=${encodeURIComponent(item.path)}`;
+    return resolveApiUrl(`/file-api/raw-file?path=${encodeURIComponent(item.path)}`);
   }
   return undefined;
 }

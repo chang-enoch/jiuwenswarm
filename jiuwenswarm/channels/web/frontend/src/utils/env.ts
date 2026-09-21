@@ -9,6 +9,32 @@ function normalizeBase(input: string): string {
   return input.replace(/\/+$/, "");
 }
 
+/**
+ 	  * 获取API前缀的函数
+ 	  * 从环境变量中读取VITE_API_PREFIX配置，并进行规范化处理后返回
+ 	  * @returns {string} 返回处理后的API前缀字符串，如果环境变量未定义则返回空字符串
+ 	  */
+ 	 export function getApiPrefix(): string {
+ 	   const raw = import.meta.env.VITE_API_PREFIX as string | undefined; // 从环境变量中获取原始API前缀值，可能为undefined
+ 	   if (!raw) return ""; // 如果原始值为空，则直接返回空字符串
+ 	   return normalizeBase(raw); // 调用normalizeBase函数对原始值进行规范化处理并返回
+ 	 }
+ 	 
+ 	 export function resolveApiUrl(path: string): string {
+ 	   if (!path || /^(https?:|\/\/|data:|blob:)/i.test(path)) {
+ 	     return path;
+ 	   }
+ 	   const prefix = getApiPrefix();
+ 	   if (!prefix) {
+ 	     return path;
+ 	   }
+ 	   const cleanPath = path.startsWith("/") ? path : `/${path}`;
+ 	   if (cleanPath === prefix || cleanPath.startsWith(`${prefix}/`)) {
+ 	     return cleanPath;
+ 	   }
+ 	   return `${prefix}${cleanPath}`;
+ 	 }
+ 	 
 export function getApiBase(): string {
   const raw = import.meta.env.VITE_API_BASE as string | undefined;
   if (!raw) return "";
@@ -19,8 +45,16 @@ export function getWsBase(): string {
   const raw = import.meta.env.VITE_WS_BASE as string | undefined;
   if (raw) return normalizeBase(raw);
   const apiBase = getApiBase();
-  if (!apiBase) return "";
-  return apiBase.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  if (apiBase) {
+    return apiBase.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  }
+  // 未显式配置 VITE_WS_BASE 但配置了接口前缀时，基于当前页面 origin + 前缀推导 WS 地址。
+  const prefix = getApiPrefix();
+  if (prefix && typeof window !== "undefined") {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${prefix}/ws`;
+  }
+  return "";
 }
 
 export type WebTransport = "websocket" | "http";
@@ -61,7 +95,9 @@ export function getWebTransport(): WebTransport {
 export function getGatewayHttpBase(): string {
   const raw = import.meta.env.VITE_GATEWAY_HTTP_BASE ?? import.meta.env.VITE_WEB_HTTP_BASE;
   if (!raw) {
-    return "/gateway-api/v1";
+    // 默认走同源 gateway-api，配置接口前缀时需带上前缀以命中门户代理。
+    const prefix = getApiPrefix();
+    return prefix ? `${prefix}/gateway-api/v1` : "/gateway-api/v1";
   }
   const normalized = normalizeBase(raw);
   if (normalized.endsWith("/api/v1")) {

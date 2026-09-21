@@ -1,5 +1,5 @@
 import type { Plugin } from 'vite'
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import svgr from 'vite-plugin-svgr'
 import { createHash } from 'node:crypto'
@@ -407,76 +407,185 @@ const webHttpTarget =
   process.env.GATEWAY_WEB_HTTP_URL?.replace(/\/$/, '') ||
   `http://127.0.0.1:${webHttpPort}`
 
-export default defineConfig({
-  // 相对资源路径同时支持独立根路径与 Manager Web 的 /chat/ 同源转发。
-  base: './',
-  plugins: [loginAuthStartupCheck(), suppressWsProxySocketErrors(), devWsTrafficLogger(), react(), svgr()],
-  optimizeDeps: {
-    include: ['exceljs', 'jszip', 'saxes', 'ssf'],
-  },
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-      'virtual:login-auth-simulate-provider': path.resolve(
-        __dirname,
-        './src/auth/simulate/available.ts',
-      ),
-    },
-  },
-  server: {
-    host: '0.0.0.0',
-    port: frontendPort,
-    strictPort: true,
-    // Manager Web 企业链路把 /chat 反代到 http://jiuwenclaw-web:5173，
-    // Vite 5.4+ 默认拒绝未登记 Host，会直接 403。
-    allowedHosts: true,
-    proxy: {
-      '/idp': { target: process.env.USER_WEB_IDP_TARGET || 'http://127.0.0.1:8770', changeOrigin: true, rewrite: (p) => p.replace(/^\/idp/, '') },
-      '/manager-api': { target: process.env.USER_WEB_MANAGER_TARGET || 'http://127.0.0.1:8765', changeOrigin: true, rewrite: (p) => p.replace(/^\/manager-api/, '/api') },
-      '/file-api': {
-        target: webHttpTarget,
-        changeOrigin: true,
-      },
-      '/share-api': {
-        target: webHttpTarget,
-        changeOrigin: true,
-      },
-      // More specific than '/api' — enterprise HTTP APIs live on Web HTTP, not WS port.
-      '/api/v1': {
-        target: webHttpTarget,
-        changeOrigin: true,
-      },
-      '/gateway-api': {
-        target: webHttpTarget,
-        changeOrigin: true,
-        rewrite: (requestPath) => requestPath.replace(/^\/gateway-api/, '/api'),
-      },
-      '/api/sessions': {
-        target: webHttpTarget,
-        changeOrigin: true,
-      },
-      '/api/trajectory': {
-        target: webHttpTarget,
-        changeOrigin: true,
-      },
-      '/api': {
-        target: webTarget,
-        changeOrigin: true,
-      },
-      '/ws': {
-        target: webTarget,
-        ws: true,
-        changeOrigin: true,
-        configure: (proxy) => {
-          proxy.on('error', (err, _req, _res) => {
-            const code = (err as ErrorWithCode).code
-            if (code && WS_PROXY_IGNORABLE_CODES.has(code)) {
-              return
-            }
-            console.error('[vite] ws proxy error:', err.message)
+ /**
+  * 代理错误处理：后端服务未启动/连接被拒时，返回结构化的 502 JSON 提示，
+  * 避免浏览器收到 HTML 报错页；WS 噪音错误码保持静默。
+  */
+function createProxyErrorHandler(targetName: string) {
+  return (proxy: any) => {
+    proxy.on('error', (err: any, _req: any, res: any) => {
+      const code = (err as ErrorWithCode)?.code || ''
+      if (code && WS_PROXY_IGNORABLE_CODES.has(code)) {
+        return
+      }
+      if (res && !res.headersSent && typeof res.writeHead === 'function') {
+        res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(
+          JSON.stringify({
+            ok: false,
+            code: 'BACKEND_SERVICE_UNREACHABLE',
+            message: `后端服务未启动或连接被拒绝 [${targetName}] (${code || err.message})。请检查后端服务是否已启动并监听对应端口。`,
           })
+        )
+      }
+    })
+  }
+}
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const configuredBase = env.VITE_BASE_PATH || process.env.VITE_BASE_PATH || process.env.BASE_PATH || './'
+  const apiPrefix = (env.VITE_API_PREFIX || process.env.VITE_API_PREFIX || '').replace(/\/+$/, '')
+
+  return {
+    // 相对资源路径同时支持独立根路径与 Manager Web 的 /chat/ 同源转发；支持 VITE_BASE_PATH 指定门户前缀。
+    base: configuredBase,
+    plugins: [loginAuthStartupCheck(), suppressWsProxySocketErrors(), devWsTrafficLogger(), react(), svgr()],
+    optimizeDeps: {
+      include: ['exceljs', 'jszip', 'saxes', 'ssf'],
+    },
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, './src'),
+        'virtual:login-auth-simulate-provider': path.resolve(
+          __dirname,
+          './src/auth/simulate/available.ts',
+        ),
+      },
+    },
+    server: {
+      host: '0.0.0.0',
+      port: frontendPort,
+      strictPort: true,
+      // Manager Web 企业链路把 /chat 反代到 http://jiuwenclaw-web:5173，
+      // Vite 5.4+ 默认拒绝未登记 Host，会直接 403。
+      allowedHosts: true,
+      proxy: {
+        // 配置了接口前缀时，为带前缀的路径注册同一组代理规则（剥掉前缀后转发到对应后端）
+        ...(apiPrefix ? {
+          [`${apiPrefix}/idp`]: {
+            target: process.env.USER_WEB_IDP_TARGET || 'http://127.0.0.1:8770',
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/idp`), ''),
+            configure: createProxyErrorHandler('ID认证服务'),
+          },
+          [`${apiPrefix}/manager-api`]: {
+            target: process.env.USER_WEB_MANAGER_TARGET || 'http://127.0.0.1:8765',
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/manager-api`), '/api'),
+            configure: createProxyErrorHandler('Manager业务接口'),
+          },
+          [`${apiPrefix}/file-api`]: {
+            target: webHttpTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/file-api`), '/file-api'),
+            configure: createProxyErrorHandler('Gateway File API'),
+          },
+          [`${apiPrefix}/share-api`]: {
+            target: webHttpTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/share-api`), '/share-api'),
+            configure: createProxyErrorHandler('Gateway Share API'),
+          },
+          [`${apiPrefix}/gateway-api`]: {
+            target: webHttpTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/gateway-api`), '/api'),
+            configure: createProxyErrorHandler('Gateway Web HTTP'),
+          },
+          [`${apiPrefix}/api/v1`]: {
+            target: webHttpTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/api/v1`), '/api/v1'),
+            configure: createProxyErrorHandler('Gateway API v1'),
+          },
+          [`${apiPrefix}/api/sessions`]: {
+            target: webHttpTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/api/sessions`), '/api/sessions'),
+            configure: createProxyErrorHandler('Gateway Sessions API'),
+          },
+          [`${apiPrefix}/api`]: {
+            target: webTarget,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/api`), '/api'),
+            configure: createProxyErrorHandler('Gateway API'),
+          },
+          [`${apiPrefix}/ws`]: {
+            target: webTarget,
+            ws: true,
+            changeOrigin: true,
+            rewrite: (p) => p.replace(new RegExp(`^${apiPrefix}/ws`), '/ws'),
+            configure: (proxy) => {
+              proxy.on('error', (err, _req, _res) => {
+                const code = (err as ErrorWithCode).code
+                if (code && WS_PROXY_IGNORABLE_CODES.has(code)) {
+                  return
+                }
+                console.error('[vite] ws proxy error:', err.message)
+              })
+            },
+          },
+        } : {}),
+        '/idp': {
+          target: process.env.USER_WEB_IDP_TARGET || 'http://127.0.0.1:8770',
+          changeOrigin: true,
+          rewrite: (p) => p.replace(/^\/idp/, ''),
+          configure: createProxyErrorHandler('ID认证服务'),
+        },
+        '/manager-api': {
+          target: process.env.USER_WEB_MANAGER_TARGET || 'http://127.0.0.1:8765',
+          changeOrigin: true,
+          rewrite: (p) => p.replace(/^\/manager-api/, '/api'),
+          configure: createProxyErrorHandler('Manager业务接口'),
+        },
+        '/file-api': {
+          target: webHttpTarget,
+          changeOrigin: true,
+          configure: createProxyErrorHandler('Gateway File API'),
+        },
+        '/share-api': {
+          target: webHttpTarget,
+          changeOrigin: true,
+          configure: createProxyErrorHandler('Gateway Share API'),
+        },
+        // More specific than '/api' — enterprise HTTP APIs live on Web HTTP, not WS port.
+        '/api/v1': {
+          target: webHttpTarget,
+          changeOrigin: true,
+          configure: createProxyErrorHandler('Gateway API v1'),
+        },
+        '/gateway-api': {
+          target: webHttpTarget,
+          changeOrigin: true,
+          rewrite: (requestPath) => requestPath.replace(/^\/gateway-api/, '/api'),
+          configure: createProxyErrorHandler('Gateway Web HTTP'),
+        },
+        '/api/sessions': {
+          target: webHttpTarget,
+          changeOrigin: true,
+          configure: createProxyErrorHandler('Gateway Sessions API'),
+        },
+        '/api': {
+          target: webTarget,
+          changeOrigin: true,
+          configure: createProxyErrorHandler('Gateway API'),
+        },
+        '/ws': {
+          target: webTarget,
+          ws: true,
+          changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on('error', (err, _req, _res) => {
+              const code = (err as ErrorWithCode).code
+              if (code && WS_PROXY_IGNORABLE_CODES.has(code)) {
+                return
+              }
+              console.error('[vite] ws proxy error:', err.message)
+            })
+          },
         },
       },
     },
-  },
+  }
 })
