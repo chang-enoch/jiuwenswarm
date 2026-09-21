@@ -294,6 +294,8 @@ models:
         stream_first_chunk_timeout: 300
         # 流式：分片之间的最大空闲等待时间（秒）
         stream_idle_timeout: 120
+        # SDK 薄层重试关闭（5xx/429 不再由 OpenAI SDK 多打一次）；瞬时失败由 LLMRetryRail 整轮重试
+        max_retries: 0
         verify_ssl: true
         custom_headers: ${CUSTOM_HEADERS}
       model_config_obj:
@@ -721,7 +723,7 @@ execution_guard:
     # 总开关。关闭后不注册 LLMRetryRail，也不会额外拦截重复输出/流式帧超时
     enabled: true
     # 单次 invoke 内同一类异常最多重试次数；超过后把异常继续抛给上层
-    max_retries: 2
+    max_retries: 4
     # 重复片段检测的最短长度，单位：字符；用于检测短句/短片段循环输出
     repeat_min_pattern_chars: 2
     # 重复片段检测的最长长度，单位：字符；过长片段不作为循环模式检测
