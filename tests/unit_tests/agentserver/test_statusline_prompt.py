@@ -149,8 +149,11 @@ class TestHandleStatuslinePromptCommand:
 
     # --- Exclusion cases (known subcommands should NOT be matched) ---
 
+    # sorted() 固定参数化顺序：set 的迭代顺序随每个进程的 hash 种子变化，
+    # pytest-xdist 的两个 worker 各自收集时顺序不同，会误报
+    # "Different tests were collected between gw1 and gw0"。
     @pytest.mark.parametrize(
-        "subcmd", list(_STATUSLINE_KNOWN_SUBCOMMANDS)
+        "subcmd", sorted(_STATUSLINE_KNOWN_SUBCOMMANDS)
     )
     @staticmethod
     def test_known_subcommands_excluded(subcmd: str):
