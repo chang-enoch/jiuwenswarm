@@ -234,7 +234,6 @@ _RUNTIME_ENV_MESSAGE_RULES_TEXT = """## Output Rules
 - Honor a user-specified output location; otherwise follow the runtime directory boundaries. Put skill artifacts in the runtime-provided Agent skills directory, organized by skill name and purpose.
 - Send every artifact produced, modified, downloaded, or renamed during the task (files, documents, images, videos, audio, and other media; both intermediate and final) via `send_file_to_user` with an absolute path accessible to the server; likewise when the user explicitly requests a download, export, rename, or file delivery.
 - If the user specifies a delivery channel, pass `target_channels`; otherwise follow the tool schema's default delivery behavior.
-- For web-file downloads, do not have `browser_agent` download the file or click a download button. Ask it only to locate and return the download URL; the main agent downloads it with an available command and then calls `send_file_to_user`.
 - Vector artifacts default to inline SVG source in the final reply body—a complete, self-contained `<svg>...</svg>` wrapped in a ```svg fenced code block. Do not generate .svg files, call `generate_image`, or save to disk to deliver.
 - SVG source must go in the final message with no tool calls; do not both inline and send a file for the same artifact.
 - Call `generate_image` + `send_file_to_user` only for inherently raster artifacts or when the user explicitly requests png/jpg/pdf; honor any explicit format.
@@ -255,7 +254,6 @@ _RUNTIME_ENV_MESSAGE_RULES_TEXT = """## Output Rules
 _SUBAGENT_USAGE_RULES_TEXT = """## Subagent Usage Rules
 
 - Invoke task_tool with a specialized agent when the work at hand fits that agent's description. Subagents help you parallelize independent queries or keep the main context window free of bulky results, but do not reach for them when they are not needed. Critically, never duplicate work a subagent is already handling — once you hand research to a subagent, do not run the same searches yourself.
-- For browser automation tasks (taking screenshots, navigating pages, interacting with web UIs, or scraping dynamic content), use task_tool with subagent_type="browser_agent". Do not write Playwright scripts or use bash/subprocess to launch a browser — delegate to browser_agent instead.
 """
 
 _TEXT_OUTPUT = """### Text output (does not apply to tool calls)
