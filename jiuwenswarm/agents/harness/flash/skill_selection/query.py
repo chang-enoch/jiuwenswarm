@@ -57,13 +57,12 @@ def application_envelope(content: object) -> dict | None:
             )
         except (ValueError, RecursionError):
             continue
-        if (
-            not isinstance(envelope, dict)
-            or envelope.get("type") not in ("user input", "cron", "heartbeat")
-            or not isinstance(envelope.get("source"), str)
-            or not isinstance(envelope.get("preferred_response_language"), str)
-            or "content" not in envelope
-        ):
+        if not isinstance(envelope, dict):
+            continue
+        if envelope.get("type") not in ("user input", "cron", "heartbeat") or "content" not in envelope:
+            continue
+        if (not isinstance(envelope.get("source"), str)
+                or not isinstance(envelope.get("preferred_response_language"), str)):
             continue
         return envelope
     return None

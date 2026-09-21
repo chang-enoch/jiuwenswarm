@@ -4,6 +4,18 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class SearchCacheKey:
+    """Include every query, configuration and permission boundary in reuse."""
+
+    settings: tuple
+    service_id: int
+    generation: int
+    permission_key: str
+    query: str
+    keywords: tuple[str, ...]
+
+
 @dataclass
 class RequestState:
     # Model tool calls can arrive together. Serializing only this invocation

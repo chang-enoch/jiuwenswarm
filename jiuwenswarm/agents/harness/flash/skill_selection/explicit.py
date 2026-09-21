@@ -34,13 +34,15 @@ def explicit_task_text(text):
 
     This does not produce retrieval queries or alter the model's user message.
     """
-    text = re.sub(r'(?:#{1,6}\s*)?(?:输入素材|原始材料|参考资料|任务内容|待处理内容|原文|输入内容|正文)\s*[:：]?\s*(?=`{3,}|~{3,})', '', text)
+    text = re.sub(r'(?:#{1,6}\s*)?(?:输入素材|原始材料|参考资料|任务内容|待处理内容|原文|输入内容|正文)'
+                  r'\s*[:：]?\s*(?=`{3,}|~{3,})', '', text)
     text = re.sub(r'(`{3,}|~{3,})[\s\S]*?(?:\1|$)', ' ', text)
     lines = re.split(r'\n|(?<!#)(?=#{1,6}\s)', text)
     result, material = [], False
     for line in lines:
         heading = re.sub(r'^\s*#{1,6}\s*', '', line).strip()
-        if re.match(r'^(?:输入素材|原始材料|参考资料|任务内容|待处理内容|原文|输入内容|正文)(?:\s*[:：]|\s*$)', heading):
+        if re.match(r'^(?:输入素材|原始材料|参考资料|任务内容|待处理内容|原文|输入内容|正文)'
+                    r'(?:\s*[:：]|\s*$)', heading):
             material = True
         elif re.match(r'^(?:任务要求|输出要求|交付要求|补充要求|需求|任务)(?:\s*[:：]|\s*$)', heading):
             material = False
@@ -57,7 +59,9 @@ def explicit_request(content, query, known_names=()) -> ExplicitRequest | None:
         envelope = application_envelope(block.get("text")) if isinstance(block, dict) else None
         if envelope and "skills_to_use" in envelope:
             value = envelope["skills_to_use"]
-            if not isinstance(value, list) or any(not isinstance(n, str) or not n.strip() or len(n) > 128 for n in value):
+            if not isinstance(value, list):
+                return ExplicitRequest("frontend", (), "invalid_names")
+            if any(not isinstance(n, str) or not n.strip() or len(n) > 128 for n in value):
                 return ExplicitRequest("frontend", (), "invalid_names")
             requests.extend(n.strip() for n in value)
     if requests:
@@ -79,7 +83,9 @@ def explicit_request(content, query, known_names=()) -> ExplicitRequest | None:
         if re.match(r'\s*(?:格式|文件|format\b|file\b)', clause, re.I):
             continue
         marked = bool(re.search(r'技能|\bskill\b', match[0] + clause, re.I))
-        if name.casefold() in known or marked or '-' in name or '_' in name or raw != name:
+        named = name.casefold() in known or marked
+        annotated = '-' in name or '_' in name or raw != name
+        if named or annotated:
             names.append(name.casefold())
             # A choice/list is not a uniquely specified textual name.
             remainder = re.sub(r'^\s*(?:的|这个)?(?:技能|skills?)\s*', '', clause, flags=re.I)
@@ -118,7 +124,9 @@ def _resolve_names(request, native):
             return (), "ambiguous_names" if matches else "missing_or_not_allowed"
         skill = matches[0]
         path = Path(skill.directory)
-        if path.name in disabled or skill.name in disabled or (enabled and path.name not in enabled):
+        if path.name in disabled or skill.name in disabled:
+            return (), "missing_or_not_allowed"
+        if enabled and path.name not in enabled:
             return (), "missing_or_not_allowed"
         target = (path / 'SKILL.md').resolve()
         if not any(target.is_relative_to(root) for root in roots) or not target.is_file():

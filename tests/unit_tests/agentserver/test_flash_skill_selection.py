@@ -15,11 +15,11 @@ from openjiuwen.harness.prompts.sections.skills import build_skills_section
 from openjiuwen.harness.tools import ToolOutput
 
 from jiuwenswarm.agents.harness.flash.skill_selection import execution, service
-from jiuwenswarm.agents.harness.flash.skill_selection.catalog import directory_id
+from jiuwenswarm.agents.harness.flash.skill_selection.catalog import directory_id, read_catalog
 from jiuwenswarm.agents.harness.flash.skill_selection.config import SelectionSettings
 from jiuwenswarm.agents.harness.flash.skill_selection.rail import SkillSelectionRail
 from jiuwenswarm.agents.harness.flash.skill_selection.tool import (
-    SYSTEM_GUIDANCE, TOOL_GUIDANCE, SkillSearchTool,
+    SYSTEM_GUIDANCE, TOOL_GUIDANCE, SkillSearchInput, SkillSearchTool,
 )
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep, interface_flash
 
@@ -112,7 +112,7 @@ async def search(h, ctx, query="制作演示文稿", keywords=None):
     # Tests install fixtures after rail.init; publish that simulated install,
     # then emulate the SDK's native catalog hook before the model runs.
     h.rail.refresh(force=True)
-    await h.rail._service.current_snapshot()
+    await h.rail.service.current_snapshot()
     h.native.scan()
     await h.rail.before_model_call(ctx)
     await h.rail.after_model_call(ctx)
@@ -129,7 +129,8 @@ async def load(h, search_id, name, source):
     await h.rail.before_tool_call(ctx)
     if ctx.inputs.tool_name != 'skill_tool':
         try:
-            return await h.rail._from_model('load', ctx, search_id=search_id, skill_name=name)
+            return await h.rail.handle_action(
+                SkillSearchInput(action='load', search_id=search_id, skill_name=name), ctx)
         finally:
             await h.rail.after_tool_call(ctx)
     result, message = (await h.abilities.execute(ctx, call, ctx.session, parallel_tool_calls=False))[0]
@@ -187,11 +188,11 @@ async def test_flash_selection_survives_startup_cleanup_and_config_read(
     await harness.rail.before_model_call(ctx)
     assert (SkillSearchTool.TOOL_NAME in harness.abilities.tools) is enabled
     if enabled:
-        assert harness.rail._service.settings.candidate_k == 3
+        assert harness.rail.service.settings.candidate_k == 3
         result = await harness.rail._search_from_model("制作演示文稿", ["slides"], ctx)
         assert result["status"] == "candidates"
     else:
-        assert harness.rail._service is None
+        assert harness.rail.service is None
     await harness.rail.after_model_call(ctx)
 
 
@@ -243,6 +244,26 @@ async def test_cross_request_ticket_and_forged_name_rejected(harness):
     assert (await load(h, result["search_id"], "slides", second))["status"] == "invalid_search"
     assert (await load(h, result["search_id"], "../other", first))["status"] == "invalid_choice"
     h.abilities.execute.assert_not_awaited()
+
+
+async def test_rejected_call_does_not_contaminate_another_call_in_same_request(harness):
+    h = harness
+    source = context()
+    result = await search(h, source)
+    rejected = SimpleNamespace(extra=source.extra, session=source.session)
+    h.rail.load_rail.reject(rejected, 'invalid_choice', 'Invalid candidate')
+    request = SkillSearchInput(action='load', search_id=result['search_id'], skill_name='missing')
+    assert (await h.rail.handle_action(request, rejected))['status'] == 'invalid_choice'
+    assert (await load(h, result['search_id'], 'slides', source))['loaded'] is True
+
+
+def test_invalid_utf8_skill_does_not_discard_readable_catalog(tmp_path):
+    write_skill(tmp_path, 'slides')
+    invalid = tmp_path / 'invalid-utf8'
+    invalid.mkdir()
+    (invalid / 'SKILL.md').write_bytes(b'\xff\xfeinvalid')
+    documents = read_catalog([tmp_path], text_max_chars=2000)
+    assert [document.name for document in documents] == ['slides']
 
 
 @pytest.mark.parametrize("change", ["disabled", "file", "config", "catalog"])
@@ -309,7 +330,7 @@ async def test_prompt_tools_disable_and_reenable(harness):
     assert builder.get_section("skills") == native
     h.config["flash"]["skill_selection"]["enabled"] = False
     await h.rail.before_model_call(ctx)
-    assert not h.abilities.tools and h.rail._service is None
+    assert not h.abilities.tools and h.rail.service is None
     assert builder.get_section("skills") == native
     h.config["flash"]["skill_selection"]["enabled"] = True
     await h.rail.before_model_call(ctx)
@@ -440,7 +461,7 @@ async def test_model_request_excludes_full_catalog_before_and_after_search(harne
     # The harness began indexing before we added 299 files; finish that simulated
     # installation before checking the normal (non-fallback) model-call path.
     rail.refresh(force=True)
-    await rail._service.current_snapshot()
+    await rail.service.current_snapshot()
 
     async def native_catalog_prompt(model_ctx):
         native = SimpleNamespace(skills=records, skill_mode="all", SKILL_MODE_ALL="all",
@@ -536,7 +557,8 @@ async def test_model_request_excludes_full_catalog_before_and_after_search(harne
         assert {*ordinary_names, 'skill_tool'} <= {t['name'] for t in execution_request['tools']}
         assert all(name not in captured[-1] and desc not in captured[-1] for name, desc in hidden.items())
 
-        await rail._from_model('fallback', ctx)
+        await rail.handle_action(
+            SkillSearchInput(action='fallback'), ctx)
         await call_model()
         assert 'execution-only-contract' in captured[-1]
         assert all(name in captured[-1] and desc in captured[-1] for name, desc in hidden.items())
@@ -601,7 +623,7 @@ async def test_failed_index_restores_native_flow(harness, monkeypatch):
     ctx = context()
     await h.rail.before_model_call(ctx)
     await h.rail.after_model_call(ctx)
-    monkeypatch.setattr(h.rail._service, "current_snapshot", AsyncMock(side_effect=RuntimeError("broken index")))
+    monkeypatch.setattr(h.rail.service, "current_snapshot", AsyncMock(side_effect=RuntimeError("broken index")))
     result = await h.rail._search_from_model("slides", ["slides"], ctx)
     assert result["status"] == "failed" and not result["loaded"]
     await h.rail.before_model_call(ctx)
@@ -717,7 +739,7 @@ def test_disabled_rail_does_not_create_catalog(monkeypatch):
     rail = SkillSelectionRail(config_provider=lambda: {}, skill_rail_provider=lambda: None)
     abilities = Abilities()
     rail.init(SimpleNamespace(ability_manager=abilities))
-    assert not abilities.tools and rail._service is None
+    assert not abilities.tools and rail.service is None
 
 
 @pytest.mark.parametrize("operation", ["skill", "ordinary"])
@@ -831,7 +853,7 @@ async def test_cancellation_releases_request_and_native_cache_flag(harness, monk
 
 async def warm_catalog(h):
     h.rail.refresh(force=True)
-    await h.rail._service.current_snapshot()
+    await h.rail.service.current_snapshot()
 
 
 async def test_two_round_selection_and_execution_metrics_are_separate(harness, monkeypatch):
@@ -848,7 +870,8 @@ async def test_two_round_selection_and_execution_metrics_are_separate(harness, m
     ctx.inputs.response = SimpleNamespace(usage_metadata=dict(
         input_tokens=200, cache_tokens=120, output_tokens=10, reasoning_tokens=3))
     await h.rail.after_model_call(ctx)
-    result = await h.rail._from_model('search', ctx, query='制作幻灯片', keywords=['slides'])
+    result = await h.rail.handle_action(
+        SkillSearchInput(action='search', query='制作幻灯片', keywords=['slides']), ctx)
     assert result['candidates'][0]['name'] == 'slides'
     assert h.native.reload_count == 0
     h.abilities.execute.assert_not_awaited()
@@ -894,7 +917,8 @@ async def test_stale_candidate_file_change_is_rejected(harness):
     ctx = context()
     await h.rail.before_model_call(ctx)
     await h.rail.after_model_call(ctx)
-    result = await h.rail._from_model('search', ctx, query='制作幻灯片', keywords=['slides'])
+    result = await h.rail.handle_action(
+        SkillSearchInput(action='search', query='制作幻灯片', keywords=['slides']), ctx)
     assert (await load(h, result['search_id'], 'slides', ctx))['status'] == 'changed'
     h.abilities.execute.assert_not_awaited()
 
@@ -917,7 +941,7 @@ async def test_search_serves_snapshot_while_background_check_runs(harness, monke
     import threading
     h = harness
     await warm_catalog(h)
-    svc = h.rail._service
+    svc = h.rail.service
     original = svc._prepare_checked
     entered, release = threading.Event(), threading.Event()
     def delayed_check(*args):
@@ -961,7 +985,8 @@ async def test_candidate_rejection_restores_native_catalog_and_invalidates_ticke
     h = harness
     ctx = context()
     search_id = (await search(h, ctx))['search_id']
-    result = await h.rail._from_model('fallback', ctx)
+    result = await h.rail.handle_action(
+        SkillSearchInput(action='fallback'), ctx)
     assert result['status'] == 'fallback' and not result['loaded']
     assert not ctx.extra[h.rail.REUSE].tickets
     await h.rail.before_model_call(ctx)
@@ -1048,7 +1073,7 @@ async def test_two_round_views_restore_execution_and_keep_request_intact(harness
     ctx = context(text)
     original_tools = list(ctx.inputs.tools)
     h.rail.refresh(force=True)
-    await h.rail._service.current_snapshot()
+    await h.rail.service.current_snapshot()
     # No retrieval may run before the model has supplied query and keywords.
     with monkeypatch.context() as first_round:
         automatic_search = AsyncMock(side_effect=AssertionError('query must come from the model'))
@@ -1062,8 +1087,9 @@ async def test_two_round_views_restore_execution_and_keep_request_intact(harness
     assert ctx.extra[h.rail.REUSE].searches == 0
     await h.rail.after_model_call(ctx)
     assert ctx.inputs.tools == original_tools
-    result = await h.rail._from_model('search', ctx, query='制作三页幻灯片，交付 pptx，不要 HTML',
-                                      keywords=['presentation', 'slides', 'pptx'])
+    result = await h.rail.handle_action(
+        SkillSearchInput(action='search', query='制作三页幻灯片，交付 pptx，不要 HTML',
+                         keywords=['presentation', 'slides', 'pptx']), ctx)
     assert result['status'] == 'candidates'
     await h.rail.before_model_call(ctx)
     assert [t.name for t in ctx.inputs.tools] == [SkillSearchTool.TOOL_NAME]
@@ -1081,13 +1107,14 @@ async def test_two_round_warm_query_does_not_rescan_and_revocation_is_live(harne
     h = harness
     ctx = context()
     h.rail.refresh(force=True)
-    await h.rail._service.current_snapshot()
+    await h.rail.service.current_snapshot()
     monkeypatch.setattr(h.native, 'reload_skills', AsyncMock(side_effect=AssertionError('duplicate native scan')))
     with monkeypatch.context() as query_patch:
-        query_patch.setattr(h.rail._service, '_submit_build', lambda: pytest.fail('fresh catalog rechecked'))
+        query_patch.setattr(h.rail.service, '_submit_build', lambda: pytest.fail('fresh catalog rechecked'))
         await h.rail.before_model_call(ctx)
         await h.rail.after_model_call(ctx)
-        result = await h.rail._from_model('search', ctx, query='制作幻灯片', keywords=['slides'])
+        result = await h.rail.handle_action(
+            SkillSearchInput(action='search', query='制作幻灯片', keywords=['slides']), ctx)
     assert result['status'] == 'candidates'
     h.native.disabled_skills = {'slides'}
     assert (await load(h, result['search_id'], 'slides', ctx))['status'] == 'changed'
@@ -1108,8 +1135,9 @@ async def test_two_round_timeout_restores_all_tools_and_catalog(harness, monkeyp
         finally:
             cancelled.set()
 
-    monkeypatch.setattr(h.rail._service, 'current_snapshot', slow)
-    result = await asyncio.wait_for(h.rail._from_model('search', ctx, query='制作幻灯片', keywords=['slides']), 2)
+    monkeypatch.setattr(h.rail.service, 'current_snapshot', slow)
+    result = await asyncio.wait_for(h.rail.handle_action(
+        SkillSearchInput(action='search', query='制作幻灯片', keywords=['slides']), ctx), 2)
     assert result['status'] == 'timeout' and cancelled.is_set()
     await h.rail.before_model_call(ctx)
     assert {t.name for t in ctx.inputs.tools} == {'bash', 'skill_tool'}
@@ -1122,7 +1150,8 @@ async def test_two_round_unsuitable_candidates_do_not_search_again(harness, monk
     ctx = context()
     result = await search(h, ctx)
     monkeypatch.setattr(h.rail, '_search_once', AsyncMock(side_effect=AssertionError('must not search again')))
-    assert (await h.rail._from_model('fallback', ctx))['status'] == 'fallback'
+    assert (await h.rail.handle_action(
+        SkillSearchInput(action='fallback'), ctx))['status'] == 'fallback'
     assert not ctx.extra[h.rail.REUSE].tickets
     await h.rail.before_model_call(ctx)
     assert {t.name for t in ctx.inputs.tools} == {'bash', 'skill_tool'}

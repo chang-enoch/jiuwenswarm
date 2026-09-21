@@ -6,12 +6,11 @@ import re
 from .freshness import file_stamp
 
 
-
 def read_sources(directory, raw=None, *, observed_files=None):
     root = Path(directory).resolve()
     path = root / 'SKILL.md'
     if raw is None:
-        if not path.is_file() or not path.resolve().is_relative_to(root) or path.stat().st_size > 1024*1024:
+        if not path.is_file() or not path.resolve().is_relative_to(root) or path.stat().st_size > 1024 * 1024:
             return ()
         raw = path.read_text(encoding='utf-8-sig')
     # Hash the whole bounded root document, including text beyond the excerpt.

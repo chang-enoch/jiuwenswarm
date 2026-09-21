@@ -214,8 +214,9 @@ class SelectionService:
             # Interactive searches may use the last verified snapshot while
             # a bounded background check runs. Forced refreshes await freshness;
             # selected files and permissions are always rechecked before loading.
-            if (allow_stale and self._ready and self._error is None
-                    and not self._force_refresh and not self._pending_refresh and not self._building_forced):
+            verified = allow_stale and self._ready and self._error is None
+            refresh_required = self._force_refresh or self._pending_refresh or self._building_forced
+            if verified and not refresh_required:
                 if (self._build is None and
                         time.monotonic() - self._checked_at >= self.settings.catalog_check_interval_s):
                     self._submit_build()

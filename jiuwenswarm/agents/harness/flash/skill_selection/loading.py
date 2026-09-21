@@ -53,8 +53,10 @@ class SkillSelectionLoadRail(DeepAgentRail):
             if (ctx.extra.get(self.selection.EXPLICIT) or {}).get('error'):
                 self.reject(ctx, 'explicit_selection_blocked', '用户指定项不可用，请先说明原因。')
                 return
-            ctx._flash_selection_load = dict(ticket=ticket, selected=selected,
-                                             search_id=args.search_id, started=time.perf_counter())
+            # Keep call-specific state on the callback context. ctx.extra may
+            # be shared by parallel tool calls in the same request.
+            ctx.flash_selection_load = dict(ticket=ticket, selected=selected,
+                                            search_id=args.search_id, started=time.perf_counter())
             native_args = json.dumps({'skill_name': selected.name, 'relative_file_path': 'SKILL.md'})
             ctx.inputs.tool_call.name = 'skill_tool'
             ctx.inputs.tool_call.arguments = native_args
@@ -67,27 +69,28 @@ class SkillSelectionLoadRail(DeepAgentRail):
     def reject(self, ctx, status, message):
         # Leave the original tool call in place. Its ordinary callback returns
         # this error; no shared _skip_tool flag can affect a parallel tool call.
-        ctx._flash_selection_error = self.selection._response(status, message)
+        ctx.flash_selection_error = self.selection.response(status, message)
         if status in {'changed', 'load_failed', 'invalid_search'}:
-            self.selection._use_default(ctx, status)
+            self.selection.use_default(ctx, status)
 
     def valid(self, ticket, selected):
         rail = self.selection
-        settings = SelectionSettings.from_config(rail._config_provider())
-        disabled = (rail._config_provider().get('react') or {}).get('disabled_tools', [])
+        config = rail.config
+        settings = SelectionSettings.from_config(config)
+        disabled = (config.get('react') or {}).get('disabled_tools', [])
         if isinstance(disabled, str):
             disabled = [s.strip() for s in disabled.split(',')]
-        native = rail._skill_rail_provider()
+        native = rail.native
         permitted, error = resolve_names(ExplicitRequest('candidate', (selected.name,)), native)
         return (settings.enabled and settings.identity() == ticket['settings']
                 and SkillSearchTool.TOOL_NAME not in (disabled or [])
-                and native is ticket['native'] and rail._service is ticket['service']
+                and native is ticket['native'] and rail.service is ticket['service']
                 and not ticket['service'].retired and not error and len(permitted) == 1
                 and permitted[0].id == selected.id
                 and source_fingerprint('', read_sources(selected.directory)) == selected.fingerprint)
 
     async def finish(self, ctx):
-        load = getattr(ctx, '_flash_selection_load', None)
+        load = getattr(ctx, 'flash_selection_load', None)
         if load is None:
             return
         native_output = getattr(ctx.inputs, 'tool_result', None)
@@ -100,7 +103,7 @@ class SkillSelectionLoadRail(DeepAgentRail):
             # Preserve denial details and native tool result; do not claim load.
             return
         if not valid:
-            data = self.selection._response('changed', '加载期间配置、权限或文件变化，请重新检索。')
+            data = self.selection.response('changed', '加载期间配置、权限或文件变化，请重新检索。')
         else:
             state = ctx.extra.get(self.selection.REUSE)
             if state is not None:

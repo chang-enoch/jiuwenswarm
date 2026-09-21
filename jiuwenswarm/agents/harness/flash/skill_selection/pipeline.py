@@ -15,6 +15,7 @@ class SelectionResult:
 class SelectionPipeline:
     def __init__(self, settings, retriever=None):
         self.settings = settings
+        self.documents = {}
         self.retriever = retriever or BM25Retriever(k1=settings.k1, b=settings.b,
                                                    name_weight=settings.name_weight)
 
@@ -28,7 +29,7 @@ class SelectionPipeline:
                                        allowed_ids=allowed_ids)
         return SelectionResult(
             candidates=tuple((self.documents[c.skill_id], c.score) for c in ranked),
-            elapsed_ms={'bm25': (time.perf_counter()-start)*1000},
+            elapsed_ms={'bm25': (time.perf_counter() - start) * 1000},
             diagnostics={'catalog_count': len(self.documents), 'allowed_count': len(allowed_ids),
                          'reason': 'candidates' if ranked else 'no_overlap'},
         )

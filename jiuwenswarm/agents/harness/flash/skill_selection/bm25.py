@@ -35,14 +35,18 @@ class BM25Okapi:
                 scores[i] += self.idf[term] * frequency * (self.k1 + 1) / denominator
         return scores
 
-_STOP = frozenset('a an the to of for in on and or with from by as is are be this that it its use using can your you our when needs need please help me my'.split())
+
+_STOP = frozenset(
+    'a an the to of for in on and or with from by as is are be this that it its '
+    'use using can your you our when needs need please help me my'.split()
+)
 
 
 def tokenize(text):
     result = []
     for word in re.findall(r'[a-z0-9]+|[一-龥]+', unicodedata.normalize('NFKC', text).lower()):
         if re.fullmatch(r'[一-龥]+', word):
-            result.extend(word[i:i+2] for i in range(len(word)-1))
+            result.extend(word[i:i + 2] for i in range(len(word) - 1))
         elif word not in _STOP:
             if len(word) > 4 and word.endswith('ies'):
                 word = word[:-3] + 'y'
@@ -55,6 +59,9 @@ def tokenize(text):
 class BM25Retriever:
     def __init__(self, *, k1=0.9, b=0.4, name_weight=0.5):
         self.k1, self.b, self.name_weight = k1, b, name_weight
+        self.documents = ()
+        self.index = None
+        self.names = None
 
     def prepare(self, documents):
         self.documents = tuple(documents)

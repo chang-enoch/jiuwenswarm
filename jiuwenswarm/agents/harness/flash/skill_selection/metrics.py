@@ -24,7 +24,7 @@ class RequestMetrics:
     model_calls: int = 0
     model_errors: int = 0
     usage_samples: int = 0
-    model_ms: float = 0
+    model_ms: float = 0.0
     totals: dict = field(default_factory=lambda: dict.fromkeys(FIELDS, 0))
     first_load_ms: float | None = None
     closed: bool = False
@@ -33,7 +33,8 @@ class RequestMetrics:
     def snapshot(self):
         complete = self.model_calls > 0 and self.usage_samples == self.model_calls
         totals = self.totals if self.usage_samples else dict.fromkeys(FIELDS)
-        return dict(mode=self.mode, fallback=self.fallback, model_calls=self.model_calls, model_errors=self.model_errors,
+        return dict(mode=self.mode, fallback=self.fallback,
+                    model_calls=self.model_calls, model_errors=self.model_errors,
                     usage_samples=self.usage_samples, usage_complete=complete,
                     model_ms=self.model_ms, first_load_ms=self.first_load_ms,
                     **totals, uncached_input_tokens=(max(0, self.totals['input_tokens'] - self.totals['cache_tokens'])

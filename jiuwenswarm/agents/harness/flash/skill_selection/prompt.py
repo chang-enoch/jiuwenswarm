@@ -16,8 +16,10 @@ def _adapt_entry(text: str) -> str:
         ("Read the relevant SKILL.md using read_file before execution.",
          "Load the relevant SKILL.md through the skill retrieval guidance before execution."),
         ("Available skills:", "The skill catalog is available through on-demand retrieval."),
-        ("No skill was selected for this task. When skill information is available, read the relevant SKILL.md using read_file.",
-         "No skill was selected for this task. When a skill is needed, find and load its SKILL.md through the skill retrieval guidance."),
+        ("No skill was selected for this task. When skill information is available, "
+         "read the relevant SKILL.md using read_file.",
+         "No skill was selected for this task. When a skill is needed, "
+         "find and load its SKILL.md through the skill retrieval guidance."),
     )
     for old, new in replacements:
         text = text.replace(old, new)
@@ -37,8 +39,10 @@ def without_catalog(section: PromptSection) -> PromptSection:
             content[language] = _adapt_entry(original)
             continue
         before, after = template.render(language).split(marker)
-        if (not before or not after or not original.startswith(before)
-                or not original.endswith(after) or len(original) < len(before) + len(after)):
+        if not before or not after:
+            raise ValueError("Native Skill prompt format is not supported")
+        if (not original.startswith(before) or not original.endswith(after)
+                or len(original) < len(before) + len(after)):
             raise ValueError("Native Skill prompt format is not supported")
         content[language] = _adapt_entry(before + after)
     return PromptSection(name=section.name, content=content, priority=section.priority)

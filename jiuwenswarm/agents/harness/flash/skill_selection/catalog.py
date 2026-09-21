@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
@@ -12,7 +13,6 @@ from .types import SkillDocument
 from .cards import capability_card
 from .sources import read_sources, source_fingerprint
 from .capability_metadata import declared_contract
-from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def read_catalog(
                     )
                     if end is not None:
                         metadata = yaml.safe_load("\n".join(lines[1:end])) or {}
-                        body = "\n".join(lines[end + 1 :])
+                        body = "\n".join(lines[end + 1:])
                 if not isinstance(metadata, dict):
                     raise ValueError("Skill front matter must be a mapping")
                 name = str(metadata.get("name") or directory.name)
@@ -113,7 +113,7 @@ def read_catalog(
                     description[:4000],
                     record,
                 )
-            except (OSError, ValueError, UnicodeError, yaml.YAMLError) as exc:
+            except (OSError, ValueError, yaml.YAMLError) as exc:
                 logger.warning(
                     "[SkillSelection] skipping unreadable skill %s: %s", path, exc
                 )

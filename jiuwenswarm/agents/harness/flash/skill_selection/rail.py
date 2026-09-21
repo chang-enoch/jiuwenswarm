@@ -10,6 +10,7 @@ import time
 import os
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from openjiuwen.harness.prompts import PromptSection
 from openjiuwen.harness.rails.base import DeepAgentRail
@@ -20,11 +21,10 @@ from .execution import SelectionBusy, SelectionTimedOut
 from .diagnostics import emit, selection_trace
 from .query import retrieval_text
 from .explicit import explicit_request, explicit_task_text, resolve_names
-from .tool import SkillSearchTool, SYSTEM_GUIDANCE
+from .tool import SkillSearchInput, SkillSearchTool, SYSTEM_GUIDANCE
 from .presentation import candidate_view
 from .prompt import without_catalog
-from .request_state import RequestState
-from uuid import uuid4
+from .request_state import RequestState, SearchCacheKey
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,21 @@ class SkillSelectionRail(DeepAgentRail):
         self._metrics = MetricsBridge()
         from .loading import SkillSelectionLoadRail
         self.load_rail = SkillSelectionLoadRail(self)
+
+    @property
+    def config(self):
+        """Read live configuration for cooperating selection components."""
+        return self._config_provider()
+
+    @property
+    def native(self):
+        """Return the current native authority for Skill permissions and loading."""
+        return self._skill_rail_provider()
+
+    @property
+    def service(self):
+        """Expose the current retrieval service without allowing replacement."""
+        return self._service
 
     def init(self, agent: Any) -> None:
         self._agent = agent
@@ -155,7 +170,7 @@ class SkillSelectionRail(DeepAgentRail):
             return
         manager = self._agent.ability_manager
         if enabled and self._tool is None:
-            self._tool = SkillSearchTool(self._from_model)
+            self._tool = SkillSearchTool(self.handle_action)
             manager.add_ability(self._tool.card, self._tool)
         elif not enabled and self._tool is not None:
             manager.remove_ability(SkillSearchTool.TOOL_NAME)
@@ -251,7 +266,7 @@ class SkillSelectionRail(DeepAgentRail):
             metrics.model_started = time.perf_counter()
 
     @staticmethod
-    def _response(status, message, **fields):
+    def response(status, message, **fields):
         return {'status': status, 'loaded': False, 'selected': None, 'message': message, **fields}
 
     @staticmethod
@@ -279,19 +294,20 @@ class SkillSelectionRail(DeepAgentRail):
                 allowed.add(identity)
         return frozenset(allowed)
 
-    async def _from_model(self, action, ctx, query=None, keywords=None, search_id=None, skill_name=None):
+    async def handle_action(self, request: SkillSearchInput, ctx):
         # Arguments have already been validated for exactly one action.
-        if action == 'load':
-            return getattr(ctx, '_flash_selection_error', self._response(
+        if request.action == 'load':
+            return getattr(ctx, 'flash_selection_error', self.response(
                 'unavailable', '加载必须经过 Flash 原生工具调用流程。'))
-        if action == 'fallback':
+        if request.action == 'fallback':
             if (ctx.extra.get(self.EXPLICIT) or {}).get('error'):
-                return self._response('explicit_selection_blocked', '请先说明用户指定技能不可用的原因。')
-            self._use_default(ctx, 'candidates_unsuitable')
-            return self._response('fallback', '本请求已切换为原生技能流程。下一轮使用原生技能目录和 skill_tool；无需重新检索。')
-        return await self._search_from_model(query, keywords, ctx)
+                return self.response('explicit_selection_blocked', '请先说明用户指定技能不可用的原因。')
+            self.use_default(ctx, 'candidates_unsuitable')
+            return self.response('fallback', '本请求已切换为原生技能流程。'
+                                 '下一轮使用原生技能目录和 skill_tool；无需重新检索。')
+        return await self._search_from_model(request.query, request.keywords, ctx)
 
-    def _use_default(self, ctx, reason):
+    def use_default(self, ctx, reason):
         ctx.extra[self.FALLBACK] = True
         state = ctx.extra.get(self.REUSE)
         if state is not None:
@@ -309,25 +325,25 @@ class SkillSelectionRail(DeepAgentRail):
                 async with state.lock:
                     return await self._search_once(query, keywords, ctx, state)
         except (TimeoutError, SelectionTimedOut):
-            self._use_default(ctx, 'timeout')
-            return self._response('timeout', '检索超时，尚未加载技能；下一轮恢复原生目录与工具。')
+            self.use_default(ctx, 'timeout')
+            return self.response('timeout', '检索超时，尚未加载技能；下一轮恢复原生目录与工具。')
         except SelectionBusy:
-            self._use_default(ctx, 'busy')
-            return self._response('busy', '检索暂忙，尚未加载技能；下一轮恢复原生目录与工具。')
+            self.use_default(ctx, 'busy')
+            return self.response('busy', '检索暂忙，尚未加载技能；下一轮恢复原生目录与工具。')
         except Exception:
-            self._use_default(ctx, 'failed')
+            self.use_default(ctx, 'failed')
             logger.warning('[SkillSelection] search failed', exc_info=True)
-            return self._response('failed', '检索不可用，尚未加载技能；下一轮恢复原生目录与工具。')
+            return self.response('failed', '检索不可用，尚未加载技能；下一轮恢复原生目录与工具。')
 
     async def _search_once(self, query, keywords, ctx, state):
         started = time.perf_counter()
         settings = self.refresh()
         if not settings.enabled:
-            return self._response('disabled', '检索开关已关闭，请使用默认方式。')
+            return self.response('disabled', '检索开关已关闭，请使用默认方式。')
         if self.REQUEST not in ctx.extra:
-            return self._response('missing_request_context', '缺少当前请求上下文。')
+            return self.response('missing_request_context', '缺少当前请求上下文。')
         if (ctx.extra.get(self.EXPLICIT) or {}).get('error'):
-            return self._response('explicit_selection_blocked', '用户指定项未能加载，请说明原因，不要换选。')
+            return self.response('explicit_selection_blocked', '用户指定项未能加载，请说明原因，不要换选。')
         service, native = self._service, self._skill_rail_provider()
         # Use a verified snapshot and coalesce background refreshes. Explicit
         # force-refresh and known errors still block/fail; selected files and
@@ -363,8 +379,11 @@ class SkillSelectionRail(DeepAgentRail):
         state.searches += 1
         trace.update(search_number=state.searches, query_source='model_tool_argument', keywords_count=len(keywords))
         permission_key = hashlib.sha256('\0'.join(sorted(allowed)).encode()).hexdigest()
+
         def cache_key(generation):
-            return (settings.identity(), id(service), generation, permission_key, query, tuple(keywords))
+            return SearchCacheKey(settings=settings.identity(), service_id=id(service), generation=generation,
+                                  permission_key=permission_key, query=query, keywords=tuple(keywords))
+
         result = state.results.get(cache_key(generation))
         cache_hit = result is not None
         if result is None:
@@ -372,17 +391,17 @@ class SkillSelectionRail(DeepAgentRail):
             RequestState.remember(state.results, cache_key(result.generation), result)
         # A disable or catalog/permission switch during background work invalidates this response.
         current = SelectionSettings.from_config(self._config_provider())
-        if (current.identity() != settings.identity() or service is not self._service
-                or native is not self._skill_rail_provider() or service.retired
-                or allowed != self._allowed(native, snapshot[0])):
-            return self._response('changed', '配置或权限已变化，请重新检索。')
+        context_changed = (current.identity() != settings.identity() or service is not self._service
+                           or native is not self._skill_rail_provider())
+        if context_changed or service.retired or allowed != self._allowed(native, snapshot[0]):
+            return self.response('changed', '配置或权限已变化，请重新检索。')
         if not result.candidates:
             emit(logger, 'search', trace, status='no_match', loaded=False,
                  timings_ms={} if cache_hit else result.elapsed_ms,
                  diagnostics={**result.diagnostics, 'catalog_check_ms': catalog_check_ms},
-                 cache_hit=cache_hit, total_ms=(time.perf_counter()-started)*1000)
-            self._use_default(ctx, 'no_candidates')
-            return self._response('no_match', '没有可用候选，本请求恢复原生技能流程，尚未加载技能。')
+                 cache_hit=cache_hit, total_ms=(time.perf_counter() - started) * 1000)
+            self.use_default(ctx, 'no_candidates')
+            return self.response('no_match', '没有可用候选，本请求恢复原生技能流程，尚未加载技能。')
         search_id = uuid4().hex
         RequestState.remember(state.tickets, search_id, {
             'result': result, 'settings': settings.identity(), 'service': service,
@@ -393,9 +412,9 @@ class SkillSelectionRail(DeepAgentRail):
              top=[{'name': d.name, 'score': score} for d, score in result.candidates],
              timings_ms={} if cache_hit else result.elapsed_ms,
              diagnostics={**result.diagnostics, 'catalog_check_ms': catalog_check_ms},
-             cache_hit=cache_hit, total_ms=(time.perf_counter()-started)*1000,
+             cache_hit=cache_hit, total_ms=(time.perf_counter() - started) * 1000,
              candidate_chars=len(json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))))
-        return self._response('candidates',
+        return self.response('candidates',
             '候选资料未经执行验证。对照原始需求选择后 load；资料不足或候选不合适则 fallback，勿重复检索。',
             search_id=search_id, candidates=candidates)
 
@@ -474,7 +493,7 @@ class SkillSelectionRail(DeepAgentRail):
             native = self._skill_rail_provider()
             permitted.update(s.name for s in native.skills
                              if directory_id(s.directory) in state.get('additional_ids', ()))
-        loading = getattr(ctx, '_flash_selection_load', {}).get('selected')
+        loading = getattr(ctx, 'flash_selection_load', {}).get('selected')
         loading = loading.id if loading else None
         if loading and not state['error']:
             native = self._skill_rail_provider()
@@ -483,7 +502,8 @@ class SkillSelectionRail(DeepAgentRail):
             return  # The normal SkillTool still validates nested paths and permissions.
         from openjiuwen.core.foundation.llm.schema.message import ToolMessage
         message = '指定 Skill 校验未通过，或尝试加载未被用户指定的其他 Skill；请确认指定项，不要自动换选。'
-        logger.info('[SkillSelection] explicit_tool_blocked requested=%r', args.get('skill_name') if isinstance(args, dict) else None)
+        logger.info('[SkillSelection] explicit_tool_blocked requested=%r',
+                    args.get('skill_name') if isinstance(args, dict) else None)
         call = getattr(ctx.inputs, 'tool_call', None)
         ctx.extra['_skip_tool'] = True
         ctx.inputs.tool_result = message
