@@ -66,6 +66,8 @@ skill_credential / skill_active_state / disabled_tools）全部在 keep 白名�
 冷热两态不漂移。
 
 要调 flash 的行为，改本文件的类常量（纳入代码审查/版本管理），而非 config.yaml。
+可选的已安装技能检索扩展独立于固定 profile，由 ``flash.skill_selection.enabled``
+控制；扩展缺失或关闭时保留原生技能流程，只在本适配器接入。
 """
 
 from __future__ import annotations
@@ -234,6 +236,7 @@ class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
         # 技能执行 + 凭证注入：见上方注释，flash 必须能跑已安装技能。
         # _skill_rail 由 flash 钉 ALL 模式，只注册 skill_tool。
         "_skill_rail",
+        "_flash_skill_selection_rail",
         "_skill_credential_injection_rail",
         # _skill_active_state_rail / _skill_authorization_rail: 活跃技能状态与
         #   skill_tool 授权门禁——保持与 normal 对等的技能链（上游 flash 裁掉了
@@ -712,7 +715,42 @@ class JiuwenSwarmFlashAdapter(JiuWenSwarmDeepAdapter):
         裁剪 rail_infos，再委托父类 ``_instantiate_rails`` 逐个构建并挂载 standing rails。
         """
         rail_infos = self._filter_rail_infos_by_keep(rail_infos)
-        return super()._instantiate_rails(rail_infos, config_base)
+        rails = super()._instantiate_rails(rail_infos, config_base)
+        selection = self._build_flash_skill_selection_rail(config_base)
+        if selection is not None:
+            rails.extend((selection.load_rail, selection))
+        return rails
+
+    def _build_flash_skill_selection_rail(self, config_base: dict[str, Any]):
+        """Optional Flash-only extension; removing its package restores native skills."""
+        try:
+            from jiuwenswarm.agents.harness.flash.skill_selection import build_rail
+
+            rail = getattr(self, "_flash_skill_selection_rail", None)
+            if rail is None:
+                rail = build_rail(
+                    config_provider=lambda: self._config_base_cache or config_base,
+                    skill_rail_provider=lambda: self._skill_rail,
+                )
+                self._flash_skill_selection_rail = rail
+            return rail
+        except ImportError:
+            logger.info("[FlashSkillSelection] optional module unavailable; native skills retained")
+        except Exception:
+            logger.warning("[FlashSkillSelection] optional module failed; native skills retained", exc_info=True)
+        return None
+
+    def _get_current_agent_rails(self, config, config_base):
+        rails, removed = super()._get_current_agent_rails(config, config_base)
+        selection = self._build_flash_skill_selection_rail(config_base)
+        if selection is not None:
+            rails.extend((selection.load_rail, selection))
+        else:
+            old = getattr(self, "_flash_skill_selection_rail", None)
+            if old is not None:
+                removed.extend((old.load_rail, old))
+                self._flash_skill_selection_rail = None
+        return rails, removed
 
     async def _update_rails_for_mode(self, mode: str) -> None:
         """flash 的 rail 生命周期：闭合白名单，不动态注册全量 rail.
