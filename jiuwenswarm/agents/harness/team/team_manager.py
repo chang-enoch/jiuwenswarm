@@ -56,7 +56,7 @@ from jiuwenswarm.agents.harness.team.distributed_runtime import (
 from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
 from jiuwenswarm.agents.harness.team import kv_cache_hooks
 from jiuwenswarm.agents.harness.team.remote_member_bootstrap import release_a2x_reservations_for_session
-from jiuwenswarm.agents.harness.team.team_skill_links import sync_skill_dir_links
+from jiuwenswarm.agents.harness.team.team_skill_links import offload_link_sync, sync_skill_dir_links
 from jiuwenswarm.common.config import (
     get_config,
     get_default_models,
@@ -1342,8 +1342,17 @@ class TeamManager:
         )
 
     @staticmethod
-    def _initialize_team_shared_skill_links(spec: TeamAgentSpec) -> None:
-        """Initialize team shared skill links from the global skill root."""
+    async def _initialize_team_shared_skill_links(spec: TeamAgentSpec) -> None:
+        """Initialize team shared skill links from the global skill root.
+
+        The sync is filesystem-heavy - one lstat per global skill entry plus one
+        link creation per new skill - and runs once per team on the first
+        request. It must not run inline on the event loop: on 2026-09-18 a
+        machine where each ``cmd.exe`` junction creation cost about a second
+        stalled the loop for 268s (BUG20260918365771). It also must complete
+        before the first team turn starts, so callers await it rather than
+        fire-and-forget.
+        """
         global_skills_dir = get_agent_skills_dir()
         if not global_skills_dir.exists():
             logger.warning("[TeamManager] global_skills_dir does not exist: %s", global_skills_dir)
@@ -1357,8 +1366,11 @@ class TeamManager:
 
         team_shared_skills_dir = Path(ws_path) / "skills"
 
-        team_shared_skills_dir.mkdir(parents=True, exist_ok=True)
-        sync_skill_dir_links(global_skills_dir, team_shared_skills_dir)
+        def _sync() -> None:
+            team_shared_skills_dir.mkdir(parents=True, exist_ok=True)
+            sync_skill_dir_links(global_skills_dir, team_shared_skills_dir)
+
+        await asyncio.to_thread(_sync)
 
         logger.info("[TeamManager] Initialized team shared skill links: %s", team_shared_skills_dir)
 
@@ -1371,13 +1383,13 @@ class TeamManager:
         return Path(ws_path) / "skills"
 
     @staticmethod
-    def ensure_team_shared_skills_initialized(spec: TeamAgentSpec) -> None:
+    async def ensure_team_shared_skills_initialized(spec: TeamAgentSpec) -> None:
         """Ensure team shared skills are available in the team workspace."""
-        TeamManager._initialize_team_shared_skill_links(spec)
+        await TeamManager._initialize_team_shared_skill_links(spec)
 
-    def ensure_team_shared_skills_ready_for_session(self, session_id: str, spec: TeamAgentSpec) -> None:
+    async def ensure_team_shared_skills_ready_for_session(self, session_id: str, spec: TeamAgentSpec) -> None:
         """Ensure team shared skills are initialized and registered for refresh."""
-        self.ensure_team_shared_skills_initialized(spec)
+        await self.ensure_team_shared_skills_initialized(spec)
         self.register_team_shared_skill_link_target(
             session_id,
             self._resolve_team_shared_skills_dir(spec),
@@ -1388,7 +1400,12 @@ class TeamManager:
         self._team_shared_skill_link_targets[session_id] = target
 
     def refresh_team_shared_skill_links(self, session_id: str) -> bool:
-        """Refresh team shared skill links from global skills."""
+        """Refresh team shared skill links from global skills.
+
+        The sync is offloaded to a worker thread when this runs on the event
+        loop (rail refresh callbacks are sync callables invoked there); see
+        ``offload_link_sync``.
+        """
         target = self._team_shared_skill_link_targets.get(session_id)
         if target is None:
             logger.debug("[TeamManager] no team shared skill link target for session_id=%s", session_id)
@@ -1397,7 +1414,7 @@ class TeamManager:
         if not global_skills_dir.exists():
             logger.warning("[TeamManager] global_skills_dir does not exist: %s", global_skills_dir)
             return False
-        sync_skill_dir_links(global_skills_dir, target)
+        offload_link_sync(global_skills_dir, target)
         logger.info("[TeamManager] Refreshed team shared skill links: session_id=%s target=%s", session_id, target)
         return True
 
@@ -1463,7 +1480,7 @@ class TeamManager:
             team_agent.channel_id = bootstrap.channel_id  # 记录 channel，供 _destroy_other_sessions 按 channel 隔离
             self._team_agents[session_id] = team_agent
             # After build, initialize team shared skill links.
-            self.ensure_team_shared_skills_ready_for_session(session_id, spec)
+            await self.ensure_team_shared_skills_ready_for_session(session_id, spec)
 
             if self._is_distributed_mode(config_base):
                 try:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -2027,7 +2028,13 @@ async def process_team_message_stream(
     ensure_ready = getattr(team_manager, "ensure_team_shared_skills_ready_for_session", None)
     shared_skills_ready_prepared = False
     if is_first_request and callable(ensure_ready):
-        ensure_ready(session_id, team_spec)
+        # The manager is a duck-typed extension point: implementations may be
+        # sync (older/embedded variants) or async (the link sync now runs via
+        # asyncio.to_thread so it cannot stall the loop - BUG20260918365771).
+        # Support both signatures here.
+        ensure_ready_result = ensure_ready(session_id, team_spec)
+        if inspect.isawaitable(ensure_ready_result):
+            await ensure_ready_result
         shared_skills_ready_prepared = True
 
     slash_result = await _handle_team_slash_command(
@@ -2351,7 +2358,9 @@ async def process_team_message_stream(
 
         if is_first_request:
             if callable(ensure_ready) and not shared_skills_ready_prepared:
-                ensure_ready(session_id, team_spec)
+                ensure_ready_result = ensure_ready(session_id, team_spec)
+                if inspect.isawaitable(ensure_ready_result):
+                    await ensure_ready_result
                 shared_skills_ready_prepared = True
             request_queue = await _start_team_stream_round(
                 channel_id=channel_id,
