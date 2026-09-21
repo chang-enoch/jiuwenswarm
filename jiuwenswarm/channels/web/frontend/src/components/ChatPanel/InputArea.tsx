@@ -31,6 +31,7 @@ import { ModelProviderIcon } from '../ModelProviderIcon';
 import { Switch } from '../Switch';
 import { getEvolutionPillLabel } from './evolution-status';
 import { isEnterprise } from '../../edition';
+import { FEATURE_PERSONAL_CONTEXT_UI } from '../../featureFlags';
 import { webRequest } from '../../services/webClient';
 import { getSkillAvatar } from '../../utils/skillAvatar';
 import { withUploadDocumentBlock } from '../../utils/documentMessage';
@@ -618,6 +619,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const goalTagVisible = canUseGoalMenu && goalArmed;
 
   // 个人上下文：agent 加载开关（总开关联动）。总开关关闭时整个菜单项隐藏；开启时默认打开，可单独控制。
+  // 显式企业版隔离 + 功能开关门控：不依赖 store 默认值与配置加载路径的隐式隔离。
+  const personalContextChatAvailable = FEATURE_PERSONAL_CONTEXT_UI && !isEnterprise();
   const isConnected = useSessionStore((s) => s.isConnected);
   const personalContextMasterEnabled = usePersonalContextStore(
     (s) => s.config.collection_enabled || s.config.agent_use_enabled,
@@ -2340,7 +2343,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     </span>
                   </button>
                 )}
-                {personalContextMasterEnabled && (
+                {personalContextChatAvailable && personalContextMasterEnabled && (
                   <div
                     className="chat-mode-select__option"
                     role="menuitem"

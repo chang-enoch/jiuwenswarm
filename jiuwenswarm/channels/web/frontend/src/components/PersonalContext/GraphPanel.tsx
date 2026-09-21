@@ -1442,7 +1442,7 @@ export function PersonalContextGraphPanel({
                   onMouseMove={handleMarkdownMouseMove}
                   onMouseLeave={handleMarkdownMouseLeave}
                 >
-                  <MarkdownRenderer className="prose prose-sm max-w-none pc-graph__markdown" content={nodeDetail.markdown} onLinkClick={handleDetailLinkClick} />
+                  <MarkdownRenderer className="prose prose-sm max-w-none pc-graph__markdown" content={nodeDetail.markdown} onLinkClick={handleDetailLinkClick} inPageAnchors />
                 </div>
               </div>
             ) : (
