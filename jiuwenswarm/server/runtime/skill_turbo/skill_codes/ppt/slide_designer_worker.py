@@ -151,7 +151,7 @@ class SlideDesignerWorker:
         last_raw = ""
         last_reason = ""
         html = ""
-        chart_activation_warning = False
+        soft_deliver_warning = False
         for attempt in range(max(self._policy.max_fill_attempts, 1)):
             rewrite_hint = ""
             if attempt > 0 and (last_raw or last_reason):
@@ -168,6 +168,9 @@ class SlideDesignerWorker:
 
         if not html:
             # 填槽耗尽：custom 先走既有 free_gen；图表未激活最终仍 soft 交付（不进 missing）
+            soft_deliver_reasons = {
+                "chart_scaffold_not_activated",
+            }
             if self._policy.allow_free_gen_fallback:
                 logger.warning(
                     "[SlideDesignerWorker] 填槽失败，降级 free_generate page=%d reason=%s",
@@ -186,14 +189,14 @@ class SlideDesignerWorker:
                         fail_reason="" if ok else "write_failed",
                         path=path,
                     )
-                if last_reason == "chart_scaffold_not_activated" and last_raw.strip():
+                if last_reason in soft_deliver_reasons and last_raw.strip():
                     logger.warning(
-                        "[SlideDesignerWorker] 图表 scaffold 未激活，"
-                        "free_gen 失败仍交付 page=%d",
+                        "[SlideDesignerWorker] %s，free_gen 失败仍交付 page=%d",
+                        last_reason,
                         ctx.page_num,
                     )
                     html = last_raw
-                    chart_activation_warning = True
+                    soft_deliver_warning = True
                 else:
                     last_reason = fb_reason or last_reason
                     return SlideDesignerResult(
@@ -203,13 +206,14 @@ class SlideDesignerWorker:
                         fail_reason=last_reason or "fill_failed",
                         path=path,
                     )
-            elif last_reason == "chart_scaffold_not_activated" and last_raw.strip():
+            elif last_reason in soft_deliver_reasons and last_raw.strip():
                 logger.warning(
-                    "[SlideDesignerWorker] 图表 scaffold 未激活，重试耗尽仍交付 page=%d",
+                    "[SlideDesignerWorker] %s，重试耗尽仍交付 page=%d",
+                    last_reason,
                     ctx.page_num,
                 )
                 html = last_raw
-                chart_activation_warning = True
+                soft_deliver_warning = True
             else:
                 return SlideDesignerResult(
                     page_num=ctx.page_num,
@@ -241,7 +245,7 @@ class SlideDesignerWorker:
                 path=path,
             )
 
-        if layout_warning or chart_activation_warning:
+        if layout_warning or soft_deliver_warning:
             warn_reason = layout_reason or last_reason or "chart_scaffold_not_activated"
             logger.warning(
                 "[SlideDesignerWorker] 页面 %d 已标记警告并继续交付: %s",
