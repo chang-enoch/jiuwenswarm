@@ -25,8 +25,8 @@ def _request(params, channel_id="web"):
     [
         ("agent", "work", "agent"),
         ("agent.plan", "work", "agent"),
-        ("agent", "code", "code"),
-        ("agent.plan", "code", "code"),
+        ("agent", "code", "agent"),
+        ("agent.plan", "code", "agent"),
     ],
 )
 def test_web_work_mode_drives_adapter_choice(mode, work_mode, expected_adapter):
