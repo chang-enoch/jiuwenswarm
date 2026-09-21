@@ -20,6 +20,7 @@ import {
   AgentManagementError,
   createAgentGroupManagementClient,
   createAgentManagementClient,
+  type AgentFileContent,
   type AgentCatalogItem,
   type AgentDetail,
   type AgentDraft,
@@ -288,7 +289,7 @@ export function AgentManagementPanel({
   const [groupFilesStatus, setGroupFilesStatus] = useState<RequestStatus>('idle');
   const [groupFilesError, setGroupFilesError] = useState<string | null>(null);
   const [groupSelectedFilePath, setGroupSelectedFilePath] = useState<string | null>(null);
-  const [groupFileContent, setGroupFileContent] = useState<{ relativePath: string; content: string } | null>(null);
+  const [groupFileContent, setGroupFileContent] = useState<AgentFileContent | null>(null);
   const [groupFileStatus, setGroupFileStatus] = useState<RequestStatus>('idle');
   const [groupFileError, setGroupFileError] = useState<string | null>(null);
   const [groupDraft, setGroupDraft] = useState<AgentGroupDraft>(EMPTY_GROUP_DRAFT);
@@ -1089,11 +1090,20 @@ export function AgentManagementPanel({
     setGroupSaving(true);
     setGroupCreateError(null);
     setActionError(null);
-      setActionNotice(null);
-      try {
-        const result = await groupClient.createGroup({ ...groupDraft, id: groupDraft.id || deriveAgentGroupId(groupDraft.name) });
-        await groupClient.installGroup(result.id);
-        await loadGroups('mine');
+    setActionNotice(null);
+    try {
+      const existingGroups = await groupClient.listGroups();
+      const normalizedName = groupDraft.name.trim().toLocaleLowerCase();
+      if (existingGroups.some(group => group.displayName.trim().toLocaleLowerCase() === normalizedName)) {
+        setGroupCreateError(t('agentManagement.group.states.duplicateName'));
+        return;
+      }
+      const result = await groupClient.createGroup({
+        ...groupDraft,
+        id: groupDraft.id || deriveAgentGroupId(groupDraft.name),
+      });
+      await groupClient.installGroup(result.id);
+      await loadGroups('mine');
       setGroupMineQuery('');
       setGroupMinePage(1);
       setMineKind('group');
