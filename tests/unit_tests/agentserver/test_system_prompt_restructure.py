@@ -22,6 +22,7 @@ from jiuwenswarm.server.runtime.agent_adapter import interface_deep as interface
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
 from jiuwenswarm.agents.harness.common.prompt.prompt_builder import (
     build_agent_identity_prompt,
+    _runtime_env_message_rules_text,
 )
 from jiuwenswarm.agents.harness.common.prompt.browser_task_prompt import (
     build_browser_task_prompt,
@@ -423,6 +424,64 @@ def test_runtime_subagent_usage_rules_are_present_while_office_omits_outer_rules
     assert JiuWenSwarmDeepAdapter._include_runtime_subagent_usage_rules(None) is True
     assert JiuWenSwarmDeepAdapter._include_outer_subagent_usage_rules(None) is False
     assert JiuwenSwarmCodeAdapter._include_outer_subagent_usage_rules(None) is False
+
+
+def _subagent_card_test_agent(subagent_names: list[str], language: str = "en"):
+    return SimpleNamespace(
+        system_prompt_builder=SystemPromptBuilder(language=language),
+        deep_config=SimpleNamespace(
+            tool_owner_id="subagent-card-test",
+            subagents=[
+                SimpleNamespace(
+                    card=SimpleNamespace(
+                        name=name,
+                        description=f"{name} test agent",
+                    )
+                )
+                for name in subagent_names
+            ],
+        ),
+        card=SimpleNamespace(id="subagent-card-test"),
+        ability_manager=_FakeAbilityManager(),
+    )
+
+
+@pytest.mark.parametrize("language", ["en", "cn"])
+def test_task_tool_metadata_hides_browser_parameters_when_browser_agent_is_unavailable(language):
+    from jiuwenswarm.agents.harness.common.rails.browser_task_prompt_rail import (
+        BrowserTaskPromptRail,
+    )
+
+    agent = _subagent_card_test_agent(["general-purpose"], language)
+    rail = BrowserTaskPromptRail(channel="desktop", include_usage_rules=True)
+
+    rail.init(agent)
+
+    card = rail.tools[0].card
+    assert "browser_agent" not in card.description
+    assert "browser_capabilities" not in card.description
+    assert "browser_capabilities" not in card.input_params["properties"]
+
+    rail.refresh_available_agents(agent)
+    assert "browser_agent" not in card.description
+    assert "browser_capabilities" not in card.description
+    assert "browser_capabilities" not in card.input_params["properties"]
+
+
+def test_task_tool_metadata_keeps_browser_parameters_when_browser_agent_is_available():
+    from jiuwenswarm.agents.harness.common.rails.browser_task_prompt_rail import (
+        BrowserTaskPromptRail,
+    )
+
+    agent = _subagent_card_test_agent(["general-purpose", "browser_agent"])
+    rail = BrowserTaskPromptRail(channel="web", include_usage_rules=True)
+
+    rail.init(agent)
+
+    card = rail.tools[0].card
+    assert "browser_agent" in card.description
+    assert "browser_capabilities" in card.description
+    assert "browser_capabilities" in card.input_params["properties"]
 
 
 @pytest.mark.asyncio
@@ -993,6 +1052,13 @@ async def test_runtime_dynamic_sections_go_to_prompt_attachment_when_manager_ava
     assert "Always respond in English" not in prompt
     assert "# Browser Tool Policy" not in prompt
     assert "## Browser Subagent Rules" not in prompt
+
+
+def test_shared_runtime_rules_do_not_hardcode_browser_subagent() -> None:
+    prompt = _runtime_env_message_rules_text(include_subagent_usage_rules=True)
+
+    assert "browser_agent" not in prompt
+    assert "subagent_type" not in prompt
 
 
 @pytest.mark.asyncio
