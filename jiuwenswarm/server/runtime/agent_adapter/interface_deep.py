@@ -2093,9 +2093,13 @@ class JiuWenSwarmDeepAdapter:
         apply_deepagent_task_plan_binding_patch()
         self._instance: DeepAgent | None = None
         self._project_dir: str | None = None
-        # 企业多租户：企业版下可用外部传入的隔离 workspace / 租户 ID
+        # 多租户：调用方（企业版 AgentManager / 个人版 TenantAgentPool）显式
+        # 传入的隔离 workspace 优先，均未传时才回退全局默认工作区。此前个人版
+        # 被企业门禁挡掉、强制落全局默认，导致 officeclaw 租户请求的记忆文件
+        # 与索引全写进 agent_default。agent_id / service_id 保持企业语义不变
+        # （个人版的租户身份经 env 命名空间传递，不走这两个字段）。
         enterprise = is_enterprise()
-        if workspace_dir and enterprise:
+        if workspace_dir:
             self._workspace_dir: str = str(
                 collapse_nested_agent_workspace_dir(workspace_dir)
             )
