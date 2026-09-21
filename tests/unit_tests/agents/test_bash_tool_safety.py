@@ -150,17 +150,16 @@ def test_install_patches_bash_card_with_run_in_background() -> None:
     assert "run_in_background" in properties
     assert properties["run_in_background"]["type"] == "boolean"
     assert "description" not in properties
-    assert "run_in_background" in tool.card.description
-    assert "nohup" in tool.card.description
-    assert "仅用于不会自行退出" in tool.card.description
-    assert "会结束的长任务用 `timeout`" in tool.card.description
-    assert "起前" in tool.card.description
-    assert "子进程" in tool.card.description
-    assert "失败换端口" in tool.card.description
-    assert "不要杀占用进程" in tool.card.description
+    assert "shell_type" not in properties
+    assert "执行 Bash 命令并返回输出" in tool.card.description
+    assert "run_in_background" not in tool.card.description
+    assert "起前" not in tool.card.description
+    assert "子进程" not in tool.card.description
+    assert "失败换端口" not in tool.card.description
+    assert "不要杀占用进程" not in tool.card.description
 
 
-def test_ensure_bash_background_card_appends_en() -> None:
+def test_ensure_bash_background_card_sets_compact_en_description() -> None:
     class Card:
         input_params = {"properties": {}}
         description = "bash tool"
@@ -170,13 +169,11 @@ def test_ensure_bash_background_card_appends_en() -> None:
 
     _ensure_bash_background_card(Tool(), "en")
     assert "run_in_background" in Tool.card.input_params["properties"]
-    assert "run_in_background" in Tool.card.description
-    assert "will not exit on its own" in Tool.card.description
-    assert "finite long jobs" in Tool.card.description
-    assert "Before start" in Tool.card.description
-    assert "child of this PID" in Tool.card.description
-    assert "switch ports" in Tool.card.description
-    assert "do not kill the occupying process" in Tool.card.description
+    assert "shell_type" not in Tool.card.input_params["properties"]
+    assert Tool.card.description.startswith("Execute a command with Bash")
+    assert "will not exit on its own" not in Tool.card.description
+    assert "Before start" not in Tool.card.description
+    assert "child of this PID" not in Tool.card.description
 
 
 def test_install_patches_powershell_card_against_start_process() -> None:
@@ -186,23 +183,21 @@ def test_install_patches_powershell_card_against_start_process() -> None:
     tool = PowerShellTool(MagicMock(), language="cn")
     assert "background" in tool.card.input_params["properties"]
     assert "description" not in tool.card.input_params["properties"]
-    assert "Start-Process" in tool.card.description
-    assert "background=true" in tool.card.description
-    assert "优先" in tool.card.description
-    assert "仅用于不会自行退出" in tool.card.description
-    assert "会结束的长任务用 `timeout`" in tool.card.description
-    assert "-Wait" in tool.card.description
-    assert "RedirectStandardOutput" in tool.card.description
-    assert "起前" in tool.card.description
-    assert "子进程" in tool.card.description
-    assert "失败换端口" in tool.card.description
-    assert "不要杀占用进程" in tool.card.description
+    assert "执行 PowerShell 命令并返回输出" in tool.card.description
+    assert "Start-Process" not in tool.card.description
+    assert "background=true" not in tool.card.description
+    assert "-Wait" not in tool.card.description
+    assert "RedirectStandardOutput" not in tool.card.description
+    assert "起前" not in tool.card.description
+    assert "子进程" not in tool.card.description
+    assert "失败换端口" not in tool.card.description
+    assert "不要杀占用进程" not in tool.card.description
     original = tool.card.description
     _ensure_powershell_background_card(tool, "cn")
     assert tool.card.description == original
 
 
-def test_ensure_powershell_background_card_skips_existing_start_process() -> None:
+def test_ensure_powershell_background_card_replaces_existing_description() -> None:
     class Card:
         description = "already documents Start-Process as a URL opener"
 
@@ -210,10 +205,11 @@ def test_ensure_powershell_background_card_skips_existing_start_process() -> Non
         card = Card()
 
     _ensure_powershell_background_card(Tool(), "cn")
-    assert Tool.card.description == "already documents Start-Process as a URL opener"
+    assert "Start-Process" not in Tool.card.description
+    assert "执行 PowerShell 命令并返回输出" in Tool.card.description
 
 
-def test_ensure_powershell_background_card_appends_en() -> None:
+def test_ensure_powershell_background_card_sets_compact_en_description() -> None:
     class Card:
         description = "powershell tool"
 
@@ -221,21 +217,16 @@ def test_ensure_powershell_background_card_appends_en() -> None:
         card = Card()
 
     _ensure_powershell_background_card(Tool(), "en")
-    assert "Start-Process" in Tool.card.description
-    assert "background=true" in Tool.card.description
-    assert "Prefer" in Tool.card.description
-    assert "will not exit" in Tool.card.description
-    assert "finite long jobs" in Tool.card.description
-    assert "-Wait" in Tool.card.description
-    assert "RedirectStandardOutput" in Tool.card.description
-    assert "finite foreground" in Tool.card.description
-    assert "before start" in Tool.card.description
-    assert "child of this PID" in Tool.card.description
-    assert "switch ports" in Tool.card.description
-    assert "do not kill the occupying process" in Tool.card.description
+    assert Tool.card.description.startswith("Execute a PowerShell command")
+    assert "Start-Process" not in Tool.card.description
+    assert "background=true" not in Tool.card.description
+    assert "will not exit" not in Tool.card.description
+    assert "finite long jobs" not in Tool.card.description
+    assert "before start" not in Tool.card.description
+    assert "child of this PID" not in Tool.card.description
 
 
-def test_ensure_bash_background_card_skips_existing_property() -> None:
+def test_ensure_bash_background_card_preserves_existing_property() -> None:
     existing = {
         "type": "boolean",
         "description": "upstream already exposes this",
@@ -250,10 +241,10 @@ def test_ensure_bash_background_card_skips_existing_property() -> None:
 
     _ensure_bash_background_card(Tool(), "cn")
     assert Tool.card.input_params["properties"]["run_in_background"] is existing
-    assert Tool.card.description == "bash tool with run_in_background already documented"
+    assert "执行 Bash 命令并返回输出" in Tool.card.description
 
 
-def test_ensure_bash_background_card_skips_description_when_property_exists() -> None:
+def test_ensure_bash_background_card_normalizes_description_when_property_exists() -> None:
     existing = {
         "type": "boolean",
         "description": "upstream already exposes this",
@@ -266,10 +257,9 @@ def test_ensure_bash_background_card_skips_description_when_property_exists() ->
     class Tool:
         card = Card()
 
-    original = Tool.card.description
     _ensure_bash_background_card(Tool(), "cn")
     assert Tool.card.input_params["properties"]["run_in_background"] is existing
-    assert Tool.card.description == original
+    assert "执行 Bash 命令并返回输出" in Tool.card.description
 
 
 def test_patch_always_wraps_bash_init() -> None:

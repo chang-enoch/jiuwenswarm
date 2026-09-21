@@ -18,47 +18,40 @@ _RUN_IN_BACKGROUND_PARAM = {
     "cn": "是否后台运行，默认 false；设为 true 时立即返回 PID",
     "en": "Run in background (default false); returns PID immediately when true",
 }
-_RUN_IN_BACKGROUND_USAGE = {
+_COMPACT_BASH_DESCRIPTION = {
     "cn": (
-        "\n - 可将 `run_in_background` 设为 true 后台运行命令；"
-        "仅用于不会自行退出的命令；会结束的长任务用 `timeout`，不要后台。"
-        "不要用 `nohup` 或 `&` 代替该参数。"
-        "起前先查端口是否已有监听；起后核对监听是这次子进程且内容是这次目录，"
-        "不要只看 HTTP 200；失败换端口，不要杀占用进程"
+        "执行 Bash 命令并返回输出。工作目录会在调用之间保留，"
+        "但变量、函数和别名等 Shell 状态不会保留。此工具固定使用 Bash/POSIX 语法，"
+        "不要传入 PowerShell 或 CMD 语法。"
     ),
     "en": (
-        "\n - You can set `run_in_background` to true to run the command "
-        "in the background, only when the command will not exit on its own; "
-        "use `timeout` for finite long jobs, not background. "
-        "Do not substitute `nohup` or `&`. "
-        "Before start, check whether the port already has a listener; "
-        "after start, confirm the listener is a child of this PID and the "
-        "content is this directory — do not rely on HTTP 200 alone; "
-        "on failure switch ports and do not kill the occupying process"
+        "Execute a command with Bash and return its output. "
+        "The working directory persists between calls, but shell state such as "
+        "variables, functions, and aliases does not. Use POSIX/Bash syntax; "
+        "do not send PowerShell or CMD syntax to this tool."
     ),
 }
-_POWERSHELL_BACKGROUND_USAGE = {
+_COMPACT_POWERSHELL_DESCRIPTION = {
     "cn": (
-        "\n - 后台任务优先设 `background=true`（立刻回 PID）；"
-        "仅用于不会自行退出的命令；会结束的长任务用 `timeout`，不要后台。"
-        "也可用 `Start-Process` 把进程拆出去，但不要 `-Wait`、"
-        "不要 `RedirectStandardOutput`/`Error`；探测请另开，"
-        "起前先查端口是否已有监听；起后核对监听是这次子进程且内容是这次目录，"
-        "不要只看 HTTP 200；失败换端口，不要杀占用进程。"
-        "打开 URL 用前台 `Start-Process` 即可"
+        "执行 PowerShell 命令并返回输出。工作目录会在调用之间保留，"
+        "但变量、函数和别名等 Shell 状态不会保留。命令在非交互模式下运行，"
+        "不要调用需要交互输入、交互编辑器或图形界面的命令。"
+        "默认按 Windows PowerShell 5.1 语法编写：不要使用 `&&`、`||`、`?:`、`??` 或 `?.`；"
+        "条件执行使用 `A; if ($?) { B }`。5.1 下避免对原生命令使用 `2>&1`，"
+        "写文本文件时显式指定 UTF-8。使用 `$env:NAME` 访问环境变量；"
+        "调用路径含空格的可执行文件时使用 `&`。"
     ),
     "en": (
-        "\n - Prefer `background=true` for background jobs "
-        "(returns PID immediately), only when the command will not exit "
-        "on its own; use `timeout` for finite long jobs, not background. "
-        "You may detach with `Start-Process`, "
-        "but do not use `-Wait` or `RedirectStandardOutput`/`Error`; "
-        "probe in a separate call; before start check whether the port "
-        "already has a listener; after start confirm the listener is a "
-        "child of this PID and the content is this directory — do not "
-        "rely on HTTP 200 alone; on failure switch ports and do not kill "
-        "the occupying process. "
-        "Opening a URL with `Start-Process` is a finite foreground job"
+        "Execute a PowerShell command and return its output. "
+        "The working directory persists between calls, but shell state such as "
+        "variables, functions, and aliases does not. Commands run non-interactively; "
+        "do not invoke prompts, interactive editors, or GUI input. "
+        "Write commands compatible with Windows PowerShell 5.1 unless the runtime "
+        "is known to use PowerShell 7+. Do not use `&&`, `||`, `?:`, `??`, or `?.` "
+        "in 5.1; use `A; if ($?) { B }` for conditional execution. "
+        "Avoid `2>&1` on native executables in 5.1 and specify UTF-8 when writing "
+        "text files. Use `$env:NAME` for environment variables and `&` to invoke "
+        "an executable whose path contains spaces."
     ),
 }
 
@@ -112,7 +105,7 @@ def _remove_shell_description_param(tool: Any) -> None:
 
 
 def _ensure_bash_background_card(tool: Any, language: str) -> None:
-    """Expose ``run_in_background`` on a BashTool instance card if missing."""
+    """Normalize the model-facing Bash card without changing execution behavior."""
     card = getattr(tool, "card", None)
     if card is None:
         return
@@ -121,29 +114,29 @@ def _ensure_bash_background_card(tool: Any, language: str) -> None:
     params = getattr(card, "input_params", None)
     if isinstance(params, dict):
         properties = params.setdefault("properties", {})
-        if isinstance(properties, dict) and "run_in_background" in properties:
-            return
         if isinstance(properties, dict):
-            properties["run_in_background"] = {
-                "type": "boolean",
-                "description": _RUN_IN_BACKGROUND_PARAM[lang],
-            }
-    description = getattr(card, "description", None)
-    if isinstance(description, str) and "run_in_background" not in description:
-        card.description = description.rstrip() + _RUN_IN_BACKGROUND_USAGE[lang]
+            # The BashTool wrapper fixes shell_type to "bash" before invoking
+            # the upstream tool. Do not expose a model-facing selector that
+            # cannot affect execution.
+            properties.pop("shell_type", None)
+            properties.setdefault(
+                "run_in_background",
+                {
+                    "type": "boolean",
+                    "description": _RUN_IN_BACKGROUND_PARAM[lang],
+                },
+            )
+    card.description = _COMPACT_BASH_DESCRIPTION[lang]
 
 
 def _ensure_powershell_background_card(tool: Any, language: str) -> None:
-    """Append Start-Process usage notes on a PowerShellTool instance card if missing."""
+    """Normalize the model-facing PowerShell card without changing execution behavior."""
     card = getattr(tool, "card", None)
     if card is None:
         return
     _remove_shell_description_param(tool)
-    description = getattr(card, "description", None)
-    if not isinstance(description, str) or "Start-Process" in description:
-        return
-    lang = language if language in _POWERSHELL_BACKGROUND_USAGE else "cn"
-    card.description = description.rstrip() + _POWERSHELL_BACKGROUND_USAGE[lang]
+    lang = language if language in _COMPACT_POWERSHELL_DESCRIPTION else "cn"
+    card.description = _COMPACT_POWERSHELL_DESCRIPTION[lang]
 
 
 def _wrap_card_init(
