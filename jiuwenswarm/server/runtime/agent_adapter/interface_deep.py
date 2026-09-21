@@ -6839,7 +6839,7 @@ class JiuWenSwarmDeepAdapter:
         if is_enterprise() and self._workspace_dir:
             # 企业多租户：挂载当前 workspace 根，修复下载路径权限
             shared_dir = str(Path(self._workspace_dir).resolve().parent.parent)
-        return create_sandbox_sysop_card(
+        card = create_sandbox_sysop_card(
             sandbox_url,
             sandbox_type,
             files_runtime=runtime.get("files"),
@@ -6852,6 +6852,7 @@ class JiuWenSwarmDeepAdapter:
             startup_mode=get_sandbox_startup_mode(),
             shared_dir=shared_dir,
         )
+        return card
 
     def _resolve_project_dir_for_sandbox(self) -> str | None:
         """Best-effort lookup of the user project directory for sandbox builds.
@@ -7103,6 +7104,17 @@ class JiuWenSwarmDeepAdapter:
                     return registered_sys_operation
                 logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", result.msg())
                 return None
+            # 仅在真正 add 成功（非复用）时打 create_sandbox UA
+            if runtime.get("enabled") and sandbox_url and sandbox_type:
+                from jiuwenswarm.common.audit_emit import emit_audit_ua
+                from jiuwenswarm.common.audit_net import resolve_peer_ip
+
+                emit_audit_ua(
+                    SUBMDL="sandbox",
+                    PROC="create_sandbox",
+                    sandbox_type=sandbox_type,
+                    DSTIP=resolve_peer_ip(sandbox_url),
+                )
             return Runner.resource_mgr.get_sys_operation(sysop_card.id)
         except Exception as exc:
             logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", exc)
@@ -8813,6 +8825,17 @@ class JiuWenSwarmDeepAdapter:
             has_api_key = embed_config.get("api_key") if isinstance(embed_config, dict) else None
             has_base_url = embed_config.get("base_url") if isinstance(embed_config, dict) else None
             has_model = embed_config.get("model") if isinstance(embed_config, dict) else None
+            if not all([has_api_key, has_base_url, has_model]):
+                embed_cfg = config.get("embed") if isinstance(config, dict) else None
+                embed_cfg = embed_cfg if isinstance(embed_cfg, dict) else {}
+                embed_config = {
+                    "api_key": embed_cfg.get("embed_api_key"),
+                    "base_url": embed_cfg.get("embed_base_url") or embed_cfg.get("embed_api_base"),
+                    "model": embed_cfg.get("embed_model"),
+                }
+                has_api_key = embed_config.get("api_key")
+                has_base_url = embed_config.get("base_url")
+                has_model = embed_config.get("model")
             if not all([has_api_key, has_base_url, has_model]):
                 logger.warning(
                     "[JiuWenSwarmDeepAdapter] MemoryRail create failed: No available embedding config"
