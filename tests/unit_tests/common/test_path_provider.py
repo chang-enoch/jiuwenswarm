@@ -177,3 +177,53 @@ def test_workspace_directory_nodes_replace_defaults(tmp_path):
         provider.build_workspace_directories(providers.current_path_context())
     )
     assert workspace.get_node_path("memory") == tmp_path / "state" / "memory"
+
+
+def test_dispatch_workspace_directories_uses_provider():
+    class Provider(providers.PathProvider):
+        name = "dirs"
+
+        def resolve_path(self, category, ctx, **kwargs):
+            return None
+
+        def build_workspace_directories(self, ctx):
+            return [
+                {
+                    "name": "memory",
+                    "description": "custom memory",
+                    "path": "state/memory",
+                    "children": [],
+                }
+            ]
+
+    providers.register_path_provider(Provider())
+    nodes = utils._dispatch_workspace_directories()
+    assert nodes[0]["path"] == "state/memory"
+
+
+def test_explicit_workspace_root_skips_provider_but_keeps_directory_nodes(tmp_path):
+    class Provider(providers.PathProvider):
+        name = "split"
+
+        def resolve_path(self, category, ctx, **kwargs):
+            if category == providers.PathCategory.WORKSPACE:
+                return tmp_path / "hijacked"
+            return None
+
+        def build_workspace_directories(self, ctx):
+            return [
+                {
+                    "name": "memory",
+                    "description": "",
+                    "path": "state/memory",
+                    "children": [],
+                }
+            ]
+
+    providers.register_path_provider(Provider())
+    kept = str(tmp_path / "kept")
+    assert utils._dispatch_path(
+        providers.PathCategory.WORKSPACE, explicit=kept,
+    ) is None
+    assert utils._dispatch_path(providers.PathCategory.WORKSPACE) == tmp_path / "hijacked"
+    assert utils._dispatch_workspace_directories()[0]["name"] == "memory"

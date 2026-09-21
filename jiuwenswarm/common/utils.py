@@ -1884,6 +1884,18 @@ def _dispatch_path(category, *, node=None, session_id=None, explicit=None):
         return None
 
 
+def _dispatch_workspace_directories():
+    """Resolve Workspace directory nodes from the path provider, if any."""
+    provider = get_path_provider()
+    if provider is None:
+        return None
+    try:
+        return provider.build_workspace_directories(current_path_context())
+    except Exception:
+        logger.warning("path provider workspace build failed", exc_info=True)
+        return None
+
+
 def get_agent_workspace_dir() -> Path:
     """Get the agent workspace directory path.
 

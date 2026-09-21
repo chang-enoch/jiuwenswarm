@@ -8787,27 +8787,22 @@ class JiuWenSwarmDeepAdapter:
             return None
 
     def _build_agent_workspace(self, *, language: str | None = None) -> Workspace:
-        from jiuwenswarm.common.path_provider import (
-            PathCategory, current_path_context, get_path_provider,
+        from jiuwenswarm.common.path_provider import PathCategory
+        from jiuwenswarm.common.utils import (
+            _dispatch_path,
+            _dispatch_workspace_directories,
         )
 
         root = self._workspace_dir or "./"
-        directories = None
-        provider = get_path_provider()
-        if provider is not None:
-            try:
-                ctx = current_path_context()
-                if self._workspace_dir is None:
-                    overridden = provider.resolve_path(PathCategory.WORKSPACE, ctx)
-                    if overridden is not None:
-                        root = str(overridden)
-                directories = provider.build_workspace_directories(ctx)
-            except Exception:
-                logger.warning("path provider workspace build failed", exc_info=True)
+        overridden = _dispatch_path(
+            PathCategory.WORKSPACE, explicit=self._workspace_dir,
+        )
+        if overridden is not None:
+            root = str(overridden)
         workspace = Workspace(
             root_path=root, language=language or self._resolve_runtime_language(),
         )
-        for node in directories or []:
+        for node in _dispatch_workspace_directories() or []:
             workspace.set_directory(node)
         return workspace
 
