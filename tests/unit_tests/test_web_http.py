@@ -25,11 +25,51 @@ SERVER_PATH = ROOT / "jiuwenswarm" / "gateway" / "channel_manager" / "web" / "we
 ROUTES_PATH = ROOT / "jiuwenswarm" / "gateway" / "channel_manager" / "web" / "web_http_routes.py"
 
 
-def _load_module(mod_name: str, path: Path) -> ModuleType:
+def _install_sys_module(
+    monkeypatch: pytest.MonkeyPatch | None,
+    name: str,
+    module: ModuleType,
+    *,
+    package: bool = False,
+) -> ModuleType:
+    """Register ``module`` under ``name`` and bind it on the parent package.
+
+    pytest ``monkeypatch.setattr("a.b.c.attr")`` walks parent attributes, not
+    only ``sys.modules``. Leaving an empty stub on ``gateway.channel_manager``
+    without restoring ``.web`` / ``.routing`` leaks into later xdist tests.
+    """
+    if package:
+        module.__path__ = []  # type: ignore[attr-defined]
+    parent_name, _, child = name.rpartition(".")
+    if monkeypatch is None:
+        sys.modules[name] = module
+        if parent_name and parent_name in sys.modules:
+            setattr(sys.modules[parent_name], child, module)
+        return module
+    monkeypatch.setitem(sys.modules, name, module)
+    if parent_name:
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.setattr(parent, child, module, raising=False)
+    return module
+
+
+def _ensure_pkg(monkeypatch: pytest.MonkeyPatch, name: str) -> ModuleType:
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    return _install_sys_module(monkeypatch, name, ModuleType(name), package=True)
+
+
+def _load_module(
+    mod_name: str,
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> ModuleType:
     spec = importlib.util.spec_from_file_location(mod_name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
+    _install_sys_module(monkeypatch, mod_name, mod)
     spec.loader.exec_module(mod)
     return mod
 
@@ -55,48 +95,59 @@ class _FakePeer:
 
 @pytest.fixture
 def app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
-    # Stub dispatch module before loading web_http_app
-    dispatch_mod = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_dispatch")
-    dispatch_mock = AsyncMock()
-    dispatch_mod.dispatch_http_request = dispatch_mock  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_dispatch"] = dispatch_mod
-
-    # Minimal package parents so relative imports in web_http_app resolve if any
+    # Minimal package parents so relative imports in web_http_app resolve if any.
     for pkg in (
         "jiuwenswarm",
         "jiuwenswarm.gateway",
         "jiuwenswarm.gateway.channel_manager",
         "jiuwenswarm.gateway.channel_manager.web",
     ):
-        if pkg not in sys.modules:
-            m = ModuleType(pkg)
-            m.__path__ = []  # type: ignore[attr-defined]
-            sys.modules[pkg] = m
+        _ensure_pkg(monkeypatch, pkg)
+
+    # Stub dispatch module before loading web_http_app
+    dispatch_mod = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_dispatch")
+    dispatch_mock = AsyncMock()
+    dispatch_mod.dispatch_http_request = dispatch_mock  # type: ignore[attr-defined]
+    _install_sys_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_dispatch",
+        dispatch_mod,
+    )
 
     # Real route table (no Gateway imports) so create_web_http_app can register workspace routes.
     _load_module(
         "jiuwenswarm.gateway.channel_manager.web.web_http_routes",
         ROUTES_PATH,
+        monkeypatch,
     )
 
     # web_http_app imports file/sessions compat; stub them (empty package __path__ above).
     sessions_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat")
     sessions_compat.register_sessions_compat_routes = lambda app: None  # type: ignore[attr-defined]
     sessions_compat.catalog_sessions_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat"] = sessions_compat
+    _install_sys_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat",
+        sessions_compat,
+    )
 
     file_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_file_compat")
     file_compat.register_file_compat_routes = lambda app: None  # type: ignore[attr-defined]
     file_compat.catalog_file_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_file_compat"] = file_compat
+    _install_sys_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_file_compat",
+        file_compat,
+    )
 
     # web_http_app imports timeout helpers from web_http_server (stdlib-only).
     _load_module(
         "jiuwenswarm.gateway.channel_manager.web.web_http_server",
         SERVER_PATH,
+        monkeypatch,
     )
 
-    web_http_app = _load_module("jw_web_http_app_under_test", HTTP_PATH)
+    web_http_app = _load_module("jw_web_http_app_under_test", HTTP_PATH, monkeypatch)
     channel = object()
     app = web_http_app.create_web_http_app(channel)
     return app, dispatch_mock
