@@ -1139,6 +1139,13 @@ class AgentWebSocketServer:
         # 当前 Gateway 连接，用于 send_push 主动推送
         self._current_ws: Any = None
         self._current_send_lock: asyncio.Lock | None = None
+        # 渠道 → 该渠道请求实际来自的连接 (transport, send_lock)。
+        # 桌面形态下 stdio（PC 前端）与命名管道（gateway）两条连接并存，
+        # _current_ws 只是"最后连上的那条"，被 gateway 抢走后所有 send_push
+        # 都会投给 gateway；channel_id=desktop 的产物帧会被 gateway 按
+        # 「未找到 Channel」丢弃，PC 前端直播期拿不到产物。这里按渠道登记，
+        # send_push 优先按消息的 channel_id 精确投递。
+        self._channel_conns: dict[str, tuple[Any, asyncio.Lock]] = {}
         self._acp_client_capabilities_by_ws: dict[int, dict[str, Any]] = {}
         # AgentManager 实例
         self._agent_manager = AgentManager()
@@ -1727,6 +1734,29 @@ class AgentWebSocketServer:
         """WS 传输皮入口（websockets serve 回调；非桌面形态的通道）。"""
         await self.run_connection(WsMessageTransport(ws))
 
+    def _bind_channel_conn(
+        self, channel: str | None, transport: Any, send_lock: asyncio.Lock
+    ) -> None:
+        """登记「渠道 → 该渠道当前连接」，供 send_push 按 channel_id 精确投递。
+
+        桌面形态下同时存在 stdio（PC 前端，channel=desktop）与命名管道
+        （gateway，channel=xiaoyi/web/...）两条连接：同一渠道以最新声明该渠道的
+        连接为准（gateway 单连接承载多个渠道，因此多条渠道指向同一 transport）。
+        """
+        name = str(channel or "").strip()
+        if not name or transport is None:
+            return
+        prev = self._channel_conns.get(name)
+        if prev is not None and prev[0] is transport:
+            return
+        self._channel_conns[name] = (transport, send_lock)
+
+    def _unbind_channel_conns(self, transport: Any) -> None:
+        """连接断开时清掉它占用的渠道映射，避免 push 继续指向死连接。"""
+        for channel, (bound, _lock) in list(self._channel_conns.items()):
+            if bound is transport:
+                self._channel_conns.pop(channel, None)
+
     async def run_connection(self, transport: Any, *, remote: Any = None) -> None:
         """处理单条 E2A 连接（同一连接可并发处理多个请求）.
 
@@ -1795,6 +1825,7 @@ class AgentWebSocketServer:
             if self._current_ws is transport:
                 self._current_ws = None
                 self._current_send_lock = None
+            self._unbind_channel_conns(transport)
             get_device_command_manager().fail_all(RuntimeError("Gateway disconnected"))
             get_gui_rpc_client().fail_all(
                 GuiRpcClientError(
@@ -1892,6 +1923,8 @@ class AgentWebSocketServer:
                         env.method,
                         env.is_stream,
                     )
+                    # 记录「该渠道的请求来自哪条连接」，供 send_push 精确投递
+                    self._bind_channel_conn(env.channel, ws, send_lock)
                     request = e2a_to_agent_request(env)
             except ValueError as exc:
                 # 协议漂移（如客户端比服务端新，未知 req_method）。异常不能逃逸到
@@ -8543,6 +8576,12 @@ class AgentWebSocketServer:
 
         payload 格式与 AgentResponse.payload 一致，
         可含 event_type 等字段供 Gateway 转为 Message 派发到 Channel。
+
+        投递目标：优先按 ``msg["channel_id"]`` 找该渠道当前连接（桌面形态下
+        stdio=PC 前端 / 命名管道=gateway 两条连接并存，不能只看 _current_ws，
+        否则 channel_id=desktop 的产物帧会被投给 gateway 并按「未找到 Channel」
+        丢弃，PC 前端直播期拿不到产物卡片）；该渠道没有登记连接时，回退到
+        原来的 _current_ws 行为，保持与单连接部署一致。
         """
         response_kind = str(msg.get("response_kind") or "").strip()
         gui_rpc_id = ""
@@ -8550,7 +8589,15 @@ class AgentWebSocketServer:
             body = msg.get("body")
             if isinstance(body, dict):
                 gui_rpc_id = str(body.get("rpc_id") or "")
-        if self._current_ws is None or self._current_send_lock is None:
+        channel_id = str(msg.get("channel_id") or "").strip()
+        bound = self._channel_conns.get(channel_id) if channel_id else None
+        if bound is not None:
+            target_ws, target_send_lock = bound
+            target_via = "channel-map"
+        else:
+            target_ws, target_send_lock = self._current_ws, self._current_send_lock
+            target_via = "current-ws"
+        if target_ws is None or target_send_lock is None:
             if gui_rpc_id:
                 logger.error(
                     "[GUI_RPC_TRACE] phase=AGENT_WS_PUSH_NO_CONNECTION "
@@ -8559,7 +8606,10 @@ class AgentWebSocketServer:
                     response_kind,
                 )
             logger.warning(
-                "[AgentWebSocketServer] send_push 失败: 无活跃 Gateway 连接"
+                "[AgentWebSocketServer] send_push 失败: 无活跃连接 "
+                "channel_id=%s via=%s",
+                channel_id,
+                target_via,
             )
             raise RuntimeError("No active Gateway connection")
 
@@ -8572,14 +8622,19 @@ class AgentWebSocketServer:
                     gui_rpc_id,
                     response_kind,
                 )
-            async with self._current_send_lock:
-                sent_original = await send_wire_payload(self._current_ws, wire)
+            async with target_send_lock:
+                sent_original = await send_wire_payload(target_ws, wire)
             if not sent_original:
                 logger.warning(
                     "[AgentWebSocketServer] send_push 内容过大已降级为错误帧: channel_id=%s",
                     msg.get("channel_id", ""),
                 )
                 return
+            logger.info(
+                "[AgentWebSocketServer] send_push 投递目标: channel_id=%s via=%s",
+                channel_id,
+                target_via,
+            )
             response_kind = str(msg.get("response_kind") or "").strip()
             if gui_rpc_id:
                 logger.info(
