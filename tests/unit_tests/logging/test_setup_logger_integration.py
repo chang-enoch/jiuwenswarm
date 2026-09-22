@@ -7,6 +7,7 @@ from pathlib import Path
 from jiuwenswarm.common import utils
 from jiuwenswarm.common.utils import (
     IdentityFieldFilter,
+    SessionIdFilter,
     UserVisibleTagFilter,
     setup_logger,
     update_log_levels,
@@ -54,10 +55,12 @@ def test_queue_handler_has_identity_and_privacy_filters(monkeypatch):
     queue_handler = root.handlers[0]
     assert type(queue_handler).__name__ == "QueueHandler"
     assert any(isinstance(f, IdentityFieldFilter) for f in queue_handler.filters)
+    assert any(isinstance(f, SessionIdFilter) for f in queue_handler.filters)
     assert any(isinstance(f, SensitiveDataFilter) for f in queue_handler.filters)
     for h in utils._iter_log_output_handlers():
         if hasattr(h, "baseFilename"):
             assert not any(isinstance(f, IdentityFieldFilter) for f in h.filters)
+            assert not any(isinstance(f, SessionIdFilter) for f in h.filters)
             assert not any(isinstance(f, SensitiveDataFilter) for f in h.filters)
 
 
@@ -124,3 +127,4 @@ def test_end_to_end_text_log_has_identity_and_user_tag(monkeypatch, tmp_path):
     assert "hello-end-to-end" in content
     assert "[USER]" in content
     assert "user_id=null" in content
+    assert "[<nosid>]" in content

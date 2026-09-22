@@ -118,12 +118,16 @@ def link_skill_dir(source: Path, target: Path) -> None:
 
 
 def remove_skill_dir_link(target: Path) -> None:
-    """Remove a skill directory link without deleting ordinary directories."""
-    if target.is_symlink():
-        target.unlink()
-        return
-    if _is_windows_reparse_point(target):
-        os.rmdir(target)
+    try:
+        if target.is_symlink():
+            target.unlink()
+            return
+        if _is_windows_reparse_point(target):
+            os.rmdir(target)
+    except (FileNotFoundError, PermissionError):
+        if not os.path.lexists(target):
+            return
+        raise
 
 
 def _create_directory_link(target_path: Path, link_path: Path) -> None:
@@ -174,8 +178,9 @@ def _create_windows_junction(target_path: Path, link_path: Path) -> None:
     ``UnicodeDecodeError`` on Chinese Windows (GBK output vs UTF-8 decoding).
 
     The ``cmd.exe /c mklink /J`` fallback only runs when the private API is
-    unavailable or rejected the creation. Its output is decoded with the ANSI
-    code page (``mbcs``) and undecodable bytes are replaced, so localized output
+    unavailable or rejected the creation. Its piped output is encoded in the
+    OEM code page (not the ANSI ``mbcs`` page); decoding with ``oem`` keeps
+    localized output readable on Western locales, and ``errors="replace"``
     can neither crash the reader thread nor raise while decoding.
     """
     create_junction = getattr(_winapi, "CreateJunction", None) if _winapi is not None else None
@@ -186,8 +191,11 @@ def _create_windows_junction(target_path: Path, link_path: Path) -> None:
         except OSError:
             if path_exists_or_link(link_path):
                 raise
-            # Fall through to cmd.exe, which reports a descriptive error for
-            # cases the native call rejected (e.g. a missing target).
+            # Fall through to cmd.exe. Note mklink /J does not validate the
+            # target: for a missing target it exits 0 and silently creates a
+            # dangling junction (the native error above was the descriptive
+            # one). Dangling links are removed by later prune_skill_dir_links
+            # runs because the source entry is not a valid skill directory.
     cmd_path = os.path.join(
         os.environ.get("SystemRoot", r"C:\Windows"),
         "System32",
@@ -198,7 +206,7 @@ def _create_windows_junction(target_path: Path, link_path: Path) -> None:
         capture_output=True,
         check=False,
         shell=False,
-        encoding="mbcs" if sys.platform == "win32" else "utf-8",
+        encoding="oem" if sys.platform == "win32" else "utf-8",
         errors="replace",
     )
     if result.returncode != 0:

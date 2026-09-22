@@ -177,6 +177,37 @@ def test_enterprise_uninstall_uses_origin_and_persisted_entity_directory(tmp_pat
     assert restored.list_skill_installations() == []
 
 
+def test_enterprise_uninstall_allows_blank_source_type(tmp_path: Path) -> None:
+    manager = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
+    skill_dir = _write_skill(tmp_path, "local-skill")
+    manager.record_skill_installation(
+        name="local-skill", source_type="user", origin="local:local-skill", source="local",
+    )
+    state_file = tmp_path / "skills" / "skills_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["installed_plugins"][0]["source_type"] = ""
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    restored = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
+    result = asyncio.run(restored.handle_skills_web_uninstall({"name": "local-skill"}))
+
+    assert result == {"success": True, "name": "local-skill"}
+    assert not skill_dir.exists()
+    assert restored.list_skill_installations() == []
+
+
+def test_enterprise_web_uninstall_still_rejects_prebuilt(tmp_path: Path) -> None:
+    manager = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
+    skill_dir = _write_skill(tmp_path, "managed-skill")
+    _record_prebuilt(manager)
+
+    result = asyncio.run(manager.handle_skills_web_uninstall({"name": "managed-skill"}))
+
+    assert result["success"] is False
+    assert result["error_code"] == "prebuilt_not_removable"
+    assert skill_dir.is_dir()
+
+
 def test_enterprise_uninstall_does_not_fall_back_from_unknown_origin(tmp_path: Path) -> None:
     manager = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
     skill_dir = _write_skill(tmp_path, "user-skill")
