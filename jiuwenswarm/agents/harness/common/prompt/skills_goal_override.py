@@ -93,8 +93,7 @@ _TOOL_USAGE_RULES = {
 - 相同工具和相同参数已有结果时，不要重复调用。
 - 上一次结果为空或没有新增信息时，调整参数、改用其他工具或说明结果不足。
 - 文件搜索、读取、编辑和写入优先使用专用工具，不要用 Shell 重复实现。
-- Shell 命令只有存在依赖关系时才串联。是否后台只看控制流有没有结束点，不看跑多久、目录名、文件名、用户有没有说「测试」。有结束点（语句会跑完、函数会 return、进程会 exit）的长任务（如构建、pytest、下载、打开 URL、sleep N 秒后打印结束、倒计时、跑完就退出的脚本等此类操作）可根据需要增大 `timeout` 等到退出，不要用 `sleep` 轮询，不要设 `run_in_background` 或 `background=true`，哪怕要跑十几分钟。没有结束点、命令不会自行退出时（如本地 HTTP 服务、dev server、watch、while True 心跳等此类操作）才是后台任务：这次调用必须马上结束，不要为此加大 timeout。优先指定工具卡后台参数：powershell 用 `background=true`，bash 用 `run_in_background=true`，立刻返回 PID。
-- 返回的 PID 只表示包装进程已拉起，不表示服务已起来。确认服务是否起来必须另开一次调用，并给 HTTP 客户端设超时。绑定端口时：①起指定端口前先查该端口是否已有监听，已占用则不要在原端口启动，换空闲端口再起并告知用户；②拉起后另开探测：监听该端口的进程必须是这次返回 PID 的子进程（包装进程本身不算），且响应是这次要起的服务（请求本次目录里真实存在的路径，状态和内容都对）；不要只看 HTTP 200，不要把身份默认成立；③任一条件不成立（已有监听、进程已退、内容不对）视为启动失败：不要打开原 URL；换空闲端口重起并告知用户；不要杀占用进程，除非用户明确要求；不要为此再问一轮。
+- Shell 命令只有存在依赖关系时才串联，并且必须能够自行结束。有限任务（如构建、pytest 和下载）可根据需要增大 `timeout` 等待完成，不要用 `sleep` 轮询。不要启动本地服务、dev server、watch、`while True` 等不会自行退出的进程。
 - 技能发现与安装默认工具：`find-skills-win` 技能。所有技能发现、检索和安装任务默认必须通过该技能完成；仅当用户明确要求其他发现或安装方式时，才可使用其他方法。
 
 当有相关专用工具时，不要用 bash 运行命令。使用专用工具能让用户更好地理解和审查你的工作。这对协助用户至关重要：
@@ -103,7 +102,7 @@ _TOOL_USAGE_RULES = {
 - 创建文件用 write_file，不要用 cat heredoc 或 echo 重定向
 - 搜索文件用 glob 或 list_files，不要用 find 或 ls
 - 搜索文件内容用 grep，不要用 bash 的 grep 命令
-- bash 用于普通 POSIX 系统命令和 Bash 脚本。powershell 用于 Windows 原生 cmdlet 和路径。mcp_exec_command 仅在需要显式 Shell 参数化、后台执行或专用 Shell 工具时使用；每次 mcp_exec_command 调用必须包含 shell_type=\"bash\"、\"powershell\"、\"cmd\" 或 \"sh\"，不能使用 auto。如果不确定且有相关专用文件工具，默认使用该专用工具。
+- bash 用于普通 POSIX 系统命令和 Bash 脚本。powershell 用于 Windows 原生 cmdlet 和路径。mcp_exec_command 仅在需要显式 Shell 参数化或专用 Shell 工具时使用；每次 mcp_exec_command 调用必须包含 shell_type=\"bash\"、\"powershell\"、\"cmd\" 或 \"sh\"，不能使用 auto。如果不确定且有相关专用文件工具，默认使用该专用工具。
 
 ## 任务规划（todos）
 
@@ -143,8 +142,7 @@ _TOOL_USAGE_RULES = {
 - Do not repeat the same tool with the same parameters when a result already exists.
 - If the previous result is empty or has no new information, adjust parameters, switch to another tool, or state that the result is insufficient.
 - Prefer dedicated tools for file search, read, edit, and write — do not reimplement them with Shell.
-- Chain Shell commands only when there are dependencies. Whether a job is background depends only on whether the control flow has an end point — do not judge by duration, directory or file name, or whether the user said "test". Finite jobs that have an end point (statements finish, functions return, the process will exit) such as build, pytest, download, opening a URL, sleep N then print and exit, countdown, a script that exits when done, and similar operations: increase `timeout` as needed and wait for exit — do not poll with `sleep`, do not set `run_in_background` or `background=true`, even if it takes more than ten minutes. A job is a background task only when it has no end point and the command will not exit on its own (such as a local HTTP server, dev server, watch, a while True heartbeat, and similar operations): the call must return immediately; do not raise timeout for that. Prefer to set the tool-card background parameter: `background=true` for powershell, `run_in_background=true` for bash, which returns a PID immediately.
-- The returned PID shows the wrapper process started, not that the service is up. Probe whether the server is up in a separate call with a client timeout. When binding a port: (1) Before starting on a specified port, check whether it already has a listener; if occupied, do not start on the original port — restart on a free port and tell the user. (2) After start, the listener must be a child of this returned PID (the wrapper process itself does not count), and the response must be the service just started (request a path that actually exists in this directory; both status and content must match). Do not rely on HTTP 200 alone; do not assume identity holds. (3) If any condition fails (already has a listener, process already gone, or unexpected content), treat it as a start failure: do not open the original URL; restart on a free port and tell the user; do not kill the occupying process unless the user explicitly asks; do not ask another round of confirmation for that.
+- Chain Shell commands only when there are dependencies, and commands must be able to exit on their own. For finite jobs such as builds, pytest, and downloads, increase `timeout` as needed and wait for completion; do not poll with `sleep`. Do not start local servers, dev servers, watchers, `while True` loops, or other processes that will not exit on their own.
 - Default skill for skill discovery and installation: `find-skills-win`. Complete all skill discovery, retrieval, and installation tasks through this skill by default; use another method only when the user explicitly requests it.
 
 Do NOT use bash to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:
@@ -153,7 +151,7 @@ Do NOT use bash to run commands when a relevant dedicated tool is provided. Usin
 - To create files use write_file instead of cat with heredoc or echo redirection
 - To search for files use glob or list_files instead of find or ls
 - To search the content of files, use grep instead of the bash grep command
-- Use bash for ordinary POSIX system commands and Bash scripts. Use powershell for Windows-native cmdlets and paths. Use mcp_exec_command only when explicit Shell parameterization, background execution, or a dedicated Shell tool is needed; every mcp_exec_command call must include shell_type=\"bash\", \"powershell\", \"cmd\", or \"sh\" and must not use auto. If you are unsure and there is a relevant dedicated file tool, default to using that dedicated tool.
+- Use bash for ordinary POSIX system commands and Bash scripts. Use powershell for Windows-native cmdlets and paths. Use mcp_exec_command only when explicit Shell parameterization or a dedicated Shell tool is needed; every mcp_exec_command call must include shell_type=\"bash\", \"powershell\", \"cmd\", or \"sh\" and must not use auto. If you are unsure and there is a relevant dedicated file tool, default to using that dedicated tool.
 
 ## Task planning (todos)
 

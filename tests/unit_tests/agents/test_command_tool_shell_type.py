@@ -21,6 +21,12 @@ def test_mcp_schema_requires_explicit_shell_type() -> None:
     assert "auto" not in params["properties"]["shell_type"].get("description", "")
 
 
+def test_mcp_schema_hides_background_execution() -> None:
+    assert "background" not in mcp_exec_command.card.input_params["properties"]
+    assert "background" not in mcp_exec_command.card.description.lower()
+    assert "pid" not in mcp_exec_command.card.description.lower()
+
+
 @pytest.mark.asyncio
 async def test_mcp_rejects_auto_before_execution(tmp_path) -> None:
     result = await mcp_exec_command._func(
@@ -62,6 +68,7 @@ def test_shell_prompt_names_tool_routing_and_forbids_auto() -> None:
     assert "mcp_exec_command" in prompt
     assert "shell_type" in prompt
     assert "禁止使用 `auto`" in prompt
+    assert "后台执行" not in prompt
 
 
 def test_shell_prompt_keeps_bash_as_primary_for_posix() -> None:

@@ -841,18 +841,12 @@ def _run_command_background(
         "Execute simple cross-platform command-line command in project workspace. "
         "Supports Windows cmd/PowerShell and macOS/Linux bash/sh. "
         "Prefer the dedicated bash tool for ordinary POSIX commands; use this tool "
-        "for explicit parameterization, background execution, or Shell fallback. "
+        "for explicit parameterization or Shell fallback. "
         "shell_type is required and must be one of cmd|powershell|bash|sh; "
         "do not use auto. "
-        "Set background=True to run non-blocking (e.g. start a server); "
-        "returns a PID immediately (the wrapper process only). "
-        "Before start, check whether the port already has a listener; "
-        "after start, confirm the listener is a child of this PID and the "
-        "content is this directory — do not rely on HTTP 200 alone; "
-        "on failure switch ports and do not kill the occupying process. "
         "Set max_output_chars=0 to disable output clipping. "
         "Use a larger timeout_seconds only for finite jobs (build/test/download). "
-        "Returns JSON: exit_code/stdout/stderr (blocking) or pid/status (background)."
+        "Returns JSON with exit_code, stdout, and stderr."
     ),
 )
 async def mcp_exec_command(
@@ -985,6 +979,9 @@ async def mcp_exec_command(
         "stderr": _clip_text(result.stderr or "", max_output_chars),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+mcp_exec_command.card.input_params.get("properties", {}).pop("background", None)
 
 
 def reset_tui_spawn_history() -> None:

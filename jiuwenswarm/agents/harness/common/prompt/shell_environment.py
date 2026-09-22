@@ -151,7 +151,7 @@ def _tool_routing_prompt(
 - 文件读取、搜索和编辑优先使用 `read_file`、`grep`、`glob`、`edit_file`、`write_file` 等专用工具，不要为了这些操作调用 Shell。
 {posix_rule}
 {windows_rule}
-- `mcp_exec_command` 仅在需要显式参数化 Shell、后台执行或 Shell 专用工具时使用；必须显式提供 `shell_type`，禁止使用 `auto`。
+- `mcp_exec_command` 仅在需要显式参数化 Shell 或 Shell 专用工具时使用；必须显式提供 `shell_type`，禁止使用 `auto`。
 - 不要在 Bash 中包裹 PowerShell，也不要在 PowerShell 中拼接 Bash 语法。"""
 
     if bash_available:

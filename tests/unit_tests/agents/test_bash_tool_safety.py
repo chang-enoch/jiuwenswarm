@@ -110,7 +110,7 @@ async def test_bash_wrapper_forces_bash_shell_type() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_wrapper_passes_run_in_background_through() -> None:
+async def test_bash_wrapper_drops_hidden_background_inputs() -> None:
     calls = []
 
     class Parsed:
@@ -130,25 +130,25 @@ async def test_bash_wrapper_passes_run_in_background_through() -> None:
         {
             "command": Parsed.command,
             "run_in_background": True,
+            "background": True,
             "timeout": 1800,
         },
     )
 
     assert result == "ok"
     assert calls[0]["shell_type"] == "bash"
-    assert calls[0]["run_in_background"] is True
     assert calls[0]["timeout"] == 1800
+    assert "run_in_background" not in calls[0]
     assert "background" not in calls[0]
 
 
-def test_install_patches_bash_card_with_run_in_background() -> None:
+def test_install_hides_bash_background_input() -> None:
     from openjiuwen.harness.tools.shell.bash._tool import BashTool
 
     install_shell_tool_safety_hooks()
     tool = BashTool(MagicMock(), language="cn")
     properties = tool.card.input_params["properties"]
-    assert "run_in_background" in properties
-    assert properties["run_in_background"]["type"] == "boolean"
+    assert "run_in_background" not in properties
     assert "description" not in properties
     assert "shell_type" not in properties
     assert "执行 Bash 命令并返回输出" in tool.card.description
@@ -168,7 +168,7 @@ def test_ensure_bash_background_card_sets_compact_en_description() -> None:
         card = Card()
 
     _ensure_bash_background_card(Tool(), "en")
-    assert "run_in_background" in Tool.card.input_params["properties"]
+    assert "run_in_background" not in Tool.card.input_params["properties"]
     assert "shell_type" not in Tool.card.input_params["properties"]
     assert Tool.card.description.startswith("Execute a command with Bash")
     assert "will not exit on its own" not in Tool.card.description
@@ -176,12 +176,12 @@ def test_ensure_bash_background_card_sets_compact_en_description() -> None:
     assert "child of this PID" not in Tool.card.description
 
 
-def test_install_patches_powershell_card_against_start_process() -> None:
+def test_install_hides_powershell_background_input() -> None:
     from openjiuwen.harness.tools.shell.powershell._tool import PowerShellTool
 
     install_shell_tool_safety_hooks()
     tool = PowerShellTool(MagicMock(), language="cn")
-    assert "background" in tool.card.input_params["properties"]
+    assert "background" not in tool.card.input_params["properties"]
     assert "description" not in tool.card.input_params["properties"]
     assert "执行 PowerShell 命令并返回输出" in tool.card.description
     assert "Start-Process" not in tool.card.description
@@ -226,7 +226,7 @@ def test_ensure_powershell_background_card_sets_compact_en_description() -> None
     assert "child of this PID" not in Tool.card.description
 
 
-def test_ensure_bash_background_card_preserves_existing_property() -> None:
+def test_ensure_bash_background_card_removes_existing_property() -> None:
     existing = {
         "type": "boolean",
         "description": "upstream already exposes this",
@@ -240,25 +240,7 @@ def test_ensure_bash_background_card_preserves_existing_property() -> None:
         card = Card()
 
     _ensure_bash_background_card(Tool(), "cn")
-    assert Tool.card.input_params["properties"]["run_in_background"] is existing
-    assert "执行 Bash 命令并返回输出" in Tool.card.description
-
-
-def test_ensure_bash_background_card_normalizes_description_when_property_exists() -> None:
-    existing = {
-        "type": "boolean",
-        "description": "upstream already exposes this",
-    }
-
-    class Card:
-        input_params = {"properties": {"run_in_background": existing}}
-        description = "bash tool without the parameter name in text"
-
-    class Tool:
-        card = Card()
-
-    _ensure_bash_background_card(Tool(), "cn")
-    assert Tool.card.input_params["properties"]["run_in_background"] is existing
+    assert "run_in_background" not in Tool.card.input_params["properties"]
     assert "执行 Bash 命令并返回输出" in Tool.card.description
 
 
