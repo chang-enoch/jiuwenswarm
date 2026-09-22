@@ -15,7 +15,7 @@ function normalizeBase(input: string): string {
  	  * @returns {string} 返回处理后的API前缀字符串，如果环境变量未定义则返回空字符串
  	  */
  	 export function getApiPrefix(): string {
- 	   const raw = import.meta.env.VITE_API_PREFIX as string | undefined; // 从环境变量中获取原始API前缀值，可能为undefined
+ 	   const raw = import.meta.env?.VITE_API_PREFIX as string | undefined; // 从环境变量中获取原始API前缀值，可能为undefined；用可选链防御测试等非Vite环境下import.meta.env未定义
  	   if (!raw) return ""; // 如果原始值为空，则直接返回空字符串
  	   return normalizeBase(raw); // 调用normalizeBase函数对原始值进行规范化处理并返回
  	 }
