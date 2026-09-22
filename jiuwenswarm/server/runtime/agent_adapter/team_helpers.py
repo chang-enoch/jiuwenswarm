@@ -1995,6 +1995,17 @@ async def process_team_message_stream(
             if callable(ensure_ready) and not shared_skills_ready_prepared:
                 ensure_ready(session_id, team_spec)
                 shared_skills_ready_prepared = True
+            # 模式切换上下文交接：装团后首个团队回合，
+            # 把切换前的前情块拼进 query（消费即清标记，失败不阻塞起跑）
+            from jiuwenswarm.server.runtime.agent_adapter.context_handoff import (
+                maybe_wrap_query_with_handoff,
+            )
+
+            query = maybe_wrap_query_with_handoff(
+                session_id=session_id,
+                request_id=rid,
+                query=query,
+            )
             request_queue = await _start_team_stream_round(
                 channel_id=channel_id,
                 session_id=session_id,

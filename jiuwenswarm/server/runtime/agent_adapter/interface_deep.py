@@ -483,6 +483,30 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
         return None
 
 
+def _history_tail_lagged(
+        synced_tail: str | None,
+        session_id: str,
+        exclude_request_id: str | None = None,
+) -> bool:
+    """同步指纹是否落后于磁盘尾。
+
+    落后（True）时轮末不得把指纹推进到本轮 rid——会把未同步的历史段
+    （典型：团队期记录不经默认 agent）永久跳过。读盘失败按未落后处理
+    （保持旧行为，不冤枉正常轮次）。
+    """
+    try:
+        from jiuwenswarm.server.runtime.session.session_history import (
+            load_history_tail_request_id,
+        )
+
+        disk_tail = load_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
+    except Exception:
+        return False
+    return bool(disk_tail) and synced_tail != disk_tail
+
+
 async def _get_persistent_checkpointer_lock() -> asyncio.Lock:
     """Lazy-init or rebind the process-wide checkpointer lock to the running loop.
 
@@ -1436,11 +1460,25 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._is_session_scoped_adapter = True
         self._parent_session_id = session_id
         self._synced_history_tail_request_id = None
+        self._history_sync_lagged = False
 
     def _mark_history_tail_synced(self, request_id: str | None) -> None:
         rid = str(request_id or "").strip()
-        if rid:
-            self._synced_history_tail_request_id = rid
+        if not rid:
+            return
+        if getattr(self, "_history_sync_lagged", False):
+            # 起跑前指纹落后于磁盘尾（warmup 命中旧快照且当轮 refresh 没补上/
+            # refresh 失败）：本轮是在旧上下文上跑的，推进指纹会把未同步的
+            # 历史段（典型：团队期记录）永久跳过——保持旧指纹，下轮 refresh
+            # 继续补。标记由 _get_or_create_session_adapter 每轮起跑时重估。
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] 指纹落后，轮末不推进: session=%s rid=%s synced=%s",
+                getattr(self, "_parent_session_id", None),
+                rid,
+                self._synced_history_tail_request_id,
+            )
+            return
+        self._synced_history_tail_request_id = rid
 
     def _get_cached_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter | None":
         sid = self._session_adapter_key(session_id)
@@ -1695,6 +1733,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                             ),
                         )
                     )
+                    existing._history_sync_lagged = _history_tail_lagged(
+                        existing._synced_history_tail_request_id,
+                        sid,
+                        warmup_exclude_request_id,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "[JiuWenSwarmDeepAdapter] session context refresh failed: "
@@ -1740,18 +1783,32 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # （全新会话磁盘无历史，warmup 内部会静默跳过）。
             try:
                 from jiuwenswarm.agents.harness.common.session_ops_service import (
-                    load_history_tail_request_id,
+                    refresh_session_context_if_stale,
                     warmup_session_context,
                 )
 
-                await warmup_session_context(
+                # warmup 返回本次恢复实际覆盖到的 history 尾：快照恢复时是
+                # 快照尾指纹（可能早于磁盘尾，如团队期不经默认 agent、快照
+                # 停在装团前）。落后时立刻补一轮增量同步，让本轮就带上快照后
+                # 的历史——否则本轮失忆，且轮末指纹无条件推进会把这段缺口
+                # 永久跳过（后续 refresh 指纹相等静默不补）。
+                adapter._synced_history_tail_request_id = await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
                     exclude_request_id=warmup_exclude_request_id,
                 )
-                adapter._synced_history_tail_request_id = load_history_tail_request_id(
+                adapter._synced_history_tail_request_id = (
+                    await refresh_session_context_if_stale(
+                        deep_agent=getattr(adapter, "_instance", None),
+                        session_id=sid,
+                        exclude_request_id=warmup_exclude_request_id,
+                        synced_tail_request_id=adapter._synced_history_tail_request_id,
+                    )
+                )
+                adapter._history_sync_lagged = _history_tail_lagged(
+                    adapter._synced_history_tail_request_id,
                     sid,
-                    exclude_request_id=warmup_exclude_request_id,
+                    warmup_exclude_request_id,
                 )
             except Exception as exc:
                 logger.warning(
