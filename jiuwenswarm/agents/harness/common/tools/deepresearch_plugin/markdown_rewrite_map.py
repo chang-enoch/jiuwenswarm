@@ -10,7 +10,27 @@ from typing import Literal
 from urllib.parse import unquote
 
 from markdown_it import MarkdownIt
+from markdown_it.common.entities import entities
+from markdown_it.common.utils import fromCodePoint, isValidEntityCode
 from markdown_it.token import Token
+
+from jiuwenswarm.agents.harness.common.tools.deepresearch_plugin.cjk_friendly_emphasis import (
+    apply_cjk_friendly_rules,
+)
+
+
+def _new_rewrite_parser() -> MarkdownIt:
+    """Parser matching the relay-claw frontend's Markdown semantics.
+
+    The rewrite map must classify exactly the paragraphs the frontend
+    selection code treats as rewritable, so this parser carries the
+    frontend's CJK-friendly emphasis rules (instance-scoped; all other
+    MarkdownIt instances keep stock CommonMark flanking). See
+    cjk_friendly_emphasis for details.
+    """
+    return apply_cjk_friendly_rules(
+        MarkdownIt("commonmark", {"html": True}).enable(["table", "strikethrough"])
+    )
 
 
 UnitType = Literal["heading", "paragraph", "list_item"]
@@ -304,6 +324,50 @@ def _encode_markdown_literal(text: str) -> str:
 
 _UNMATCHED_CONSTRUCT_PREFIXES = ("**", "__", "~~", "[", "]", "<", "`", "![")
 
+# Constructs that are ordinary literal text whenever markdown-it left them
+# inside a text token — reference-list labels (`[1]. `), LaTeX-ish math
+# (`$β<0.6$`), unpaired brackets or backticks. The relay-claw frontend
+# accepts such paragraphs as rewritable, so an odd count must not reject the
+# whole unit; the per-character raw/visible alignment below already
+# guarantees the token is an exact source slice. Emphasis markers keep the
+# odd-count fail-closed rule above.
+_LITERAL_TEXT_CONSTRUCTS = frozenset({"[", "]", "<", "`", "!["})
+
+# CommonMark character references — same shapes markdown-it's own entity rule
+# decodes (rules_inline/entity.py) before `text_join` merges them into text
+# tokens, which is why rendered text can carry a character whose raw source
+# form is multi-byte (e.g. `&#91;` for `[` in scraped reference titles).
+_ENTITY_DIGITAL_RE = re.compile(r"&#((?:x[a-f0-9]{1,6}|[0-9]{1,7}));", re.IGNORECASE)
+_ENTITY_NAMED_RE = re.compile(r"&([a-z][a-z0-9]{1,31});", re.IGNORECASE)
+
+
+def _decode_entity_at(raw: str, index: int) -> tuple[str, int] | None:
+    """Decode a single-character CommonMark reference at ``raw[index:]``.
+
+    Returns ``(decoded character, raw length)``, or ``None`` when the source
+    does not hold a valid entity there (mirrors rules_inline/entity.py) or
+    the entity decodes to more than one code point (HTML5 named ligatures
+    and combining sequences such as ``&fjlig;`` -> "fj"; those fail closed
+    so consumers never align only the first code point of an entity).
+    """
+    if index >= len(raw) or raw[index] != "&":
+        return None
+    tail = raw[index:]
+    if len(tail) > 1 and tail[1] == "#":
+        match = _ENTITY_DIGITAL_RE.match(tail)
+        if match is not None:
+            digits = match.group(1)
+            code = int(digits[1:], 16) if digits[0].lower() == "x" else int(digits, 10)
+            char = fromCodePoint(code) if isValidEntityCode(code) else fromCodePoint(0xFFFD)
+            return char, match.end()
+    else:
+        match = _ENTITY_NAMED_RE.match(tail)
+        if match is not None and match.group(1) in entities:
+            decoded = entities[match.group(1)]
+            if len(decoded) == 1:
+                return decoded, match.end()
+    return None
+
 
 def _matched_unmatched_construct(raw: str, index: int) -> str | None:
     tail = raw[index:]
@@ -391,8 +455,8 @@ class _InlineScanner:
     ) -> None:
         if not rendered:
             return
-        # CommonMark flanking rules can leave a balanced, paired `**`/`__`/`~~`
-        # as literal text inside a text token (e.g. `每周**≤2次**。`, where the
+        # Flanking rules can leave a balanced, paired `**`/`__`/`~~` as
+        # literal text inside a text token (e.g. `x**≤**y`, where the Latin
         # opener is followed by the punctuation `≤`). markdown-it has already
         # decided these are literal, so consuming them as text preserves the
         # lossless invariant. Only genuinely unbalanced markers (odd count,
@@ -411,12 +475,19 @@ class _InlineScanner:
                 and self.raw[self.cursor + 1] in _ESCAPABLE
                 and self.raw[self.cursor + 1] == visible
             )
+            entity = _decode_entity_at(self.raw, self.cursor)
             if is_escaped_visible:
                 self.cursor += 2
+            elif entity is not None and entity[0] == visible:
+                # Character references: one visible char spanning several raw
+                # bytes (`&#91;` renders as `[`). Consumed whole so slots stay
+                # exact source slices.
+                self.cursor += entity[1]
             elif self.cursor < len(self.raw) and self.raw[self.cursor] == visible:
                 construct = _matched_unmatched_construct(self.raw, self.cursor)
                 if (
                     construct is not None
+                    and construct not in _LITERAL_TEXT_CONSTRUCTS
                     and construct not in balanced_double_markers
                 ):
                     raise _InlineTopologyError("unmatched inline marker")
@@ -723,9 +794,7 @@ def _list_item_kind(tokens: list[Token], open_index: int, close_index: int) -> s
 def build_rewrite_map(markdown: str) -> MarkdownRewriteMap:
     """Classify blocks and map supported inline text to exact source bytes."""
     boundary_table = Utf8BoundaryTable(markdown)
-    parser = MarkdownIt("commonmark", {"html": True}).enable(
-        ["table", "strikethrough"]
-    )
+    parser = _new_rewrite_parser()
     tokens = parser.parse(markdown)
     source_lines = _SourceLines(markdown)
     units: list[RewriteUnit] = []
@@ -916,9 +985,7 @@ def _heading_visible_text(inline: Token) -> tuple[str, bool]:
 
 def build_document_anchor_index(markdown: str) -> DocumentAnchorIndex:
     """Index headings and same-document links across supported and unsupported blocks."""
-    parser = MarkdownIt("commonmark", {"html": True}).enable(
-        ["table", "strikethrough"]
-    )
+    parser = _new_rewrite_parser()
     tokens = parser.parse(markdown)
     source_lines = _SourceLines(markdown)
     boundaries = Utf8BoundaryTable(markdown)
@@ -1111,7 +1178,17 @@ def reconstruct_markdown(
                 soft_break = character == " " and re.fullmatch(
                     r"[ \t]*(?:\r\n|\r|\n)", raw_visible
                 )
-                if not (literal or escaped or soft_break):
+                entity = (
+                    _decode_entity_at(raw_visible, 0)
+                    if raw_visible[:1] == "&"
+                    else None
+                )
+                entity_visible = (
+                    entity is not None
+                    and entity[0] == character
+                    and entity[1] == len(raw_visible)
+                )
+                if not (literal or escaped or soft_break or entity_visible):
                     conflict("slot visible text does not match its source bytes")
             output.extend(source_bytes[start_byte:end_byte])
         previous_end = end_byte
