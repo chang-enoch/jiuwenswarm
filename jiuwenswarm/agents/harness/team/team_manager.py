@@ -973,9 +973,9 @@ class TeamManager:
 
     @staticmethod
     def _apply_trace_context(
-        spec: TeamAgentSpec,
-        *,
-        request_metadata: dict[str, Any] | None,
+            spec: Any,  # 构建期 TeamAgentSpec，或运行时 TeamSpec（_refresh_active_team_trace 传入）
+            *,
+            request_metadata: dict[str, Any] | None,
     ) -> dict[str, str]:
         """Export a transported TraceContext at each Team model boundary."""
         payload = (request_metadata or {}).get(TRACE_CONTEXT_METADATA_KEY)
@@ -1025,9 +1025,13 @@ class TeamManager:
 
         for pool_entry in spec.model_pool:
             pool_entry.metadata = merge_headers(pool_entry.metadata)
-        if spec.model_router is not None:
-            spec.model_router.metadata = merge_headers(spec.model_router.metadata)
-        for agent_spec in spec.agents.values():
+        # spec 可能是运行时 TeamSpec（_refresh_active_team_trace 从 ctx.team_spec 取），
+        # 它只有 model_pool，没有 model_router / agents——两字段仅存在于构建期
+        # TeamAgentSpec，缺失时跳过对应合并（运行时成员模型配置本就不在 TeamSpec 上）。
+        model_router = getattr(spec, "model_router", None)
+        if model_router is not None:
+            model_router.metadata = merge_headers(model_router.metadata)
+        for agent_spec in (getattr(spec, "agents", None) or {}).values():
             if agent_spec.model is not None:
                 client_config = agent_spec.model.model_client_config
                 custom_headers = dict(client_config.custom_headers or {})
