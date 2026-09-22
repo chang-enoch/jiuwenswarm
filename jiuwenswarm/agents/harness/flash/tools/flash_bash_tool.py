@@ -95,18 +95,29 @@ class FlashBashTool(BashTool):
         hardened = self._hardened_inputs(inputs)
         final_chunk = None
         async for chunk in super().stream(hardened, **kwargs):
-            if (
-                chunk is not None
-                and chunk.data
-                and isinstance(chunk.data, dict)
-                and isinstance(chunk.data.get("content"), str)
-                and not chunk.data.get("text")
-            ):
+            if self._is_final_rendered_content_chunk(chunk):
                 final_chunk = chunk
                 continue
             yield chunk
         if final_chunk is not None:
             yield self._annotate_final_chunk(hardened, final_chunk)
+
+    @staticmethod
+    def _is_final_rendered_content_chunk(chunk: ToolOutput) -> bool:
+        """Return True for the fully-rendered terminal content chunk.
+
+        The stock ``BashTool.stream`` final chunk carries the rendered tool
+        content in ``data["content"]``; intermediate chunks carry partial text
+        in ``data["text"]``. We collect the final chunk (no ``text`` key,
+        ``content`` is a string) and annotate it once streaming completes.
+        """
+        if chunk is None:
+            return False
+        data = chunk.data
+        if not isinstance(data, dict):
+            return False
+        content = data.get("content")
+        return isinstance(content, str) and not data.get("text")
 
 
 class FlashBashSysOperationRail(SysOperationRail):

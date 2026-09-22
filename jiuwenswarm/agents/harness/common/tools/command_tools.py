@@ -870,9 +870,15 @@ def _prepend_windows_tool_paths(env: dict[str, str]) -> None:
     current_path = env.get(path_key, "")
     new_path = current_path
     if trusted_entries:
-        new_path = os.pathsep.join(trusted_entries) + (os.pathsep + new_path if new_path else "")
+        new_path = (
+            os.pathsep.join(trusted_entries)
+            + (os.pathsep + new_path if new_path else "")
+        )
     if workspace_entries:
-        new_path = new_path + (os.pathsep + os.pathsep.join(workspace_entries) if new_path else os.pathsep.join(workspace_entries))
+        workspace_join = os.pathsep.join(workspace_entries)
+        new_path = new_path + (
+            os.pathsep + workspace_join if new_path else workspace_join
+        )
     env[path_key] = new_path
     logger.info(
         "[BashEnv] merged %d trusted + %d workspace tool dirs into subprocess PATH: trusted=%s workspace=%s",
