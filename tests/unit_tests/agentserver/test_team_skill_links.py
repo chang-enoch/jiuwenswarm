@@ -111,7 +111,7 @@ def test_cmd_fallback_passes_decoding_options(monkeypatch, tmp_path):
     assert captured["kwargs"]["errors"] == "replace"
     assert captured["kwargs"]["capture_output"] is True
     if sys.platform == "win32":
-        assert captured["kwargs"]["encoding"] == "mbcs"
+        assert captured["kwargs"]["encoding"] == "oem"
     else:
         assert captured["kwargs"]["encoding"] == "utf-8"
     assert captured["cmd"][1:3] == ["/c", "mklink"]
@@ -154,6 +154,58 @@ def test_native_rejection_falls_back_to_cmd_exe(tmp_path, monkeypatch):
     _create_windows_junction(target, link)
 
     _assert_link_resolves(link, target)
+
+
+@requires_windows
+def test_native_rejection_missing_target_falls_back_to_dangling_junction(tmp_path, monkeypatch):
+    """Native rejection with a missing target: cmd.exe exits 0 and silently
+    creates a dangling junction, which later prune runs remove."""
+    def _reject(_src, _dst):
+        raise OSError(2, "missing target")
+
+    monkeypatch.setattr(team_skill_links._winapi, "CreateJunction", _reject)
+    source = tmp_path / "skills_src"
+    source.mkdir()
+    target_root = tmp_path / "skills_tgt"
+    target_root.mkdir()
+    link = target_root / "dangling"
+
+    _create_windows_junction(source / "missing_target", link)
+
+    assert os.path.lexists(link)
+    assert not link.exists(), "mklink /J must not validate the target"
+    team_skill_links.prune_skill_dir_links(source, target_root)
+    assert not os.path.lexists(link), "prune must remove the dangling junction"
+
+
+def test_remove_skill_dir_link_tolerates_vanished_entry(tmp_path, monkeypatch):
+    """A link removed by a concurrent sync between check and unlink is success."""
+    link = tmp_path / "ghost"
+    # Pretend the type check saw a link, but it is gone by the time the
+    # removal syscall runs (concurrent prune raced us).
+    monkeypatch.setattr(Path, "is_symlink", lambda self: True)
+
+    team_skill_links.remove_skill_dir_link(link)  # must not raise FileNotFoundError
+
+    assert not os.path.lexists(link)
+
+
+@requires_windows
+def test_remove_skill_dir_link_reraises_when_entry_remains(tmp_path, monkeypatch):
+    """A removal error with the entry still present is not swallowed."""
+    target = _make_skill(tmp_path, "skill-a")
+    link = tmp_path / "link"
+    _create_windows_junction(target, link)
+
+    def _denied(_path):
+        raise PermissionError(13, "Access denied")
+
+    monkeypatch.setattr(team_skill_links.os, "rmdir", _denied)
+
+    with pytest.raises(PermissionError):
+        team_skill_links.remove_skill_dir_link(link)
+
+    assert os.path.lexists(link)
 
 
 def test_link_skill_dir_is_idempotent(tmp_path):
