@@ -3942,7 +3942,7 @@ class SkillManager:
             )
 
     async def handle_skills_web_uninstall(self, params: dict) -> dict:
-        """企业 Web 卸载兼容入口：仅允许删除 workspace 中的 user 安装。"""
+        """企业 Web 卸载兼容入口：允许删除 source_type 为 user 或未标记的安装。"""
 
         name = str(params.get("name") or "").strip()
         if not name:
@@ -3984,7 +3984,8 @@ class SkillManager:
                 "error_code": "not_found",
                 "error_message": f"skill `{name}` is not installed",
             }
-        if str(installation.get("source_type") or "").strip() != "user":
+        source_type = str(installation.get("source_type") or "").strip()
+        if source_type not in {"", "user"}:
             return {
                 "success": False,
                 "error_code": "prebuilt_not_removable",
@@ -6142,7 +6143,7 @@ class SkillManager:
             {
                 "installed": ready,
                 "enabled": self._installation_enabled(record),
-                "removable": source_type == "user",
+                "removable": source_type in ("", "user"),
                 "consistency": "ok" if ready else "inconsistent",
             }
         )
