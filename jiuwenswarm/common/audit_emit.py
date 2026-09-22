@@ -61,6 +61,14 @@ def emit_audit(
         pass
 
     try:
+        from jiuwenswarm.common.audit_gate import is_audit_config_enabled
+
+        if not is_audit_config_enabled():
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    try:
         from jiuwenswarm.telemetry.audit import audit_claw_log
 
         keyword = str(event_type or "").strip().upper()

@@ -11,6 +11,7 @@
 - :func:`install_audit_middleware` —— M1 gateway web 全局 HTTP 审计中间件
 
 个人版：打点入口 no-op（``is_enterprise`` 门控）；异常只记 warning，不影响业务。
+无 audit_log_config 库配置时：写出关闭（``is_audit_config_enabled``），直至落盘并 apply。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from typing import Any
 
 from openjiuwen_runtime.foundation import audit
 
+from jiuwenswarm.common.audit_gate import is_audit_config_enabled
 from jiuwenswarm.edition import is_enterprise
 from jiuwenswarm.extensions.identity_provider import IdentityStore
 from jiuwenswarm.telemetry import metrics as telemetry_metrics
@@ -123,6 +125,8 @@ def audit_claw_log(
     """
     try:
         if not is_enterprise():
+            return
+        if not is_audit_config_enabled():
             return
         ctx = _request_context()
         merged_extra: dict[str, Any] = {
