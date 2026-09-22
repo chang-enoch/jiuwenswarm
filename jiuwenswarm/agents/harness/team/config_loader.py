@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from copy import deepcopy
 from pathlib import Path
@@ -14,13 +12,16 @@ from typing import Any
 from openjiuwen.agent_teams.paths import get_agent_teams_home
 
 from jiuwenswarm.common.config import get_config
+from jiuwenswarm.common.model_identity import (
+    MODEL_IDENTITY_REFERENCE_PREFIX,
+    build_model_identity_reference,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ITERATIONS = 200
 _DEFAULT_COMPLETION_TIMEOUT = 600.0
 _DEFAULT_MAX_DEBATE_ROUNDS = 5
-_MODEL_IDENTITY_REF_PREFIX = "model-identity-v1:"
 _DEFAULT_AGENT_WORKSPACE = {"stable_base": True}
 _DEFAULT_TEAM_WORKSPACE = {"enabled": True}
 _DEFAULT_TRANSPORT = {"type": "inprocess"}
@@ -249,8 +250,15 @@ def _resolve_default_model_config(
             if len(matches) == 1:
                 return matches[0]
             if len(matches) > 1:
-                raise ValueError(f"requested team model is ambiguous: {requested!r}")
-            raise ValueError(f"requested team model not found: {requested!r}")
+                logger.warning(
+                    "[TeamConfigLoader] requested model name is ambiguous; using first match: %s",
+                    requested,
+                )
+            else:
+                logger.warning(
+                    "[TeamConfigLoader] requested model name not found; using first default: %s",
+                    requested,
+                )
 
         for item in defaults_raw:
             if isinstance(item, dict):
@@ -336,32 +344,15 @@ def _build_agent_spec_dict(
     return merged
 
 
-def _normalized_model_identity_text(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def build_model_identity_reference(model_name: Any, client_config: dict[str, Any]) -> str:
-    """Build a credential-free model identity that is independent of list order."""
-    identity = {
-        "api_base": _normalized_model_identity_text(client_config.get("api_base")).rstrip("/"),
-        "model_name": _normalized_model_identity_text(model_name),
-        "provider": _normalized_model_identity_text(client_config.get("client_provider")).lower(),
-    }
-    digest = hashlib.sha256(
-        json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    return f"{_MODEL_IDENTITY_REF_PREFIX}{digest}"
-
-
 def resolve_model_identity_reference(
     model_ref: Any,
     config_base: dict[str, Any],
 ) -> dict[str, Any]:
     """Resolve one stable model identity to its unique tenant-owned model entry."""
     normalized_ref = str(model_ref or "").strip().lower()
-    digest = normalized_ref.removeprefix(_MODEL_IDENTITY_REF_PREFIX)
+    digest = normalized_ref.removeprefix(MODEL_IDENTITY_REFERENCE_PREFIX)
     if (
-        not normalized_ref.startswith(_MODEL_IDENTITY_REF_PREFIX)
+        not normalized_ref.startswith(MODEL_IDENTITY_REFERENCE_PREFIX)
         or len(digest) != 64
         or any(char not in "0123456789abcdef" for char in digest)
     ):
@@ -411,7 +402,7 @@ def resolve_legacy_index_model_reference(
     client_config = entry.get("model_client_config")
     if not isinstance(client_config, dict):
         raise ValueError(f"team model reference points to invalid entry: {normalized_ref!r}")
-    actual_name = _normalized_model_identity_text(client_config.get("model_name"))
+    actual_name = str(client_config.get("model_name") or "").strip()
     if actual_name != model_name.strip():
         raise ValueError(
             "team model reference name mismatch: "
@@ -426,7 +417,7 @@ def resolve_team_model_reference(
 ) -> dict[str, Any]:
     """Resolve stable identities and legacy index references during transition."""
     normalized_ref = str(model_ref or "").strip()
-    if normalized_ref.lower().startswith(_MODEL_IDENTITY_REF_PREFIX):
+    if normalized_ref.lower().startswith(MODEL_IDENTITY_REFERENCE_PREFIX):
         return resolve_model_identity_reference(normalized_ref, config_base)
     return resolve_legacy_index_model_reference(normalized_ref, config_base)
 

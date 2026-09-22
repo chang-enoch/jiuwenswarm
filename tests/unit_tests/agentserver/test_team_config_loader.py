@@ -222,7 +222,7 @@ def test_requested_model_overrides_every_team_agent_model_and_preserves_other_fi
     assert spec["agents"]["teammate"]["max_iterations"] == 7
 
 
-def test_requested_model_must_exist_in_models_defaults():
+def test_requested_model_name_falls_back_to_first_default_when_missing():
     config = {
         "models": {
             "defaults": [
@@ -237,8 +237,42 @@ def test_requested_model_must_exist_in_models_defaults():
         ),
     }
 
-    with pytest.raises(ValueError, match="requested team model not found"):
-        load_team_spec_dict(config_base=config, requested_model_name="missing-model")
+    spec = load_team_spec_dict(config_base=config, requested_model_name="missing-model")
+
+    assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "configured-model"
+
+
+def test_requested_model_name_uses_first_match_when_ambiguous():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "model_name": "duplicate-model",
+                        "api_base": "https://first.example.test/v1",
+                    },
+                    "model_config_obj": {},
+                },
+                {
+                    "model_client_config": {
+                        "model_name": "duplicate-model",
+                        "api_base": "https://second.example.test/v1",
+                    },
+                    "model_config_obj": {},
+                },
+            ]
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="duplicate-model")
+
+    assert (
+        spec["agents"]["leader"]["model"]["model_client_config"]["api_base"]
+        == "https://first.example.test/v1"
+    )
 
 
 def _model_identity_ref(*, model_name: str, provider: str, api_base: str) -> str:
