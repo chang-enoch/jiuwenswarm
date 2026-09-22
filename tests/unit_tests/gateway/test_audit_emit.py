@@ -67,6 +67,17 @@ def test_emit_audit_caller_is_business_site(_audit_memory: MemoryEmitter, monkey
     assert "audit_claw_log" not in caller
 
 
+def test_emit_audit_ua_passes_uid_without_context(
+    _audit_memory: MemoryEmitter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    emit_audit_ua(SUBMDL="api_client", PROC="http_agent_send", UA="ok", UID="user1")
+    attrs = _audit_memory.records[0]["attributes"]
+    assert attrs.get("UID") == "user1"
+    assert attrs.get("user_id") == "user1"
+
+
 def test_emit_audit_noop_when_config_disabled(
     _audit_memory: MemoryEmitter,
     monkeypatch: pytest.MonkeyPatch,

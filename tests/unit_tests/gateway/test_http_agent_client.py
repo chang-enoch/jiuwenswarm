@@ -673,6 +673,57 @@ async def test_send_request_unary_success_and_non_json():
 
 
 @pytest.mark.asyncio
+async def test_send_request_emits_uid_from_envelope(monkeypatch):
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    from jiuwenswarm.common.audit_gate import set_audit_config_enabled
+
+    set_audit_config_enabled(True)
+    captured: list[dict] = []
+
+    def _cap_ua(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(
+        "jiuwenswarm.gateway.routing.http_agent_client.emit_audit_ua",
+        _cap_ua,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "request_id": "t-uid",
+                "ok": True,
+                "data": {"result": {}},
+            },
+        )
+
+    client = HttpSseAgentServerClient(
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    try:
+        await client.send_request(
+            e2a_from_agent_fields(
+                request_id="t-uid",
+                channel_id="web",
+                session_id="s1",
+                req_method=ReqMethod.SESSION_DELETE,
+                params={"session_id": "s1"},
+                user_id="user1",
+            ),
+            base_url="http://10.42.1.8:8080",
+        )
+    finally:
+        await client.disconnect()
+        set_audit_config_enabled(False)
+
+    assert len(captured) == 1
+    assert captured[0].get("PROC") == "http_agent_send"
+    assert captured[0].get("UID") == "user1"
+    assert captured[0].get("method") == "session.delete"
+
+
+@pytest.mark.asyncio
 async def test_send_request_stream_yields_chunks_and_skips_garbage():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/health"):

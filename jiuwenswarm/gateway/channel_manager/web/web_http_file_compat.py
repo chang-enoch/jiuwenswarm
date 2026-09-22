@@ -70,6 +70,19 @@ def _json(status: int, payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse(payload, status_code=status)
 
 
+def _request_user_id(request: Request) -> str | None:
+    """企业上传审计 UID：可信客户端时取 ``X-User-Id``（对齐 Web HTTP 租户头策略）。"""
+    from jiuwenswarm.gateway.channel_manager.web.web_http_dispatch import (
+        _trust_client_tenant_headers,
+    )
+
+    client_host = request.client.host if request.client else None
+    if not _trust_client_tenant_headers(client_host):
+        return None
+    text = str(request.headers.get("x-user-id") or "").strip()
+    return text or None
+
+
 def catalog_file_compat_entries() -> list[dict[str, Any]]:
     paths = [
         ("GET", "/file-api/list-files", "列目录"),
@@ -380,7 +393,10 @@ def register_file_compat_routes(app: FastAPI) -> None:
         if not is_enterprise():
             return _json(404, {"error": "not_available"})
         raw = await request.body()
-        status, payload = process_obs_upload_body(raw)
+        status, payload = process_obs_upload_body(
+            raw,
+            user_id=_request_user_id(request),
+        )
         return _json(status, payload)
 
     @app.post(
@@ -405,6 +421,7 @@ def register_file_compat_routes(app: FastAPI) -> None:
                 file_bytes=raw,
                 filename=name,
                 session_id=session_id or "default",
+                user_id=_request_user_id(request),
             )
             return _json(200, result)
         except ValueError:

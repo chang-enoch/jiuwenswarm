@@ -1,3 +1,5 @@
+import { buildRuntimeIdentityHeaders } from './runtimeScope';
+
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 export interface ObsUploadResult {
@@ -31,6 +33,13 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+function newUploadRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `req_obs_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  }
+  return `req_obs_${Date.now().toString(36)}`;
+}
+
 /** Upload a browser File to Gateway MinIO via POST /file-api/upload-obs. */
 export async function uploadFileToObs(file: File): Promise<ObsUploadResult> {
   if (file.size <= 0) {
@@ -41,9 +50,14 @@ export async function uploadFileToObs(file: File): Promise<ObsUploadResult> {
   }
 
   const content_base64 = await fileToBase64(file);
+  const requestId = newUploadRequestId();
   const response = await fetch('/file-api/upload-obs', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      // 与 webRequest 对齐：Gateway 审计/路由从 X-User-Id 等头取身份
+      ...buildRuntimeIdentityHeaders(requestId, {}),
+    },
     body: JSON.stringify({
       filename: file.name,
       content_base64,
