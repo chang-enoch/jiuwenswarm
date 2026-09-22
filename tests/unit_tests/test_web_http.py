@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import inspect
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -25,11 +27,84 @@ SERVER_PATH = ROOT / "jiuwenswarm" / "gateway" / "channel_manager" / "web" / "we
 ROUTES_PATH = ROOT / "jiuwenswarm" / "gateway" / "channel_manager" / "web" / "web_http_routes.py"
 
 
-def _load_module(mod_name: str, path: Path) -> ModuleType:
+def _install_sys_module(
+    monkeypatch: pytest.MonkeyPatch | None,
+    name: str,
+    module: ModuleType,
+) -> ModuleType:
+    """Register ``module`` under ``name`` and bind it on the parent package."""
+    parent_name, _, child = name.rpartition(".")
+    if monkeypatch is None:
+        sys.modules[name] = module
+        if parent_name and parent_name in sys.modules:
+            setattr(sys.modules[parent_name], child, module)
+        return module
+    monkeypatch.setitem(sys.modules, name, module)
+    if parent_name:
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.setattr(parent, child, module, raising=False)
+    return module
+
+
+def _is_empty_package_stub(mod: object) -> bool:
+    if not isinstance(mod, ModuleType):
+        return False
+    if getattr(mod, "__file__", None):
+        return False
+    path = getattr(mod, "__path__", None)
+    return path == [] or path is None
+
+
+def _rebind_gateway_parent_attrs() -> None:
+    """Ensure gateway parent packages exist and expose cached child modules.
+
+    ``importlib.import_module("...web")`` is a no-op if ``web`` is already in
+    ``sys.modules``, even when ``gateway`` / ``channel_manager`` were dropped
+    after a partial import. pytest dotted ``monkeypatch.setattr`` then fails
+    because it walks parent attributes, not ``sys.modules``.
+    """
+    for name in (
+        "jiuwenswarm.gateway",
+        "jiuwenswarm.gateway.channel_manager",
+        "jiuwenswarm.gateway.channel_manager.web",
+        "jiuwenswarm.gateway.routing",
+    ):
+        if name not in sys.modules:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                continue
+        parent_name, _, child = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        child_mod = sys.modules.get(name)
+        if parent is not None and child_mod is not None:
+            setattr(parent, child, child_mod)
+
+
+def _purge_empty_gateway_stubs() -> None:
+    """Drop empty ``jiuwenswarm.gateway*`` stubs left in this xdist worker.
+
+    pytest ``monkeypatch.setattr("a.b.c")`` walks parent attributes. An empty
+    ``channel_manager`` / ``gateway`` stub without ``.web`` / ``.routing``
+    makes later files fail even if ``sys.modules`` still has a child name.
+    """
+    for name in list(sys.modules):
+        if name == "jiuwenswarm.gateway" or name.startswith("jiuwenswarm.gateway."):
+            if _is_empty_package_stub(sys.modules.get(name)):
+                sys.modules.pop(name, None)
+    _rebind_gateway_parent_attrs()
+
+
+def _load_module(
+    mod_name: str,
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> ModuleType:
     spec = importlib.util.spec_from_file_location(mod_name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
+    _install_sys_module(monkeypatch, mod_name, mod)
     spec.loader.exec_module(mod)
     return mod
 
@@ -53,53 +128,81 @@ class _FakePeer:
             yield f
 
 
+def _stub_leaf_module(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    **attrs: Any,
+) -> ModuleType:
+    mod = ModuleType(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return _install_sys_module(monkeypatch, name, mod)
+
+
+@pytest.fixture(autouse=True)
+def _purge_gateway_stubs_after_test() -> Iterator[None]:
+    yield
+    _purge_empty_gateway_stubs()
+
+
+def _build_app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
+    # Import real parents first. Empty ModuleType stubs under jiuwenswarm.gateway*
+    # leak into later xdist tests because pytest dotted monkeypatch walks parent
+    # attributes, not only sys.modules.
+    _rebind_gateway_parent_attrs()
+
+    dispatch_mock = AsyncMock()
+    _stub_leaf_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_dispatch",
+        dispatch_http_request=dispatch_mock,
+    )
+    _stub_leaf_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat",
+        register_sessions_compat_routes=lambda app: None,
+        catalog_sessions_compat_entries=lambda: [],
+    )
+    _stub_leaf_module(
+        monkeypatch,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_file_compat",
+        register_file_compat_routes=lambda app: None,
+        catalog_file_compat_entries=lambda: [],
+    )
+
+    web_http_app = _load_module("jw_web_http_app_under_test", HTTP_PATH, monkeypatch)
+    app = web_http_app.create_web_http_app(object())
+    return app, dispatch_mock
+
+
 @pytest.fixture
 def app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
-    # Stub dispatch module before loading web_http_app
-    dispatch_mod = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_dispatch")
-    dispatch_mock = AsyncMock()
-    dispatch_mod.dispatch_http_request = dispatch_mock  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_dispatch"] = dispatch_mod
+    return _build_app_with_mock(monkeypatch)
 
-    # Minimal package parents so relative imports in web_http_app resolve if any
-    for pkg in (
-        "jiuwenswarm",
-        "jiuwenswarm.gateway",
-        "jiuwenswarm.gateway.channel_manager",
-        "jiuwenswarm.gateway.channel_manager.web",
-    ):
-        if pkg not in sys.modules:
-            m = ModuleType(pkg)
-            m.__path__ = []  # type: ignore[attr-defined]
-            sys.modules[pkg] = m
 
-    # Real route table (no Gateway imports) so create_web_http_app can register workspace routes.
-    _load_module(
-        "jiuwenswarm.gateway.channel_manager.web.web_http_routes",
-        ROUTES_PATH,
-    )
+def test_http_app_stubs_do_not_break_later_dotted_monkeypatch():
+    """Later xdist tests resolve dotted paths like channel_manager.web / gateway.routing."""
+    mp = pytest.MonkeyPatch()
+    try:
+        app, dispatch = _build_app_with_mock(mp)
+        assert app is not None
+        assert dispatch is not None
+    finally:
+        mp.undo()
+        _purge_empty_gateway_stubs()
 
-    # web_http_app imports file/sessions compat; stub them (empty package __path__ above).
-    sessions_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat")
-    sessions_compat.register_sessions_compat_routes = lambda app: None  # type: ignore[attr-defined]
-    sessions_compat.catalog_sessions_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat"] = sessions_compat
-
-    file_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_file_compat")
-    file_compat.register_file_compat_routes = lambda app: None  # type: ignore[attr-defined]
-    file_compat.catalog_file_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_file_compat"] = file_compat
-
-    # web_http_app imports timeout helpers from web_http_server (stdlib-only).
-    _load_module(
-        "jiuwenswarm.gateway.channel_manager.web.web_http_server",
-        SERVER_PATH,
-    )
-
-    web_http_app = _load_module("jw_web_http_app_under_test", HTTP_PATH)
-    channel = object()
-    app = web_http_app.create_web_http_app(channel)
-    return app, dispatch_mock
+    later = pytest.MonkeyPatch()
+    try:
+        later.setattr(
+            "jiuwenswarm.gateway.channel_manager.web.web_connect.WebChannel",
+            object(),
+        )
+        later.setattr(
+            "jiuwenswarm.gateway.routing.agent_client.AGENT_WS_MAX_MESSAGE_BYTES",
+            1024,
+        )
+    finally:
+        later.undo()
 
 
 def test_bind_http_session_create_does_not_inject_session_id():

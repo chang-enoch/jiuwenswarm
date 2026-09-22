@@ -53,6 +53,12 @@ import yaml
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
+from jiuwenswarm.common.path_provider import (
+    PathCategory,
+    current_path_context,
+    get_path_provider,
+)
+
 # 尝试导入 pythonjsonlogger（用于 JSON 格式化输出，缺失时优雅降级为文本 Formatter）
 try:
     from pythonjsonlogger import jsonlogger
@@ -1850,6 +1856,77 @@ def get_root_dir() -> Path:
     return _root_dir
 
 
+def _dispatch_path(category, *, node=None, session_id=None, explicit=None):
+    """Resolve optional overrides without displacing explicit tenant paths."""
+    if explicit is not None:
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=skipped "
+            "outcome=explicit_default",
+            category.value,
+        )
+        return None
+    provider = get_path_provider()
+    if provider is None:
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=none "
+            "outcome=builtin_default",
+            category.value,
+        )
+        return None
+    provider_name = getattr(provider, "name", type(provider).__name__)
+    try:
+        ctx = current_path_context(session_id=session_id)
+        if category == PathCategory.SHARED_SKILLS_DIRS:
+            paths = provider.resolve_path_list(category, ctx)
+            if paths is None:
+                logger.info(
+                    "zqh1 stage=path_dispatch category=%s provider=%s "
+                    "outcome=provider_none",
+                    category.value,
+                    provider_name,
+                )
+                return None
+            resolved_paths = [Path(path) for path in paths]
+            logger.info(
+                "zqh1 stage=path_dispatch category=%s provider=%s "
+                "outcome=provider_list path_count=%d",
+                category.value,
+                provider_name,
+                len(resolved_paths),
+            )
+            return resolved_paths
+        path = provider.resolve_path(
+            category, ctx, node=node, session_id=ctx.session_id,
+        )
+        if path is None:
+            logger.info(
+                "zqh1 stage=path_dispatch category=%s provider=%s "
+                "outcome=provider_none",
+                category.value,
+                provider_name,
+            )
+            return None
+        resolved_path = Path(path)
+        logger.info(
+            "zqh1 stage=path_dispatch category=%s provider=%s "
+            "outcome=provider_path path=%s",
+            category.value,
+            provider_name,
+            resolved_path,
+        )
+        return resolved_path
+    except Exception:
+        logger.warning(
+            "zqh1 stage=path_dispatch category=%s provider=%s "
+            "outcome=error fallback=builtin_default "
+            "(fallback to default)",
+            category.value,
+            provider_name,
+            exc_info=True,
+        )
+        return None
+
+
 def get_agent_workspace_dir() -> Path:
     """Get the agent workspace directory path.
 
@@ -1861,6 +1938,9 @@ def get_agent_workspace_dir() -> Path:
         ``~/.jiuwenswarm/workspace_default/agent/jiuwenclaw_workspace``
         (or the request-bound tenant workspace when ContextVar is set).
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE)
+    if overridden is not None:
+        return overridden
     try:
         from jiuwenswarm.server.runtime.tenant_context import get_bound_jiuwenclaw_workspace
 
@@ -1879,6 +1959,9 @@ def get_default_project_workspace_dir() -> Path:
     under ``get_agent_workspace_dir()``. This directory is only the default cwd
     / workspace boundary for user task artifacts when no project is selected.
     """
+    overridden = _dispatch_path(PathCategory.PROJECT_WORKSPACE)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "projects"
 
 
@@ -1892,6 +1975,13 @@ def get_default_project_session_workspace_dir(session_id: str | None = None) -> 
     workspace. If it is missing during early adapter initialization, the shared
     projects root is returned so no throwaway session directory is created.
     """
+    overridden = _dispatch_path(
+        PathCategory.PROJECT_SESSION_WORKSPACE,
+        session_id=session_id,
+    )
+    if overridden is not None:
+        overridden.mkdir(parents=True, exist_ok=True)
+        return overridden
     base = get_default_project_workspace_dir()
     raw_session = str(session_id or "").strip()
     if not raw_session:
@@ -1909,6 +1999,9 @@ def get_default_project_session_workspace_dir(session_id: str | None = None) -> 
 def get_prompt_attachment_dir() -> Path:
     """Get the jiuwenswarm prompt attachment directory path."""
 
+    overridden = _dispatch_path(PathCategory.PROMPT_ATTACHMENT)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "prompt_attachment"
 
 
@@ -1930,6 +2023,9 @@ def get_agent_root_dir() -> Path:
     - 企业版: ``~/.jiuwenswarm/workspace_default/agent/``
     （或请求绑定的 agent root ContextVar）。
     """
+    overridden = _dispatch_path(PathCategory.AGENT_ROOT)
+    if overridden is not None:
+        return overridden
     try:
         from jiuwenswarm.server.runtime.tenant_context import get_bound_agent_root
 
@@ -2080,6 +2176,9 @@ def get_agent_memory_dir() -> Path:
     Returns:
         Path to memory directory: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/memory
     """
+    overridden = _dispatch_path(PathCategory.MEMORY)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "memory"
 
 
@@ -2091,6 +2190,9 @@ def get_agent_skills_dir() -> Path:
     Returns:
         Path to skills directory: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/skills
     """
+    overridden = _dispatch_path(PathCategory.SKILLS)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "skills"
 
 
@@ -2125,6 +2227,9 @@ def get_shared_agent_skills_dirs() -> list[Path]:
     """
     from jiuwenswarm.common.local_env_config import read_env
 
+    overridden = _dispatch_path(PathCategory.SHARED_SKILLS_DIRS)
+    if overridden is not None:
+        return overridden
     raw = read_env(JIUWENSWARM_SHARED_SKILLS_DIRS_ENV, "")
     if not raw or not raw.strip():
         return []
@@ -2195,6 +2300,9 @@ def get_interactions_dir() -> Path:
     Returns:
         Path to interactions directory: {workspace}/agent/jiuwenclaw_workspace/interactions
     """
+    overridden = _dispatch_path(PathCategory.INTERACTIONS)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "interactions"
 
 
@@ -2328,6 +2436,9 @@ def get_deepagent_todo_dir() -> Path:
     Returns:
         Path to todo directory: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/todo
     """
+    overridden = _dispatch_path(PathCategory.TODO)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "todo"
 
 
@@ -2337,6 +2448,9 @@ def get_deepagent_messages_dir() -> Path:
     Returns:
         Path to messages directory: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/messages
     """
+    overridden = _dispatch_path(PathCategory.MESSAGES)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "messages"
 
 
@@ -2346,6 +2460,9 @@ def get_deepagent_agents_dir() -> Path:
     Returns:
         Path to agents directory: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/agents
     """
+    overridden = _dispatch_path(PathCategory.AGENTS)
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "agents"
 
 
@@ -2355,6 +2472,9 @@ def get_deepagent_heartbeat_path() -> Path:
     Returns:
         Path to HEARTBEAT.md: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/HEARTBEAT.md
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE_MD, node="HEARTBEAT.md")
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "HEARTBEAT.md"
 
 
@@ -2364,6 +2484,9 @@ def get_deepagent_agent_md_path() -> Path:
     Returns:
         Path to AGENT.md: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/AGENT.md
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE_MD, node="AGENT.md")
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "AGENT.md"
 
 
@@ -2373,6 +2496,9 @@ def get_deepagent_soul_md_path() -> Path:
     Returns:
         Path to SOUL.md: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/SOUL.md
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE_MD, node="SOUL.md")
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "SOUL.md"
 
 
@@ -2382,6 +2508,9 @@ def get_deepagent_identity_md_path() -> Path:
     Returns:
         Path to IDENTITY.md: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/IDENTITY.md
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE_MD, node="IDENTITY.md")
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "IDENTITY.md"
 
 
@@ -2391,6 +2520,9 @@ def get_deepagent_user_md_path() -> Path:
     Returns:
         Path to USER.md: ~/.jiuwenswarm/agent/jiuwenclaw_workspace/USER.md
     """
+    overridden = _dispatch_path(PathCategory.WORKSPACE_MD, node="USER.md")
+    if overridden is not None:
+        return overridden
     return get_agent_workspace_dir() / "USER.md"
 
 
@@ -2412,6 +2544,9 @@ def get_agent_sessions_dir() -> Path:
     Path: ``~/.jiuwenswarm/workspace_default/agent/sessions``
     (or the request-bound tenant sessions dir when ContextVar is set).
     """
+    overridden = _dispatch_path(PathCategory.SESSIONS)
+    if overridden is not None:
+        return overridden
     return get_agent_root_dir() / "sessions"
 
 
@@ -2420,6 +2555,9 @@ def get_agent_evolution_trajectories_dir(workspace_key: str | None = None) -> Pa
 
     Path: ``workspace_{key}/agent/evolution_trajectories``
     """
+    overridden = _dispatch_path(PathCategory.EVOLUTION_TRAJECTORIES, explicit=workspace_key)
+    if overridden is not None:
+        return overridden
     if workspace_key is not None:
         return resolve_tenant_agent_root_dir(workspace_key) / "evolution_trajectories"
     return get_agent_root_dir() / "evolution_trajectories"
@@ -2473,6 +2611,9 @@ def get_checkpoint_dir() -> Path:
 
     Per-agent isolation uses ``set_checkpoint`` / ``get_multi_tenant_user_workspace_dir``.
     """
+    overridden = _dispatch_path(PathCategory.CHECKPOINT)
+    if overridden is not None:
+        return overridden
     return get_multi_tenant_user_workspace_dir("default") / ".checkpoint"
 
 
@@ -2499,6 +2640,9 @@ def get_logs_dir(service_id: str | None = None) -> Path:
     ``service_id`` 解析顺序：显式参数 > 当前 ``bind_agent_env_ns`` 的 sid > ``default``。
     进程启动时的 FileHandler（``setup_logger``）通常无 bind，仍落在 ``service_default/.logs``。
     """
+    overridden = _dispatch_path(PathCategory.LOGS, explicit=service_id)
+    if overridden is not None:
+        return overridden
     log_root_path = os.getenv("LOG_ROOT_PATH", "").strip()
     if log_root_path:
         return Path(log_root_path).expanduser().resolve()
@@ -3050,8 +3194,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     _log_queue = _queue.SimpleQueue()
     listener_targets: list[logging.Handler] = []
 
-    log_root_path = os.getenv("LOG_ROOT_PATH", "").strip()
-    logs_root = Path(log_root_path).expanduser().resolve() if log_root_path else get_logs_dir()
+    logs_root = get_logs_dir()
     logs_root.mkdir(parents=True, exist_ok=True)
 
     levels = _resolve_logging_levels(log_level)
@@ -3176,6 +3319,12 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
 
     # 保留 dev-stable 既有的源头脱敏（与 handler 层 SensitiveDataFilter 双保险）
     install_source_record_masking()
+    logger.info(
+        "zqh1 stage=log_init logs_root=%s file_enabled=%s console_enabled=%s",
+        logs_root,
+        file_enabled,
+        console_enabled,
+    )
     return root
 
 
