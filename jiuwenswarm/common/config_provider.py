@@ -26,9 +26,9 @@ def resolve_config_source() -> ConfigSource:
         raw = None
     if raw is None:
         try:
-            from jiuwenswarm.common.config import get_merged_config_dict
+            from jiuwenswarm.common.config import get_config
 
-            config = get_merged_config_dict()
+            config = get_config()
             yaml_raw = (
                 (config.get("config") or {}).get("source")
                 if isinstance(config, dict)

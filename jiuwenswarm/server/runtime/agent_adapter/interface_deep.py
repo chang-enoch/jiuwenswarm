@@ -1595,7 +1595,7 @@ def parse_int(value: Any, default: int) -> int:
 
 def _resolve_instance_config_base(config_base: dict[str, Any] | None) -> dict[str, Any]:
     if config_base is None:
-        return get_config()
+        return copy.deepcopy(get_config())
     if not isinstance(config_base, dict):
         raise TypeError("config_base must be a dict when provided")
     # 外部传入的 config_base（如企业同步的稀疏 override）与 shipped 模板做补缺型
