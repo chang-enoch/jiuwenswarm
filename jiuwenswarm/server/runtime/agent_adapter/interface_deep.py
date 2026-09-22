@@ -322,9 +322,6 @@ from jiuwenswarm.agents.harness.common.memory.config import (
     get_memory_mode,
     is_memory_enabled,
     is_proactive_memory,
-    merge_memory_config_into_config,
-    reload_memory_config_from_gateway_db,
-    set_embed_config_db_cache,
 )
 from jiuwenswarm.agents.harness.common.memory.external_memory_config import is_builtin_memory_allowed
 from jiuwenswarm.common.model_config_validation import is_placeholder_api_base
@@ -629,7 +626,6 @@ from jiuwenswarm.common.utils import (
     get_checkpoint_dir,
     get_default_project_session_workspace_dir,
     get_env_file,
-    get_multi_tenant_user_workspace_dir,
     get_prompt_attachment_dir,
     get_runtime_state_path,
     resolve_tenant_sessions_dir,
@@ -1621,7 +1617,7 @@ def parse_int(value: Any, default: int) -> int:
 
 def _resolve_instance_config_base(config_base: dict[str, Any] | None) -> dict[str, Any]:
     if config_base is None:
-        return get_config()
+        return copy.deepcopy(get_config())
     if not isinstance(config_base, dict):
         raise TypeError("config_base must be a dict when provided")
     # 外部传入的 config_base（如企业同步的稀疏 override）与 shipped 模板做补缺型
@@ -5479,26 +5475,13 @@ class JiuWenSwarmDeepAdapter:
     def _merge_enterprise_models_into_config(
         self, config_base: dict[str, Any]
     ) -> dict[str, Any]:
-        """若已加载 ``_enterprise_config``，将其模型槽位覆盖到 config 快照上。"""
-        if self._enterprise_config is None:
-            clear_embed_config_db_cache()
-            # 企业版未拉到策略时仍清空本地 MCP，与禁止 /mcp 一致
-            if is_enterprise():
-                from jiuwenswarm.server.runtime.enterprise_config.apply_mcp import (
-                    clear_local_mcp_servers,
-                )
-
-                return clear_local_mcp_servers(config_base)
-            return config_base
-        from jiuwenswarm.server.runtime.enterprise_config.apply_models import (
-            apply_enterprise_models_to_config,
+        """Deprecated compatibility delegate for the former adapter API."""
+        from jiuwenswarm.common.config_provider import (
+            apply_enterprise_models_and_mcp,
         )
 
-        merged, applied = apply_enterprise_models_to_config(
+        merged, applied, mcp_applied = apply_enterprise_models_and_mcp(
             config_base, self._enterprise_config
-        )
-        set_embed_config_db_cache(
-            getattr(self._enterprise_config, "embedding", None)
         )
         if applied:
             self._model_config_source = "enterprise_policy"
@@ -5506,25 +5489,20 @@ class JiuWenSwarmDeepAdapter:
                 "[JiuWenSwarmDeepAdapter] using enterprise model config: slots=%s",
                 list(self._enterprise_config.models),
             )
-        return self._merge_enterprise_mcp_into_config(merged)
+        if mcp_applied:
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] using enterprise MCP config: count=%s",
+                len(getattr(self._enterprise_config, "mcp", None) or []),
+            )
+        return merged
 
     def _merge_enterprise_mcp_into_config(
         self, config_base: dict[str, Any]
     ) -> dict[str, Any]:
-        """企业版用管理端 MCP 整表替换本地 ``mcp.servers``（无槽位则清空）。"""
-        from jiuwenswarm.server.runtime.enterprise_config.apply_mcp import (
-            apply_enterprise_mcp_to_config,
-            clear_local_mcp_servers,
-        )
+        """Deprecated compatibility delegate for the centralized MCP policy."""
+        from jiuwenswarm.common.config_provider import apply_enterprise_mcp
 
-        if not is_enterprise():
-            return config_base
-        if self._enterprise_config is None:
-            return clear_local_mcp_servers(config_base)
-
-        merged, applied = apply_enterprise_mcp_to_config(
-            config_base, self._enterprise_config
-        )
+        merged, applied = apply_enterprise_mcp(config_base, self._enterprise_config)
         if applied:
             logger.info(
                 "[JiuWenSwarmDeepAdapter] using enterprise MCP config: count=%s",
@@ -5533,21 +5511,19 @@ class JiuWenSwarmDeepAdapter:
         return merged
 
     async def _refresh_enterprise_config_for_reload(self) -> None:
-        """reload 前用缓存路由上下文重新拉取 Gateway DB 中的企业配置。"""
-        if not is_enterprise():
-            return
+        """Deprecated compatibility delegate for refreshing the config source."""
+        from jiuwenswarm.common.config_provider import refresh_config_source
+
         cached = self._enterprise_config
         if cached is None:
+            await refresh_config_source()
             return
         routing = getattr(cached, "routing", None)
         if routing is None:
+            await refresh_config_source()
             return
         try:
-            from jiuwenswarm.server.runtime.enterprise_config import (
-                invalidate_enterprise_config_caches,
-            )
-
-            invalidate_enterprise_config_caches()
+            await refresh_config_source()
             request = AgentRequest(
                 request_id="enterprise-config-refresh",
                 channel_id="default",
@@ -5563,34 +5539,47 @@ class JiuWenSwarmDeepAdapter:
                 exc,
             )
 
-    async def _load_enterprise_config(self, request: AgentRequest) -> None:
-        """按当前请求的 ``params`` 从 Gateway DB 加载生效企业策略到 ``self._enterprise_config``。
+    async def _load_enterprise_config(
+        self, request: AgentRequest | None, *, base: dict | None = None,
+    ):
+        """Deprecated adapter delegate for the unified agent config resolver."""
+        from jiuwenswarm.common.config_provider import resolve_agent_config
 
-        先加载成功再替换缓存，避免「先清后载」时异常把已有企业配置（含 MCP）冲成 None。
-        """
-        if not is_enterprise():
-            self._enterprise_config = None
-            self._enterprise_config_resource_id = None
-            return
-        try:
-            from jiuwenswarm.server.runtime.enterprise_config import (
-                DEFAULT_AGENT_LOAD_SLOTS,
-                load_effective_enterprise_config,
-            )
-        except ImportError as exc:
-            logger.error(
-                "[JiuWenSwarmDeepAdapter] enterprise_config unavailable: %s", exc
-            )
-            return
-
-        loaded = await load_effective_enterprise_config(
-            request,
-            DEFAULT_AGENT_LOAD_SLOTS,
+        cached_policy = getattr(self, "_enterprise_config", None)
+        cached_resource_id = getattr(self, "_enterprise_config_resource_id", None)
+        result = await resolve_agent_config(
+            base if base is not None else {}, request=request,
+            service_id=getattr(self, "_service_id", None),
+            agent_id=getattr(self, "_agent_id", None),
+            workspace_key=getattr(self, "_workspace_key", None),
+            cached_policy=cached_policy,
         )
+        loaded = result.policy
         self._enterprise_config = loaded
-        self._enterprise_config_resource_id = (
-            self._enterprise_resource_id_from_request(request) or None
-        )
+        if loaded is None:
+            self._enterprise_config_resource_id = None
+        elif request is None and loaded is cached_policy:
+            self._enterprise_config_resource_id = cached_resource_id
+        else:
+            self._enterprise_config_resource_id = (
+                self._enterprise_resource_id_from_request(request)
+                if request is not None
+                else str(getattr(loaded, "resource_id", "") or "").strip()
+            ) or None
+        self._model_config_source = "config.yaml"
+        if loaded is not None and (
+            getattr(loaded, "models", None) or getattr(loaded, "embedding", None)
+        ):
+            self._model_config_source = "enterprise_policy"
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] using enterprise model config: slots=%s",
+                list(getattr(loaded, "models", {}) or {}),
+            )
+        if loaded is not None and is_enterprise():
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] using enterprise MCP config: count=%s",
+                len(getattr(loaded, "mcp", None) or []),
+            )
         self._agent_permissions_body = resolve_permissions_body_from_enterprise(loaded)
         self._permissions_persist_agent_id = None
         if loaded is not None and self._skill_manager is not None:
@@ -5605,7 +5594,7 @@ class JiuWenSwarmDeepAdapter:
                     "[JiuWenSwarmDeepAdapter] skill source config rejected: %s",
                     exc,
                 )
-        if loaded is None:
+        if loaded is None and request is not None and is_enterprise():
             from jiuwenswarm.common.request_identity import web_routing_identity
 
             identity = web_routing_identity(
@@ -5618,10 +5607,16 @@ class JiuWenSwarmDeepAdapter:
                 identity.get("bot_id"),
                 identity.get("user_id"),
             )
+        return result
 
     async def prepare_skill_source_config(self, request: AgentRequest) -> None:
         """Load the effective policy before a source RPC, even before chat startup."""
-        await self._load_enterprise_config(request)
+        base = (
+            self._config_base_cache
+            if isinstance(self._config_base_cache, dict)
+            else get_config()
+        )
+        await self._load_enterprise_config(request, base=base)
 
     def _inject_extension_config_into_inputs(self, inputs: dict[str, Any]) -> None:
         """将企业策略中的 extension_config 注入 inputs（替代 ee gateway channel_context 透传）。
@@ -6055,11 +6050,11 @@ class JiuWenSwarmDeepAdapter:
             try:
                 PersistenceCheckpointerProvider()
                 user_ws = getattr(self, "_user_workspace_dir", None)
-                if user_ws is not None:
-                    workspace = Path(user_ws)
-                else:
-                    workspace = get_multi_tenant_user_workspace_dir("default")
-                checkpoint_path = workspace / ".checkpoint"
+                checkpoint_path = (
+                    Path(user_ws) / ".checkpoint"
+                    if user_ws is not None
+                    else get_checkpoint_dir()
+                )
                 checkpoint_path.mkdir(parents=True, exist_ok=True)
                 conf: dict[str, Any] = {
                     "db_type": "sqlite",
@@ -8967,10 +8962,30 @@ class JiuWenSwarmDeepAdapter:
             logger.warning("[JiuWenSwarmDeepAdapter] init memory manager failed: %s", e)
             return None
 
+    def _build_agent_workspace(self, *, language: str | None = None) -> Workspace:
+        from jiuwenswarm.common.path_provider import PathCategory
+        from jiuwenswarm.common.utils import (
+            _dispatch_path,
+            _dispatch_workspace_directories,
+        )
+
+        root = self._workspace_dir or "./"
+        overridden = _dispatch_path(
+            PathCategory.WORKSPACE, explicit=self._workspace_dir,
+        )
+        if overridden is not None:
+            root = str(overridden)
+        workspace = Workspace(
+            root_path=root, language=language or self._resolve_runtime_language(),
+        )
+        for node in _dispatch_workspace_directories() or []:
+            workspace.set_directory(node)
+        return workspace
+
     def _get_memory_workspace(self):
         """构造记忆用的 Workspace 对象（与 _make_deep_agent_config 中构造方式一致）。"""
         resolved_language = getattr(self, "_resolved_language", None) or "zh"
-        return Workspace(root_path=self._workspace_dir or "./", language=resolved_language)
+        return self._build_agent_workspace(language=resolved_language)
 
     def _build_memory_rail(self, mode: str) -> MemoryRail | None:
         try:
@@ -9588,7 +9603,7 @@ class JiuWenSwarmDeepAdapter:
         """与 create_deep_agent() 中 DeepAgentConfig 构造保持一致."""
         resolved_language = self._resolve_runtime_language()
         config_base = config_base or get_config()
-        workspace_obj = Workspace(root_path=self._workspace_dir or "./", language=resolved_language)
+        workspace_obj = self._build_agent_workspace(language=resolved_language)
         normalized_tool_cards = [
             tool.card if hasattr(tool, "card") else tool for tool in (tool_cards or [])
         ]
@@ -10465,12 +10480,13 @@ class JiuWenSwarmDeepAdapter:
             )
             # 企业版：create_instance 时可带 request，按 params 加载企业配置并合并模型
             bootstrap_request = self._instance_overrides.pop("request", None)
-            if bootstrap_request is not None and is_enterprise():
-                await self._load_enterprise_config(bootstrap_request)
+            result = await self._load_enterprise_config(
+                bootstrap_request,
+                base=config_base,
+            )
+            config_base = result.config
             if not is_enterprise():
                 self._refresh_standard_agent_permissions_body(bootstrap_request)
-            config_base = merge_memory_config_into_config(config_base)
-            config_base = self._merge_enterprise_models_into_config(config_base)
             # 与模型槽位一致：Agent 级 permissions 模板在构建 rail 前绑定到 Task
             token_perm_agent = self._bind_agent_permissions_base()
             try:
@@ -10585,10 +10601,7 @@ class JiuWenSwarmDeepAdapter:
                     enable_task_loop=self._resolve_enable_task_loop(config, config_base),
                     add_general_purpose_agent=should_enable_general_agent,
                     max_iterations=config.get("max_iterations", 15),
-                    workspace=Workspace(
-                        root_path=self._workspace_dir or "./",
-                        language=self._resolve_runtime_language(),
-                    ),
+                    workspace=self._build_agent_workspace(),
                     sys_operation=sys_operation,
                     language=self._resolve_runtime_language(),
                     auto_create_workspace=is_enterprise(),
@@ -10866,7 +10879,9 @@ class JiuWenSwarmDeepAdapter:
         clear_config_cache()
         clear_embed_config_db_cache()
         clear_memory_config_db_cache()
-        await self._refresh_enterprise_config_for_reload()
+        from jiuwenswarm.common.config_provider import refresh_config_source
+
+        await refresh_config_source()
         # 清 MemoryRail 实际使用的 openjiuwen lite INDEX_CACHE（而非仓内并行实现的那份），
         # 并 close 旧实例（db 连接 / watchdog observer / 定时任务），使下次
         # init_memory_manager_async 用最新 embedding_config 创建新 manager + 新 provider。
@@ -10915,9 +10930,21 @@ class JiuWenSwarmDeepAdapter:
         except Exception as exc:
             logger.warning("[JiuWenSwarm] ExtensionRegistry update failed: %s", exc)
 
-        self._config_base_cache = config_base.copy()
-        config_base = self._merge_enterprise_models_into_config(config_base)
-        config_base = merge_memory_config_into_config(config_base)
+        routing = getattr(self._enterprise_config, "routing", None)
+        refresh_request = None
+        if routing is not None:
+            refresh_request = AgentRequest(
+                request_id="enterprise-config-refresh",
+                channel_id="default",
+                req_method=ReqMethod.AGENT_RELOAD_CONFIG,
+                params=routing.as_dict(),
+            )
+        try:
+            result = await self._load_enterprise_config(refresh_request, base=config_base)
+        except Exception:
+            logger.warning("config reload failed; retaining cached policy", exc_info=True)
+            result = await self._load_enterprise_config(None, base=config_base)
+        config_base = result.config
         self._config_base_cache = config_base.copy()
         self._startup_config_base = config_base.copy()
         self._refresh_multimodal_configs(config_base)
@@ -11014,15 +11041,6 @@ class JiuWenSwarmDeepAdapter:
                 self._pending_reload = None
         elif _force_apply:
             self._pending_reload = None
-
-        if is_enterprise():
-            try:
-                await reload_memory_config_from_gateway_db()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[JiuWenSwarmDeepAdapter] reload_memory_config_from_gateway_db failed: %s",
-                    exc,
-                )
 
         if self._instance is None:
             if self._is_session_scoped_adapter:
@@ -11968,7 +11986,13 @@ class JiuWenSwarmDeepAdapter:
         if self._instance is None:
             raise RuntimeError("JiuWenSwarmDeepAdapter 未初始化，请先调用 create_instance()")
 
+        from jiuwenswarm.common.path_provider import (
+            bind_path_session_id,
+            reset_path_session_id,
+        )
+
         stage_timer = StageTimer()
+        path_session_token = bind_path_session_id(runtime_config.session_id)
         try:
             await self._apply_runtime_config_stages(
                 runtime_config,
@@ -11976,6 +12000,7 @@ class JiuWenSwarmDeepAdapter:
                 bind_request=bind_request,
             )
         finally:
+            reset_path_session_id(path_session_token)
             total_ms = stage_timer.total_ms()
             log_runtime_config_stages = _stage_breakdown_logger(
                 total_ms, _SLOW_RUNTIME_CONFIG_MS

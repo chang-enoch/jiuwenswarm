@@ -41,7 +41,6 @@ from openjiuwen.harness.subagents.code_agent import build_code_agent_config
 from openjiuwen.harness.subagents.explore_agent import build_explore_agent_config
 from openjiuwen.harness.subagents.plan_agent import build_plan_agent_config
 from openjiuwen.harness.tools.worktree import WorktreeConfig, WorktreeRail
-from openjiuwen.harness.workspace.workspace import Workspace
 
 from jiuwenswarm.edition import is_enterprise
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
@@ -389,8 +388,18 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         "FileSystemRail",  # 别名
     })
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        workspace_dir: str | None = None,
+        agent_id: str | None = None,
+        service_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            workspace_dir=workspace_dir,
+            agent_id=agent_id,
+            service_id=service_id,
+        )
+        self._constructor_workspace_dir = self._workspace_dir if workspace_dir else None
         # Code 模式专属 rails — 父类不定义这些属性
         self._lsp_rail: LspRail | None = None
         self._project_memory_rail: ProjectMemoryRail | None = None
@@ -477,6 +486,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         self._workspace_dir = (
             self._project_dir
             or config.get("workspace_dir")
+            or self._constructor_workspace_dir
             or str(get_agent_workspace_dir())
         )
         # _agent_workspace_dir: agent 数据存储路径，始终指向系统 workspace，
@@ -512,10 +522,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         configured_subagents, _should_add_general = self._build_configured_subagents(model, config, config_base)
         configured_subagents = configured_subagents or []
 
-        workspace = Workspace(
-            root_path=self._workspace_dir or "./",
-            language=self._resolve_runtime_language(),
-        )
+        workspace = self._build_agent_workspace()
         _set_workspace_coding_memory_directory(
             workspace,
             project_dir=self._project_dir,
@@ -1224,6 +1231,21 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
     # ─── Runtime config ──────────────────────────
 
     async def _update_runtime_config(self, runtime_config: "JiuWenSwarmDeepAdapter._RuntimeConfig") -> None:
+        from jiuwenswarm.common.path_provider import (
+            bind_path_session_id,
+            reset_path_session_id,
+        )
+
+        token = bind_path_session_id(runtime_config.session_id)
+        try:
+            await self._update_runtime_config_with_path_context(runtime_config)
+        finally:
+            reset_path_session_id(token)
+
+    async def _update_runtime_config_with_path_context(
+        self,
+        runtime_config: "JiuWenSwarmDeepAdapter._RuntimeConfig",
+    ) -> None:
         """Code 模式 runtime config: ProjectMemoryRail 语言同步 + rail 模式切换."""
         if self._instance is None:
             raise RuntimeError("JiuwenSwarmCodeAdapter 未初始化，请先调用 create_instance()")
