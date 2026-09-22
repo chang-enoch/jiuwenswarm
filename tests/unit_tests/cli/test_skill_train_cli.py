@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,6 +17,19 @@ openjiuwen_skill_train = pytest.importorskip(
     "openjiuwen.agent_evolving.skill_train",
     reason="openjiuwen with agent_evolving.skill_train is required",
 )
+
+
+def _capture_logger_info(monkeypatch):
+    """Record ``logger.info`` messages even when handlers bypass pytest caplog/capsys."""
+    recorded: list[str] = []
+    original = st.logger.info
+
+    def _info(msg, *args, **kwargs):
+        recorded.append(msg % args if args else str(msg))
+        return original(msg, *args, **kwargs)
+
+    monkeypatch.setattr(st.logger, "info", _info)
+    return recorded
 
 
 class _StubTrainLaunchOptions:
@@ -138,25 +150,26 @@ class TestRun:
         assert called == []
 
     @staticmethod
-    def test_training_success(stub_launch_api, monkeypatch, caplog):
+    def test_training_success(stub_launch_api, monkeypatch):
         args = st.build_parser().parse_args(["--env", "searchqa", "--skip-gateway-check", "--limit", "1"])
         seen = {}
+        infos = _capture_logger_info(monkeypatch)
 
         def _fake_train(opts):
             seen["opts"] = opts
             return SimpleNamespace(best_score=0.75, output_dir="out/x")
 
         monkeypatch.setattr(stub_launch_api, "run_offline_training", _fake_train, raising=False)
-        with caplog.at_level(logging.INFO, logger="jiuwenswarm.cli.skill_train"):
-            assert st.run_skill_train(args) == 0
+        assert st.run_skill_train(args) == 0
         assert seen["opts"].limit == 1
         assert seen["opts"].target_backend == "jiuwenswarm_cli_exec"
-        assert "best_score=0.7500" in caplog.text
+        assert any("best_score=0.7500" in msg for msg in infos)
 
     @staticmethod
-    def test_eval_only(stub_launch_api, monkeypatch, caplog):
+    def test_eval_only(stub_launch_api, monkeypatch):
         args = st.build_parser().parse_args(["--eval-only", "--split", "val", "--skip-gateway-check"])
         seen = {}
+        infos = _capture_logger_info(monkeypatch)
 
         def _fake_eval(opts, *, split):
             seen["split"] = split
@@ -170,10 +183,9 @@ class TestRun:
             }
 
         monkeypatch.setattr(stub_launch_api, "run_offline_eval", _fake_eval, raising=False)
-        with caplog.at_level(logging.INFO, logger="jiuwenswarm.cli.skill_train"):
-            assert st.run_skill_train(args) == 0
+        assert st.run_skill_train(args) == 0
         assert seen["split"] == "val"
-        assert "Eval complete" in caplog.text
+        assert any("Eval complete" in msg for msg in infos)
 
     @staticmethod
     def test_bad_config_returns_2(stub_launch_api, monkeypatch):
