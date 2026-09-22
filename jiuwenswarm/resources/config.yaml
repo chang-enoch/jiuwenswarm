@@ -960,6 +960,13 @@ channels:
 # 内置参数规则 > 用户 rules；整工具存在则不用 defaults；详见 tiered_policy 模块说明。
 #
 # 三种动作: allow / ask / deny
+# 小艺 Work 主进程行为接入。仅桌面声明支持该协议时生效。
+# 明确 allow/deny/ask 仅异步上报；未匹配规则时，开关决定是否等待云端授权。
+xiaoyi_work_security:
+  cloud_authorization:
+    enabled: false
+    timeout_ms: 4000
+
 permissions:
   enabled: true
   schema: tiered_policy

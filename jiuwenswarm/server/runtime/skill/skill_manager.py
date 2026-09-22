@@ -900,6 +900,9 @@ class SkillManager:
         if dest.exists() and dest.is_dir():
             return {"success": False, "detail": f"技能 {name} 已经安装"}
 
+        from jiuwenswarm.common.behavior_security import check_agent_skill_install
+        await check_agent_skill_install(src, dest, name, "builtin")
+
         # 复制技能到用户目录
         try:
             shutil.copytree(src, dest)
@@ -1493,6 +1496,9 @@ class SkillManager:
                             "detail_key": "skills.clawhub.errors.parseSkillFailed",
                         }
 
+                    from jiuwenswarm.common.behavior_security import check_agent_skill_install
+                    await check_agent_skill_install(skill_dir, dest, slug, "clawhub")
+
                     # 删除已存在的
                     if dest.exists():
                         if not force:
@@ -1929,6 +1935,8 @@ class SkillManager:
                 install_root = Path(output_raw).expanduser().resolve() if use_custom_output else self._skills_dir
                 install_root.mkdir(parents=True, exist_ok=True)
                 dest = install_root / skill_name
+                from jiuwenswarm.common.behavior_security import check_agent_skill_install
+                await check_agent_skill_install(skill_dir, dest, skill_name, "teamskillshub")
                 if dest.exists():
                     if not force:
                         return {"success": False, "detail": f"技能 {skill_name} 已安装"}
@@ -2206,6 +2214,8 @@ class SkillManager:
                     _log_rejected_name("skills.skillnet.install", "skill", raw_skill_name, exc)
                     return {"ok": False, "detail": str(exc)}
                 dest = _safe_child_path(self._skills_dir, skill_name, "skill")
+                from jiuwenswarm.common.behavior_security import check_agent_skill_install_sync
+                check_agent_skill_install_sync(skill_dir, dest, skill_name, "skillnet")
                 if dest.exists():
                     if not force:
                         return {
