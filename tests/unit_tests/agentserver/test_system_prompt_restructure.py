@@ -212,6 +212,21 @@ def test_work_code_and_design_share_the_same_static_prefix():
         assert "# Tone and style" not in prompt
 
 
+def test_ui_verification_does_not_require_starting_a_long_lived_dev_server():
+    from jiuwenswarm.agents.harness.code.prompt.code_prompt_builder import (
+        build_code_system_prompt,
+    )
+
+    prompts = (
+        build_agent_identity_prompt(language="zh"),
+        build_code_system_prompt(),
+    )
+    for prompt in prompts:
+        assert "start the dev server" not in prompt
+        assert "managed preview" in prompt
+        assert "If browser verification is unavailable" in prompt
+
+
 def test_all_modes_place_the_shared_system_section_before_regional_conventions():
     from jiuwenswarm.agents.harness.code.prompt.code_prompt_builder import (
         build_code_system_prompt,

@@ -14,10 +14,6 @@ from typing import Any, Awaitable, Callable
 
 _installed = False
 
-_RUN_IN_BACKGROUND_PARAM = {
-    "cn": "是否后台运行，默认 false；设为 true 时立即返回 PID",
-    "en": "Run in background (default false); returns PID immediately when true",
-}
 _COMPACT_BASH_DESCRIPTION = {
     "cn": (
         "执行 Bash 命令并返回输出。工作目录会在调用之间保留，"
@@ -93,15 +89,16 @@ def _shell_mismatch(tool_name: str, command: str) -> str | None:
     return None
 
 
-def _remove_shell_description_param(tool: Any) -> None:
-    """Remove the model-facing shell ``description`` input when present."""
+def _remove_model_facing_shell_params(tool: Any) -> None:
+    """Remove shell inputs that Swarm does not expose to the model."""
     card = getattr(tool, "card", None)
     params = getattr(card, "input_params", None) if card is not None else None
     if not isinstance(params, dict):
         return
     properties = params.get("properties")
     if isinstance(properties, dict):
-        properties.pop("description", None)
+        for name in ("description", "run_in_background", "background"):
+            properties.pop(name, None)
 
 
 def _ensure_bash_background_card(tool: Any, language: str) -> None:
@@ -109,8 +106,8 @@ def _ensure_bash_background_card(tool: Any, language: str) -> None:
     card = getattr(tool, "card", None)
     if card is None:
         return
-    _remove_shell_description_param(tool)
-    lang = language if language in _RUN_IN_BACKGROUND_PARAM else "cn"
+    _remove_model_facing_shell_params(tool)
+    lang = language if language in _COMPACT_BASH_DESCRIPTION else "cn"
     params = getattr(card, "input_params", None)
     if isinstance(params, dict):
         properties = params.setdefault("properties", {})
@@ -119,13 +116,6 @@ def _ensure_bash_background_card(tool: Any, language: str) -> None:
             # the upstream tool. Do not expose a model-facing selector that
             # cannot affect execution.
             properties.pop("shell_type", None)
-            properties.setdefault(
-                "run_in_background",
-                {
-                    "type": "boolean",
-                    "description": _RUN_IN_BACKGROUND_PARAM[lang],
-                },
-            )
     card.description = _COMPACT_BASH_DESCRIPTION[lang]
 
 
@@ -134,7 +124,7 @@ def _ensure_powershell_background_card(tool: Any, language: str) -> None:
     card = getattr(tool, "card", None)
     if card is None:
         return
-    _remove_shell_description_param(tool)
+    _remove_model_facing_shell_params(tool)
     lang = language if language in _COMPACT_POWERSHELL_DESCRIPTION else "cn"
     card.description = _COMPACT_POWERSHELL_DESCRIPTION[lang]
 
@@ -178,6 +168,8 @@ def _wrap_invoke(
             if err:
                 return ToolOutput(success=False, error=err)
         routed_inputs = dict(inputs)
+        routed_inputs.pop("run_in_background", None)
+        routed_inputs.pop("background", None)
         routed_inputs["shell_type"] = tool_name
         return await original(self, routed_inputs, **kwargs)
 
@@ -291,7 +283,7 @@ def reset_installed_flag() -> None:
 
 
 __all__ = [
-    "_remove_shell_description_param",
+    "_remove_model_facing_shell_params",
     "_ensure_bash_background_card",
     "_ensure_powershell_background_card",
     "_patch_tool_class",
