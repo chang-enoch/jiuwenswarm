@@ -39,6 +39,19 @@ def _build_supplement_request(session_id: str = "tui_sess_1") -> AgentRequest:
     )
 
 
+def _build_chat_send_request(
+    params: dict,
+    session_id: str = "tui_sess_1",
+) -> AgentRequest:
+    return AgentRequest(
+        request_id="req-send",
+        channel_id="desktop",
+        session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND,
+        params=params,
+    )
+
+
 def _interruption_state(*tool_names: str) -> SimpleNamespace:
     tool_calls = [
         SimpleNamespace(id=f"call-{index}", name=tool_name)
@@ -448,6 +461,162 @@ async def test_abort_skipped_when_other_sessions_active_even_if_target_executing
     instance.abort.assert_not_awaited()
     # But per-session teardown must still run
     rail.abort.assert_called_once_with("tui_target")
+
+
+@pytest.mark.asyncio
+async def test_stream_fresh_turn_drops_stale_interrupt_before_dispatch() -> None:
+    """串起真实入口：chat.send 普通消息进来时，先清残留中断再走后续分发。"""
+    interruption_state = _interruption_state("task_tool")
+    loop_session = MagicMock()
+    loop_session.get_session_id.return_value = "desktop_sess_1"
+    loop_session.commit = AsyncMock()
+    loop_session.get_state.return_value = interruption_state
+    context = MagicMock()
+    context.get_messages.return_value = [SimpleNamespace(tool_calls=[])]
+    context_engine = MagicMock()
+    context_engine.get_context.return_value = context
+    context_engine.save_contexts = AsyncMock()
+    instance = MagicMock()
+    instance._loop_session = loop_session
+    instance.react_agent = SimpleNamespace(context_engine=context_engine)
+    adapter = _make_adapter(_instance=instance)
+    adapter._bind_invoke_workspace_context = MagicMock()  # pylint: disable=protected-access
+    adapter._has_valid_model_config = MagicMock(return_value=False)  # pylint: disable=protected-access
+
+    request = _build_chat_send_request(
+        {"query": "还没好吗", "mode": "agent.plan"},
+        session_id="desktop_sess_1",
+    )
+    chunks = [
+        chunk
+        async for chunk in adapter.process_message_stream_impl(
+            request, {"query": "还没好吗", "conversation_id": "desktop_sess_1"}
+        )
+    ]
+
+    # 未配模型时会在分发前返回 chat.error；关键是残留中断状态已被清掉。
+    loop_session.update_state.assert_called_once_with({INTERRUPTION_KEY: None})
+    context_engine.save_contexts.assert_awaited_once_with(loop_session)
+    assert [chunk.payload.get("event_type") for chunk in chunks] == ["chat.error"]
+
+
+@pytest.mark.asyncio
+async def test_stream_hitl_answer_keeps_pending_interrupt_state() -> None:
+    """带 answers 的 chat.send 是作答，不能清掉正在等的交互状态。"""
+    interruption_state = _interruption_state("ask_user")
+    loop_session = MagicMock()
+    loop_session.get_session_id.return_value = "desktop_sess_1"
+    loop_session.get_state.return_value = interruption_state
+    context_engine = MagicMock()
+    instance = MagicMock()
+    instance._loop_session = loop_session
+    instance.react_agent = SimpleNamespace(context_engine=context_engine)
+    adapter = _make_adapter(_instance=instance)
+    adapter._bind_invoke_workspace_context = MagicMock()  # pylint: disable=protected-access
+    adapter._has_valid_model_config = MagicMock(return_value=False)  # pylint: disable=protected-access
+
+    request = _build_chat_send_request(
+        {
+            "query": "",
+            "request_id": "call-ask",
+            "source": "ask_user_interrupt",
+            "answers": [{"question": "继续吗？", "selected_options": ["继续"]}],
+            "mode": "agent.plan",
+        },
+        session_id="desktop_sess_1",
+    )
+    [
+        chunk
+        async for chunk in adapter.process_message_stream_impl(
+            request, {"query": "", "conversation_id": "desktop_sess_1"}
+        )
+    ]
+
+    loop_session.update_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fresh_turn_drops_stale_task_tool_interrupt_without_context_tail() -> None:
+    """新一轮消息必须丢弃残留的 task_tool（子代理）中断，而不是被它吞掉。
+
+    真实故障（2026-09-21）：并行子代理里 PPT 子代理永久挂起后，
+    ``interrupted_tools`` 里留下 task_tool 条目，且父会话上下文尾部是其它
+    子代理的 tool 结果（签名对不上）。旧逻辑只在「尾部正好是被中断的
+    ai_message」时才清理，于是残留状态一直在，之后每条普通消息都被
+    ``handle_resume`` 当成对旧中断的回答消费 → 不管说什么都弹「询问你」。
+    """
+    interruption_state = _interruption_state("task_tool")
+    loop_session = MagicMock()
+    loop_session.get_session_id.return_value = "tui_sess_1"
+    loop_session.commit = AsyncMock()
+    loop_session.get_state.return_value = interruption_state
+    context = MagicMock()
+    context.get_messages.return_value = [
+        SimpleNamespace(tool_calls=[]),
+        SimpleNamespace(tool_calls=[SimpleNamespace(id="call-other", name="task_tool")]),
+    ]
+    context_engine = MagicMock()
+    context_engine.get_context.return_value = context
+    context_engine.save_contexts = AsyncMock()
+    instance = MagicMock()
+    instance._loop_session = loop_session
+    instance.react_agent = SimpleNamespace(context_engine=context_engine)
+    adapter = _make_adapter(_instance=instance)
+
+    await adapter._discard_stale_interrupt_for_fresh_turn(
+        _build_chat_send_request({"query": "还没好吗", "mode": "agent.plan"})
+    )
+
+    loop_session.update_state.assert_called_once_with({INTERRUPTION_KEY: None})
+    context.pop_messages.assert_not_called()
+    context_engine.save_contexts.assert_awaited_once_with(loop_session)
+    loop_session.commit.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_non_forced_clear_still_keeps_state_without_matching_tail() -> None:
+    """非 force 的调用方（stop/supplement 的纯 ask_user 清理）行为保持不变。"""
+    interruption_state = _interruption_state("ask_user")
+    loop_session = MagicMock()
+    loop_session.get_session_id.return_value = "tui_sess_1"
+    loop_session.get_state.return_value = interruption_state
+    context = MagicMock()
+    context.get_messages.return_value = [SimpleNamespace(tool_calls=[])]
+    context_engine = MagicMock()
+    context_engine.get_context.return_value = context
+    context_engine.save_contexts = AsyncMock()
+    instance = MagicMock()
+    instance._loop_session = loop_session
+    instance.react_agent = SimpleNamespace(context_engine=context_engine)
+    adapter = _make_adapter(_instance=instance)
+
+    cleared = await getattr(adapter, "_clear_pending_interaction_interrupt")("tui_sess_1")
+
+    assert cleared is False
+    loop_session.update_state.assert_not_called()
+
+
+def test_is_fresh_turn_request_distinguishes_hitl_answers() -> None:
+    """只有带非空 query 的普通消息算新一轮；HITL 作答与 steer 不算。"""
+    adapter = _make_adapter()
+    is_fresh = getattr(adapter, "_is_fresh_turn_request")
+
+    assert is_fresh({"query": "还没好吗", "mode": "agent.plan"}) is True
+    assert is_fresh({"query": "补充一句", "input_mode": "steer"}) is False
+    assert is_fresh({"query": "", "input_mode": "follow_up"}) is False
+    assert (
+        is_fresh(
+            {
+                "query": "",
+                "request_id": "call_1",
+                "source": "ask_user_interrupt",
+                "answers": [{"question": "继续吗？", "selected_options": ["继续"]}],
+            }
+        )
+        is False
+    )
+    assert is_fresh({"query": "   "}) is False
+    assert is_fresh(None) is False
 
 
 def test_reset_runtime_cron_context_resets_shell_session(

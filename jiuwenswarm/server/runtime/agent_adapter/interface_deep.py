@@ -1893,13 +1893,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         session_id: str | None,
         *,
         require_pure_ask_user: bool = True,
+        force: bool = False,
     ) -> bool:
-        """Drop an abandoned interaction round without leaving open tool calls."""
+        """Drop an abandoned interaction round without leaving open tool calls.
+
+        ``force=True`` 时不再要求「上下文最后一条消息正好是被中断的 ai_message」：
+        并行子代理场景下父会话的上下文尾部往往是其它子代理的 tool 结果，
+        但残留的 ``interrupted_tools`` 仍会把后续每条普通消息都当成续跑输入
+        （见 :meth:`_discard_stale_interrupt_for_fresh_turn`）。
+        """
         instance = getattr(self, "_instance", None)
         loop_session = getattr(instance, "_loop_session", None)
         loop_sid = self._deep_agent_loop_session_id()
         target_sid = self._resolve_interrupt_session_id(session_id)
         if loop_session is None or loop_sid != target_sid:
+            if force:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] interrupt: cannot drop stale "
+                    "interaction state, loop session mismatch loop_sid=%s "
+                    "target_sid=%s",
+                    loop_sid,
+                    target_sid,
+                )
             return False
 
         try:
@@ -1939,10 +1954,24 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 (getattr(tool_call, "id", None), getattr(tool_call, "name", None))
                 for tool_call in last_calls
             ]
-            if last_signature != pending_signature:
+            signature_matches = last_signature == pending_signature
+            if not signature_matches and not force:
                 return False
 
-            context.pop_messages(1, with_history=True)
+            if signature_matches:
+                context.pop_messages(1, with_history=True)
+            else:
+                # 尾部已经不是那条 ai_message：历史里留着未配对的 tool_call，
+                # 但它不影响后续轮的模型调用（同轮其它子代理已回结果），
+                # 比继续让旧中断吃掉用户输入安全得多。
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] interrupt: dropping stale "
+                    "interaction state without context tail session=%s "
+                    "pending=%s last=%s",
+                    target_sid,
+                    pending_signature,
+                    last_signature,
+                )
             loop_session.update_state({INTERRUPTION_KEY: None})
             await context_engine.save_contexts(loop_session)
             # save_contexts() only copies the updated context into the session
@@ -7952,6 +7981,46 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             params
         )
 
+    def _is_fresh_turn_request(self, params: Any) -> bool:
+        """Whether this ``chat.send`` opens a brand-new user turn.
+
+        HITL 作答走 ``answers`` + ``source``（见 :meth:`_is_interrupt_resume_dispatch`），
+        steer / follow_up 是喂给在跑轮次的插入语，两者都不算新一轮。其余带非空
+        query 的消息就是用户新开的一轮，必须先把残留的中断状态清掉，否则会被
+        旧中断当成续跑输入吞掉。
+        """
+        if not isinstance(params, dict):
+            return False
+        if self._is_ack_only_dispatch(params) or self._is_interrupt_resume_dispatch(params):
+            return False
+        query = params.get("query")
+        return isinstance(query, str) and bool(query.strip())
+
+    async def _discard_stale_interrupt_for_fresh_turn(self, request: AgentRequest) -> None:
+        """Drop a leftover HITL interrupt so a new user turn is never swallowed."""
+        try:
+            dropped = await self._clear_pending_interaction_interrupt(
+                request.session_id,
+                require_pure_ask_user=False,
+                force=True,
+            )
+        except Exception:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] fresh turn: failed to drop stale "
+                "interaction state session=%s request_id=%s",
+                request.session_id,
+                request.request_id,
+                exc_info=True,
+            )
+            return
+        if dropped:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] fresh turn: dropped stale interaction "
+                "state before handling new message session=%s request_id=%s",
+                request.session_id,
+                request.request_id,
+            )
+
     @staticmethod
     def _structured_goal_op_from_request(
         request: AgentRequest,
@@ -9544,6 +9613,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise RuntimeError("JiuWenSwarmDeepAdapter 未初始化，请先调用 create_instance()")
 
         self._bind_invoke_workspace_context()
+        # 新一轮普通消息不能被上一轮残留的 HITL 中断状态吃掉：并行子代理里只要有
+        # 一个子代理永久挂起（子会话提前结束、答案 id 匹配不上等），父会话的
+        # interrupted_tools 就会一直留着，之后每条普通消息都会被 handle_resume
+        # 当成对旧中断的回答消费（症状：不管说什么都弹「询问你」且消息被吞）。
+        # E2A 语义上只有带 answers/source 的 chat.send 才是作答，其余都是新一轮。
+        if self._is_fresh_turn_request(request.params):
+            await self._discard_stale_interrupt_for_fresh_turn(request)
 
         _req_model = (request.params.get("model_name") or "") if isinstance(request.params, dict) else ""
         if not self._has_valid_model_config(_req_model):
@@ -9925,6 +10001,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise RuntimeError("JiuWenSwarmDeepAdapter 未初始化，请先调用 create_instance()")
 
         self._bind_invoke_workspace_context()
+        # 新一轮普通消息不能被上一轮残留的 HITL 中断状态吃掉：并行子代理里只要有
+        # 一个子代理永久挂起（子会话提前结束、答案 id 匹配不上等），父会话的
+        # interrupted_tools 就会一直留着，之后每条普通消息都会被 handle_resume
+        # 当成对旧中断的回答消费（症状：不管说什么都弹「询问你」且消息被吞）。
+        # E2A 语义上只有带 answers/source 的 chat.send 才是作答，其余都是新一轮。
+        if self._is_fresh_turn_request(request.params):
+            await self._discard_stale_interrupt_for_fresh_turn(request)
 
         _req_model = (request.params.get("model_name") or "") if isinstance(request.params, dict) else ""
         if not self._has_valid_model_config(_req_model):
