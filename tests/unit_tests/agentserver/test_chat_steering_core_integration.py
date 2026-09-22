@@ -8,6 +8,7 @@ normal single-agent streaming, steering dispatch, binding and Core are real.
 from __future__ import annotations
 
 import asyncio
+from importlib.util import find_spec
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -34,6 +35,11 @@ from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
     JiuWenSwarmDeepAdapter,
 )
+
+
+# The locked official SDK predates steering. Check the independent schema
+# marker so a broken capability implementation in a newer SDK still fails.
+_CORE_HAS_STEERING = find_spec("openjiuwen.core.single_agent.schema.steering") is not None
 
 
 class _BlockingTool(Tool):
@@ -270,6 +276,29 @@ async def test_chat_pipeline_steers_real_core_during_tool_without_replacing_orig
             return parse_agent_server_wire_unary(sink.wires[0])
 
         capability = await control(ReqMethod.CHAT_STEER_STATUS, input_id="")
+        if not _CORE_HAS_STEERING:
+            assert capability.payload["supported"] is False
+            assert capability.payload["reason"] == "STEER_UNSUPPORTED"
+            rejected = await control(ReqMethod.CHAT_STEER, content="legacy correction")
+            assert not rejected.ok
+            assert rejected.payload["reason"] == "STEER_UNSUPPORTED"
+            assert not main_task.done()
+            assert core.active_round.task_id == active_task
+            assert core._interaction_output.current_lease() is owner
+            assert len(model.calls) == tool.calls == 1
+            tool.release.set()
+            await asyncio.wait_for(main_task, 15)
+            assert len(model.calls) == 2 and tool.calls == 1
+            assert original_sink.chunks and not original_sink.wires
+            assert all(chunk.request_id == original.request_id for chunk in original_sink.chunks)
+            assert any("Corrected original task result" in str(chunk.payload)
+                       for chunk in original_sink.chunks)
+            assert not any(isinstance(chunk.payload, dict)
+                           and chunk.payload.get("event_type") == "chat.steering_consumed"
+                           for chunk in original_sink.chunks)
+            assert not any("legacy correction" in str(message.content)
+                           for message in model.calls[1])
+            return
         assert capability.payload["supported"] is True
         first = await control(ReqMethod.CHAT_STEER, content="Only analyse East China")
         duplicate = await control(
@@ -376,7 +405,7 @@ async def test_team_adapter_controls_real_native_leader_with_literal_fifo_inputs
 
     async def model_stream(messages, **kwargs):
         calls.append(list(messages))
-        round_handles.append(core.get_active_steering_request_id())
+        round_handles.append(core.active_round.task_id)
         if len(calls) == 1:
             entered.set()
             await release.wait()
@@ -471,7 +500,7 @@ async def test_team_adapter_controls_real_native_leader_with_literal_fifo_inputs
 
             main_task = asyncio.create_task(consume())
             await asyncio.wait_for(entered.wait(), 10)
-            native_handle = leader.get_active_steering_request_id()
+            native_handle = core.active_round.task_id
             assert native_handle and native_handle != original.request_id
             output_queue = core._st.output_queue
             # After initial send, strict controls may not start, abort or resume a round.
@@ -520,6 +549,29 @@ async def test_team_adapter_controls_real_native_leader_with_literal_fifo_inputs
                 return response
 
             capability = await control(ReqMethod.CHAT_STEER_STATUS, input_id="")
+            if not _CORE_HAS_STEERING:
+                assert capability.payload["supported"] is False
+                assert capability.payload["reason"] == "STEER_UNSUPPORTED"
+                rejected = await control(ReqMethod.CHAT_STEER, content="legacy correction")
+                assert not rejected.ok
+                assert rejected.payload["reason"] == "STEER_UNSUPPORTED"
+                assert core.active_round.task_id == native_handle
+                assert core._st.output_queue is output_queue
+                assert not main_task.done() and len(calls) == 1
+                existing_pool.get.assert_awaited_with("active-team")
+                release.set()
+                await asyncio.wait_for(finished.wait(), 10)
+                assert len(calls) == 1 and round_handles == [native_handle]
+                send_spy.assert_not_awaited()
+                abort_spy.assert_not_awaited()
+                resume_spy.assert_not_awaited()
+                await harness.stop()
+                await asyncio.wait_for(main_task, 10)
+                assert any("old answer" in str(chunk.payload) for chunk in outputs)
+                assert all(chunk.request_id == original.request_id for chunk in outputs)
+                assert not any("legacy correction" in str(message.content)
+                               for message in calls[0])
+                return
             assert capability.payload["supported"] is True
             assert capability.payload["target"] == "team_leader"
             first_text, second_text = (
