@@ -1425,7 +1425,11 @@ class TeamManager:
             logger.warning("[TeamManager] global_skills_dir does not exist: %s", global_skills_dir)
             return False
         offload_link_sync(global_skills_dir, target)
-        logger.info("[TeamManager] Refreshed team shared skill links: session_id=%s target=%s", session_id, target)
+        logger.info(
+            "[TeamManager] Scheduled refresh of team shared skill links: session_id=%s target=%s",
+            session_id,
+            target,
+        )
         return True
 
     def refresh_all_team_shared_skill_links(self) -> int:
