@@ -23,7 +23,7 @@ _DIRECTIVE = re.compile(
     r'(?:(?:请你|请|帮我|请帮我|我想要|我想|我要|我需要|我希望|麻烦你|这次|本次|现在)\s*)*'
     r'(?:使用|调用|加载|用|(?:(?:please\s+)?(?:i\s+(?:want|would like)\s+to\s+)?)'
     r'(?:use|invoke|load)\s+)\s*'
-    r'(?:the\s+)?(?:(?:名为|名称为)\s*)?(?:(?:skill\s+|技能\s*)(?:名为\s*)?[:：]?\s*)?'
+    r'(?:the\s+)?(?:(?:名为|名称为)\s*)?(?:(?P<skill_prefix>skill\s+|技能\s*)(?:名为\s*)?[:：]?\s*)?'
     r'(?P<name>`[^`\n]+`|"[^"\n]+"|\x27[^\x27\n]+\x27|“[^”\n]+”|「[^」\n]+」|'
     r'[a-z0-9_][a-z0-9_.-]*|[\u4e00-\u9fff]+)', re.I)
 _UNCERTAIN = re.compile(r'是否|要不要|如果|假如|举例|例如|\b(?:if|whether|example)\b', re.I)
@@ -78,14 +78,16 @@ def explicit_request(content, query, known_names=()) -> ExplicitRequest | None:
             continue
         raw = match['name']
         name = raw.strip('`"\x27“”「」').strip()
-        if name.casefold() not in known and name.endswith('技能'):
+        skill_suffix = raw == name and name.endswith('技能')
+        if name.casefold() not in known and skill_suffix:
             name = name[:-2].removesuffix('这个').removesuffix('的')
         if re.match(r'\s*(?:格式|文件|format\b|file\b)', clause, re.I):
             continue
-        marked = bool(re.search(r'技能|\bskill\b', match[0] + clause, re.I))
-        named = name.casefold() in known or marked
-        annotated = '-' in name or '_' in name or raw != name
-        if named or annotated:
+        marked = (bool(match['skill_prefix']) or skill_suffix
+                  or bool(re.match(r'\s*(?:的|这个)?(?:技能|skills?\b)', clause, re.I)))
+        # Punctuation and quoting also describe libraries, filenames and titles;
+        # only an installed name or an adjacent Skill label establishes intent.
+        if name.casefold() in known or marked:
             names.append(name.casefold())
             # A choice/list is not a uniquely specified textual name.
             remainder = re.sub(r'^\s*(?:的|这个)?(?:技能|skills?)\s*', '', clause, flags=re.I)

@@ -10,13 +10,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from openjiuwen.core.single_agent.skills.skill_manager import Skill
 from openjiuwen.harness.prompts import PromptSection, SystemPromptBuilder
 from openjiuwen.harness.prompts.sections.skills import build_skills_section
+from openjiuwen.harness.rails.skills.skill_use_rail import SkillUseRail
 from openjiuwen.harness.tools import ToolOutput
+from openjiuwen.harness.tools.skills.skill_tool import SkillTool
 
 from jiuwenswarm.agents.harness.flash.skill_selection import execution, service
 from jiuwenswarm.agents.harness.flash.skill_selection.catalog import directory_id, read_catalog
 from jiuwenswarm.agents.harness.flash.skill_selection.config import SelectionSettings
+from jiuwenswarm.agents.harness.flash.skill_selection.explicit import explicit_request
 from jiuwenswarm.agents.harness.flash.skill_selection.rail import SkillSelectionRail
 from jiuwenswarm.agents.harness.flash.skill_selection.tool import (
     SYSTEM_GUIDANCE, TOOL_GUIDANCE, SkillSearchInput, SkillSearchTool,
@@ -34,12 +38,9 @@ def write_skill(root, name, description="制作演示文稿 幻灯片 presentati
     return directory
 
 
-class NativeCatalog:
+class NativeCatalog(SkillUseRail):
     def __init__(self, root):
-        self.skills_dir = [str(root)]
-        self.enabled_skills = set()
-        self.disabled_skills = set()
-        self.enable_cache = True
+        super().__init__([str(root)], include_tools=False)
         self.reload_count = 0
         self.scan()
 
@@ -52,7 +53,7 @@ class NativeCatalog:
         for root in self.skills_dir:
             for path in Path(root).glob("*/SKILL.md"):
                 meta = yaml.safe_load(path.read_text(encoding="utf-8").split("---")[1])
-                self.skills.append(SimpleNamespace(name=meta["name"], directory=str(path.parent)))
+                self.skills.append(Skill(name=meta["name"], description=meta["description"], directory=path.parent))
 
     async def reload_skills(self):
         self.reload_count += 1
@@ -62,7 +63,7 @@ class NativeCatalog:
 class Abilities:
     def __init__(self):
         self.tools = {}
-        self.execute = AsyncMock(return_value=[(ToolOutput(success=True, data="native instructions"), None)])
+        self.execute = AsyncMock()
 
     def add_ability(self, card, tool):
         self.tools[card.name] = tool
@@ -72,6 +73,26 @@ class Abilities:
 
     async def list_tool_info(self, names):
         return [SimpleNamespace(name=name) for name in names if name in self.tools]
+
+
+def native_output(directory):
+    return ToolOutput(success=True, data={
+        "skill_directory": str(directory),
+        "skill_content": (directory / "SKILL.md").read_text(encoding="utf-8"),
+    })
+
+
+def native_loader(h):
+    async def read_file(path):
+        return SimpleNamespace(code=0, data=SimpleNamespace(content=Path(path).read_text(encoding="utf-8")))
+
+    operation = SimpleNamespace(fs=lambda: SimpleNamespace(read_file=read_file))
+    return SkillTool(operation=operation, get_skills=h.native.get_skills_for_session)
+
+
+def skill_session():
+    state = {}
+    return SimpleNamespace(get_state=state.get, update_state=state.update)
 
 
 @pytest.fixture
@@ -84,6 +105,7 @@ def harness(tmp_path):
     builder = SystemPromptBuilder()
     builder.add_section(build_skills_section(skill_lines="0. slides: presentation slides"))
     abilities = Abilities()
+    abilities.execute.return_value = [(native_output(root / "slides"), None)]
     agent = SimpleNamespace(system_prompt_builder=builder, ability_manager=abilities)
     rail = SkillSelectionRail(config_provider=lambda: config, skill_rail_provider=lambda: native)
     rail.init(agent)
@@ -139,7 +161,7 @@ async def load(h, search_id, name, source):
     ctx.inputs.tool_result, ctx.inputs.tool_msg = result, message
     await h.rail.after_tool_call(ctx)
     result = ctx.inputs.tool_result
-    return result.data if result.success else {"status": "load_failed", "loaded": False}
+    return result.data if isinstance(result.data, dict) else {"status": "load_failed", "loaded": False}
 
 
 def test_defaults_and_flash_only_config():
@@ -220,7 +242,7 @@ async def test_search_then_native_load(harness):
     assert result["candidates"][0]["name"] == "slides"
     h.abilities.execute.assert_not_awaited()
     chosen = await load(h, result["search_id"], "slides", ctx)
-    assert chosen["loaded"] and "native instructions" in chosen["instructions"]
+    assert chosen["loaded"] and "Follow the user's task." in chosen["instructions"]["skill_content"]
     call = h.abilities.execute.await_args
     assert call.args[0].extra is ctx.extra and call.args[2] is ctx.session
     assert call.args[1].name == "skill_tool"
@@ -314,6 +336,137 @@ async def test_repeated_load_rechecks_native_permission(harness):
     h.abilities.execute.return_value = [(ToolOutput(success=False, error="revoked"), None)]
     assert not (await load(h, result["search_id"], "slides", ctx))["loaded"]
     assert h.abilities.execute.await_count == 2
+
+
+async def test_load_rejects_different_session_skill_directory(harness):
+    h = harness
+    old_root = h.root.parent / "old-skills"
+    old_root.mkdir()
+    old_dir = write_skill(old_root, "slides", "old instructions")
+    ctx = context(session=skill_session())
+    h.native._save_session_baseline(ctx.session, [Skill(name="slides", directory=old_dir)])
+    tool = native_loader(h)
+    native = await tool.invoke({"skill_name": "slides"}, session=ctx.session)
+    assert native.success and native.data["skill_directory"] == str(old_dir)
+    assert "old instructions" in native.data["skill_content"]
+
+    async def execute(_ctx, call, session, **_kwargs):
+        return [(await tool.invoke(json.loads(call.arguments), session=session), None)]
+
+    h.abilities.execute.side_effect = execute
+    result = await search(h, ctx)
+    assert result["status"] == "candidates"
+    chosen = await load(h, result["search_id"], "slides", ctx)
+    assert chosen["status"] == "changed" and not chosen["loaded"]
+    h.abilities.execute.assert_not_awaited()
+    assert not ctx.extra[h.rail.REUSE].loaded
+
+
+@pytest.mark.parametrize("change", ["directory", "body"])
+async def test_load_rejects_native_result_changed_only_during_invoke(harness, change):
+    h = harness
+    ctx = context(session=skill_session())
+    h.native._save_session_baseline(ctx.session, h.native.skills)
+    path = h.root / "slides" / "SKILL.md"
+    original = path.read_text(encoding="utf-8")
+    old_root = h.root.parent / "old-skills"
+    old_root.mkdir()
+    old_dir = write_skill(old_root, "slides", "different instructions")
+    tool = native_loader(h)
+
+    async def execute(_ctx, call, session, **_kwargs):
+        if change == "directory":
+            h.native._save_session_baseline(session, [Skill(name="slides", directory=old_dir)])
+        else:
+            path.write_text(original + "\nDifferent instructions.\n", encoding="utf-8")
+        try:
+            output = await tool.invoke(json.loads(call.arguments), session=session)
+            assert output.success
+            return [(output, None)]
+        finally:
+            # Both live views match again before finish; only the actual return
+            # value reveals the file that the native loader read.
+            h.native._save_session_baseline(session, h.native.skills)
+            path.write_text(original, encoding="utf-8")
+
+    h.abilities.execute.side_effect = execute
+    result = await search(h, ctx)
+    chosen = await load(h, result["search_id"], "slides", ctx)
+    assert chosen["status"] == "changed" and not chosen["loaded"]
+    assert "instructions" not in chosen
+    assert not ctx.extra[h.rail.REUSE].loaded
+
+
+@pytest.mark.parametrize("style", ["plain", "bom_crlf", "media"])
+async def test_load_accepts_matching_native_skill_result(harness, style):
+    h = harness
+    path = h.root / "slides" / "SKILL.md"
+    if style == "bom_crlf":
+        raw = "\ufeff" + path.read_text(encoding="utf-8")
+        path.write_bytes(raw.replace("\n", "\r\n").encode("utf-8"))
+    elif style == "media":
+        raw = path.read_text(encoding="utf-8") + "\n![Example](assets/example.png)\n"
+        path.write_text(raw, encoding="utf-8")
+    ctx = context(session=skill_session())
+    h.native._save_session_baseline(ctx.session, h.native.skills)
+    tool = native_loader(h)
+
+    async def execute(_ctx, call, session, **_kwargs):
+        return [(await tool.invoke(json.loads(call.arguments), session=session), None)]
+
+    h.abilities.execute.side_effect = execute
+    result = await search(h, ctx)
+    chosen = await load(h, result["search_id"], "slides", ctx)
+    assert chosen["loaded"] and ctx.extra[h.rail.REUSE].loaded
+    assert chosen["instructions"]["skill_directory"] == str(path.parent)
+    if style == "media":
+        assert chosen["instructions"]["content"] != chosen["instructions"]["skill_content"]
+
+
+@pytest.mark.parametrize("query", [
+    "请用 python-docx 生成 Word 报告。",
+    "请用 my_library 处理表格。",
+    "请用 `python-docx` 生成 Word 报告。",
+    '请用 "季度总结" 作为标题。',
+    "请用“职业技能”作为标题。",
+    "请用 python-docx 编写技能使用说明。",
+    'Please use "quarterly summary" as the title.',
+])
+async def test_ordinary_named_objects_keep_skill_retrieval(harness, query):
+    h = harness
+    assert explicit_request(query, query, ["slides"]) is None
+    ctx = context(query)
+    result = await search(h, ctx)
+    assert result["status"] == "candidates"
+    assert h.rail.EXPLICIT not in ctx.extra
+    assert (await load(h, result["search_id"], "slides", ctx))["loaded"]
+
+
+@pytest.mark.parametrize("query,name", [
+    ("请用 slides 制作幻灯片。", "slides"),
+    ("请用 `slides` 制作幻灯片。", "slides"),
+    ("请用 python-docx 生成 Word 报告。", "python-docx"),
+    ("请使用技能 missing-skill。", "missing-skill"),
+    ("请用 missing-skill 技能生成报告。", "missing-skill"),
+    ("请用不存在技能。", "不存在"),
+    ("Please use skill missing-skill to write a report.", "missing-skill"),
+    ("Please use missing-skill skill to write a report.", "missing-skill"),
+])
+def test_explicit_skill_evidence_is_preserved(query, name):
+    request = explicit_request(query, query, ["slides", "python-docx"])
+    assert request is not None and request.names == (name,)
+
+
+async def test_frontend_unknown_skill_still_blocks_substitution(harness):
+    h = harness
+    envelope = {"content": "生成 Word 报告", "skills_to_use": ["python-docx"],
+                "type": "user input", "source": "web", "preferred_response_language": "zh"}
+    ctx = context("你收到一条消息：\n" + json.dumps(envelope))
+    await h.rail.before_model_call(ctx)
+    assert ctx.extra[h.rail.EXPLICIT]["error"] == "missing_or_not_allowed"
+    assert "skill_tool" not in {t.name for t in ctx.inputs.tools}
+    assert not ctx.extra[h.rail.REUSE].tickets
+    await h.rail.after_model_call(ctx)
 
 
 async def test_prompt_tools_disable_and_reenable(harness):
@@ -584,6 +737,7 @@ async def test_excel_retrieval_is_independent_of_ppt_only_accelerator(harness):
     from openjiuwen.core.foundation.tool import ToolInfo
     h = harness
     write_skill(h.root, 'xlsx-craft', 'Create Excel xlsx spreadsheets with formulas and charts')
+    h.abilities.execute.return_value = [(native_output(h.root / 'xlsx-craft'), None)]
     ctx = context('请生成 Excel 工作簿，录入月销售额，使用公式计算合计和平均值，并生成柱状图，交付 .xlsx。')
     ctx.inputs.tools.append(ToolInfo(name='skill_acceleration_exec', description='Only supports ppt-craft'))
     # The query below stands in for the model's output; this is a retrieval and
@@ -788,7 +942,9 @@ async def test_real_sdk_dispatch_preserves_native_hooks(harness, monkeypatch, po
 
     async def native_execute(tool_call, session, tag=None):
         events.append(("execute", tool_call.name))
-        return ToolOutput(success=True, data="native instructions"), ToolMessage(content="native instructions", tool_call_id=tool_call.id)
+        output = (native_output(h.root / "slides") if operation == "skill"
+                  else ToolOutput(success=True, data="native instructions"))
+        return output, ToolMessage(content=str(output), tool_call_id=tool_call.id)
 
     async def native_active_state(tool_ctx):
         events.append(("active_state", tool_ctx.inputs.tool_name))

@@ -10,6 +10,7 @@ import time
 from openjiuwen.core.foundation.llm.schema.message import ToolMessage
 from openjiuwen.harness.rails.base import DeepAgentRail
 
+from .catalog import directory_id
 from .config import SelectionSettings
 from .diagnostics import emit
 from .explicit import ExplicitRequest, resolve_names
@@ -46,7 +47,7 @@ class SkillSelectionLoadRail(DeepAgentRail):
                 self.reject(ctx, 'invalid_choice', '只能加载本次候选中的准确名称。')
                 return
             selected = candidates[0]
-            if not self.valid(ticket, selected):
+            if not self.valid(ticket, selected, ctx.session):
                 ticket['service'].refresh(force=True)
                 self.reject(ctx, 'changed', '配置、权限或候选文件已变化，请重新检索。')
                 return
@@ -73,7 +74,7 @@ class SkillSelectionLoadRail(DeepAgentRail):
         if status in {'changed', 'load_failed', 'invalid_search'}:
             self.selection.use_default(ctx, status)
 
-    def valid(self, ticket, selected):
+    def valid(self, ticket, selected, session):
         rail = self.selection
         config = rail.config
         settings = SelectionSettings.from_config(config)
@@ -82,12 +83,33 @@ class SkillSelectionLoadRail(DeepAgentRail):
             disabled = [s.strip() for s in disabled.split(',')]
         native = rail.native
         permitted, error = resolve_names(ExplicitRequest('candidate', (selected.name,)), native)
-        return (settings.enabled and settings.identity() == ticket['settings']
+        if not (settings.enabled and settings.identity() == ticket['settings']
                 and SkillSearchTool.TOOL_NAME not in (disabled or [])
                 and native is ticket['native'] and rail.service is ticket['service']
                 and not ticket['service'].retired and not error and len(permitted) == 1
                 and permitted[0].id == selected.id
-                and source_fingerprint('', read_sources(selected.directory)) == selected.fingerprint)
+                and source_fingerprint('', read_sources(selected.directory)) == selected.fingerprint):
+            return False
+        # SkillTool resolves names against this session view, which can retain
+        # a baseline directory even after the live catalog moves the same name.
+        skills = native.get_skills_for_session(session)
+        matches = [skill for skill in skills if skill.name == selected.name]
+        return len(matches) == 1 and directory_id(matches[0].directory) == selected.id
+
+    @staticmethod
+    def result_matches(native_output, selected):
+        data = getattr(native_output, 'data', None)
+        if not isinstance(data, dict):
+            return False
+        directory, body = data.get('skill_directory'), data.get('skill_content')
+        if not isinstance(directory, str) or not isinstance(body, str):
+            return False
+        if directory_id(directory) != selected.id:
+            return False
+        # Compare the actual raw document, not the media/layout-enriched
+        # `content` field. Match the index's utf-8-sig/universal-newline reads.
+        body = body.removeprefix('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+        return source_fingerprint('', read_sources(selected.directory, raw=body)) == selected.fingerprint
 
     async def finish(self, ctx):
         load = getattr(ctx, 'flash_selection_load', None)
@@ -96,14 +118,15 @@ class SkillSelectionLoadRail(DeepAgentRail):
         native_output = getattr(ctx.inputs, 'tool_result', None)
         selected, ticket = load['selected'], load['ticket']
         try:
-            valid = self.valid(ticket, selected)
+            valid = (self.valid(ticket, selected, ctx.session)
+                     and self.result_matches(native_output, selected))
         except Exception:
             valid = False
         if not getattr(native_output, 'success', False):
             # Preserve denial details and native tool result; do not claim load.
             return
         if not valid:
-            data = self.selection.response('changed', '加载期间配置、权限或文件变化，请重新检索。')
+            data = self.selection.response('changed', '配置、权限或文件已变化，或实际加载内容与候选不一致，请重新检索。')
         else:
             state = ctx.extra.get(self.selection.REUSE)
             if state is not None:
