@@ -970,9 +970,14 @@ def test_runtime_route_keeps_artifact_leaf_lexical(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     agent_workspace.mkdir()
     outside.mkdir()
-    (agent_workspace / "projects").symlink_to(
-        outside, target_is_directory=True
-    )
+    try:
+        (agent_workspace / "projects").symlink_to(
+            outside, target_is_directory=True
+        )
+    except OSError:
+        # Creating symlinks needs privilege on Windows; the rejection
+        # semantics are covered where symlinks are creatable.
+        pytest.skip("symlink creation requires privilege on this platform")
     adapter = _make_adapter(
         _env_service_id="service-output",
         _env_agent_id="agent-output",
