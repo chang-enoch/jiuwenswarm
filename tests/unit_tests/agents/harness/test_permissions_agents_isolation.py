@@ -1,7 +1,7 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""标准版 ``permissions.agents[agent_id]`` 精确整段替换隔离。"""
+"""标准版 ``permissions.agents[agent_id]`` 稀疏覆盖 + 包内模板缺省底。"""
 
 from __future__ import annotations
 
@@ -37,14 +37,14 @@ def _load_config_loader():
 
 loader = _load_config_loader()
 
+# 用户全局（可被 UI 改写）
 _RAW: dict[str, Any] = {
     "enabled": False,
     "schema": "tiered_policy",
-    "tools": {"bash": "allow"},
+    "tools": {"bash": "allow", "write_file": "deny"},
     "agents": {
         "office-excel": {
             "enabled": True,
-            "schema": "tiered_policy",
             "tools": {"bash": "deny"},
             "agents": {"nested": {"enabled": False}},
         },
@@ -52,9 +52,23 @@ _RAW: dict[str, Any] = {
     },
 }
 
+# 包内模板缺省底（与用户全局刻意不同，用于证明不跟全局走）
+_TEMPLATE: dict[str, Any] = {
+    "enabled": False,
+    "schema": "tiered_policy",
+    "permission_mode": "normal",
+    "defaults": {"*": "allow"},
+    "tools": {"bash": "allow", "write_file": "allow", "mcp_exec_command": "ask"},
+}
+
 
 @pytest.fixture(autouse=True)
-def _reset_permissions_cache():
+def _reset_permissions_cache(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        loader,
+        "get_shipped_template_permissions_config",
+        lambda *, force_reload=False: copy.deepcopy(_TEMPLATE),
+    )
     loader.clear_permissions_config_cache()
     yield
     loader.clear_permissions_config_cache()
@@ -81,9 +95,19 @@ def test_resolve_yaml_agent_permissions_hit_miss(monkeypatch, standard_edition):
 
     body = loader.resolve_yaml_agent_permissions_body("office-excel")
     assert body is not None
+    # 生效 = 包内模板 ∪ 稀疏覆盖；write_file 跟模板 allow，不跟用户全局 deny
     assert body["enabled"] is True
+    assert body["schema"] == "tiered_policy"
     assert body["tools"]["bash"] == "deny"
+    assert body["tools"]["write_file"] == "allow"
+    assert body["tools"]["mcp_exec_command"] == "ask"
     assert "agents" not in body
+
+    overlay = loader.get_yaml_agent_permissions_overlay("office-excel")
+    assert overlay is not None
+    assert overlay["enabled"] is True
+    assert "schema" not in overlay
+    assert "write_file" not in overlay.get("tools", {})
 
     assert loader.resolve_yaml_agent_permissions_body("missing") is None
     assert loader.resolve_yaml_agent_permissions_body("bad") is None
@@ -93,7 +117,40 @@ def test_resolve_yaml_agent_permissions_hit_miss(monkeypatch, standard_edition):
     global_cfg = loader.get_global_permissions_config()
     assert "agents" not in global_cfg
     assert global_cfg["enabled"] is False
-    assert global_cfg["tools"]["bash"] == "allow"
+    assert global_cfg["tools"]["write_file"] == "deny"
+
+    # 回归：全局段剥掉 agents 后，覆盖表仍须从 _cached_agents 可读（不得 .get("agents")）
+    overlay_after_global = loader.get_yaml_agent_permissions_overlay("office-excel")
+    assert overlay_after_global is not None
+    assert overlay_after_global["tools"]["bash"] == "deny"
+    assert loader.get_yaml_agent_permissions_overlay("missing") is None
+
+
+def test_overlay_not_readable_from_stripped_global_return(monkeypatch, standard_edition):
+    """评审回归：_load_yaml_cache 返回值不含 agents，只能读 _cached_agents。"""
+    monkeypatch.setattr(loader, "_load_permissions_from_yaml", lambda: copy.deepcopy(_RAW))
+    loader.clear_permissions_config_cache()
+
+    stripped = loader._load_yaml_cache()
+    assert "agents" not in stripped
+    assert stripped.get(loader.PERMISSIONS_AGENTS_KEY, {}) == {}
+
+    # 错误写法会恒为空；正确写法读进程侧 _cached_agents
+    assert loader._cached_agents.get("office-excel") is not None
+    assert loader.get_yaml_agent_permissions_overlay("office-excel") is not None
+
+
+def test_seed_without_overlay_uses_template(monkeypatch, standard_edition):
+    monkeypatch.setattr(
+        loader,
+        "_load_permissions_from_yaml",
+        lambda: {"enabled": False, "tools": {"write_file": "deny"}},
+    )
+    body = loader.resolve_yaml_agent_permissions_body("office-excel")
+    assert body is not None
+    assert body["tools"]["write_file"] == "allow"
+    assert body["tools"]["mcp_exec_command"] == "ask"
+    assert loader.get_yaml_agent_permissions_overlay("office-excel") is None
 
 
 def test_enterprise_ignores_yaml_agents(monkeypatch):
@@ -101,6 +158,7 @@ def test_enterprise_ignores_yaml_agents(monkeypatch):
     monkeypatch.setattr(loader, "_load_permissions_from_yaml", lambda: copy.deepcopy(_RAW))
 
     assert loader.resolve_yaml_agent_permissions_body("office-excel") is None
+    assert loader.get_yaml_agent_permissions_overlay("office-excel") is None
     global_cfg = loader.get_global_permissions_config()
     assert "agents" not in global_cfg
 
@@ -192,7 +250,7 @@ def test_persist_miss_does_not_create_agent_bucket(tmp_path, monkeypatch, standa
     assert "office-excel" in perms["agents"]
 
 
-def test_persist_global_seeds_office_excel_from_template(tmp_path, monkeypatch, standard_edition):
+def test_persist_global_does_not_seed_office_excel(tmp_path, monkeypatch, standard_edition):
     payload = {
         "enabled": False,
         "schema": "tiered_policy",
@@ -209,16 +267,10 @@ def test_persist_global_seeds_office_excel_from_template(tmp_path, monkeypatch, 
     data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     perms = data["permissions"]
     assert perms["enabled"] is True
-    agent = perms["agents"]["office-excel"]
-    assert agent["enabled"] is True
-    assert agent["schema"] == "tiered_policy"
-    assert agent["tools"]["bash"] == "allow"
-    assert agent["tools"]["write_file"] == "ask"
-    assert agent["file_guard"]["enabled"] is True
-    assert "agents" not in agent
+    assert "agents" not in perms
 
 
-def test_persist_global_does_not_overwrite_seeded_office_excel(
+def test_persist_global_does_not_overwrite_existing_office_excel(
     tmp_path, monkeypatch, standard_edition
 ):
     yaml_path = _install_yaml(tmp_path, monkeypatch, copy.deepcopy(_RAW))
@@ -234,16 +286,16 @@ def test_persist_global_does_not_overwrite_seeded_office_excel(
     assert "write_file" not in agent["tools"]
 
 
-def test_persist_office_excel_miss_copy_on_write(tmp_path, monkeypatch, standard_edition):
+def test_persist_office_excel_miss_sparse_create(tmp_path, monkeypatch, standard_edition):
     payload = {
         "enabled": False,
         "schema": "tiered_policy",
-        "tools": {"bash": "allow", "write_file": "allow"},
+        "tools": {"bash": "allow", "write_file": "deny"},
     }
     yaml_path = _install_yaml(tmp_path, monkeypatch, payload)
 
     def mutate(perms: dict[str, Any]) -> None:
-        perms.setdefault("tools", {})["write_file"] = "deny"
+        perms.setdefault("tools", {})["write_file"] = "ask"
 
     loader.persist_permissions_mutate(
         mutate,
@@ -253,11 +305,49 @@ def test_persist_office_excel_miss_copy_on_write(tmp_path, monkeypatch, standard
     )
     data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     perms = data["permissions"]
-    assert perms["tools"]["write_file"] == "allow"
+    assert perms["tools"]["write_file"] == "deny"
     agent = perms["agents"]["office-excel"]
-    assert agent["tools"]["bash"] == "allow"
-    assert agent["tools"]["write_file"] == "deny"
-    assert "agents" not in agent
+    assert agent == {"tools": {"write_file": "ask"}}
+
+    effective = loader.resolve_yaml_agent_permissions_body("office-excel")
+    assert effective is not None
+    # bash / mcp 来自模板，不来自用户全局
+    assert effective["tools"]["bash"] == "allow"
+    assert effective["tools"]["write_file"] == "ask"
+    assert effective["tools"]["mcp_exec_command"] == "ask"
+    assert effective["schema"] == "tiered_policy"
+
+
+def test_persist_office_excel_enabled_toggle_sparse(
+    tmp_path, monkeypatch, standard_edition
+):
+    payload = {
+        "enabled": False,
+        "schema": "tiered_policy",
+        "defaults": {"*": "allow"},
+        "tools": {"bash": "deny", "mcp_exec_command": "deny"},
+    }
+    yaml_path = _install_yaml(tmp_path, monkeypatch, payload)
+
+    def mutate(perms: dict[str, Any]) -> None:
+        perms["enabled"] = True
+
+    loader.persist_permissions_mutate(
+        mutate,
+        persist_scope="base",
+        persist_target_agent_id="office-excel",
+        source="permissions_config_rpc",
+    )
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    agent = data["permissions"]["agents"]["office-excel"]
+    assert agent == {"enabled": True}
+
+    effective = loader.resolve_yaml_agent_permissions_body("office-excel")
+    assert effective is not None
+    assert effective["enabled"] is True
+    # 用户全局改成 deny 也不影响：仍读模板
+    assert effective["tools"]["bash"] == "allow"
+    assert effective["tools"]["mcp_exec_command"] == "ask"
 
 
 def test_lookup_standard_permissions_agent_id():
