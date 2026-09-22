@@ -586,13 +586,6 @@ class SkillTurboExecutor:
         skill_name = self._env.skill_name
         if skill_name and "skill_name" not in merged:
             merged["skill_name"] = skill_name
-        # [TEMP-EXTERNAL-SKILL] 注入 skill_checksum（SHA256 校验值）
-        skill_checksum = self._env.skill_checksum
-        if skill_checksum and "skill_checksum" not in merged:
-            merged["skill_checksum"] = skill_checksum
-        # [TEMP-EXTERNAL-SKILL] 注入 skill_checksum_ok（框架层预计算的校验结果）
-        if "skill_checksum_ok" not in merged:
-            merged["skill_checksum_ok"] = self._env.skill_checksum_ok
         return merged
 
     def _build_tool_loader_context(

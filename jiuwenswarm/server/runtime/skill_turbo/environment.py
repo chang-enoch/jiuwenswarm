@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import uuid
@@ -36,68 +35,6 @@ _DEFAULT_SKILLS_DIR = str((Path(__file__).resolve().parent / "skills"))
 _DEFAULT_SKILL_CODE_IMPORT_PACKAGE = (
     "jiuwenswarm.server.runtime.skill_turbo.skill_codes"
 )
-
-# [TEMP-EXTERNAL-SKILL] MD校时排除的目录/文件模式
-# turbo/：外部加速 code 目录（有独立更新生命周期，不参与技能契约 checksum）
-_CHECKSUM_EXCLUDE_DIRS = {"node_modules", "__pycache__", ".git", "turbo"}
-_CHECKSUM_EXCLUDE_FILES = {".gitkeep"}
-
-
-def _compute_dir_checksum(dir_path: str) -> str:
-    """[TEMP-EXTERNAL-SKILL] 计算目录的确定性 SHA256。
-
-    递归遍历目录所有文件（排除 node_modules/__pycache__/.git/.gitkeep），
-    按相对路径排序，对每个文件内容算 SHA256，
-    拼接所有 ``relative_path:sha256`` 后对整体再算一次 SHA256。
-
-    此函数位于框架层（environment.py），不受 skill_code 安全校验约束，
-    可以自由使用 hashlib、rglob、read_bytes 等被沙箱禁止的能力。
-    """
-    root = Path(dir_path).resolve()
-    entries: list[str] = []
-    for file_path in sorted(root.rglob("*")):
-        if not file_path.is_file():
-            continue
-        # 排除特定目录和文件
-        if any(part in _CHECKSUM_EXCLUDE_DIRS for part in file_path.relative_to(root).parts):
-            continue
-        if file_path.name in _CHECKSUM_EXCLUDE_FILES:
-            continue
-        rel = str(file_path.relative_to(root))
-        content_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
-        entries.append(f"{rel}:{content_sha256}")
-    combined = "\n".join(entries)
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
-
-
-def _verify_skill_checksum(pptx_root: str, expected_checksum: str) -> bool:
-    """[TEMP-EXTERNAL-SKILL] 校验外部 skill 目录的 SHA256。
-
-    expected_checksum 为空时跳过校验（返回 True）。
-    校验失败时打 WARNING 日志但不阻塞执行（临时方案）。
-
-    此函数位于框架层（environment.py），不受 skill_code 安全校验约束。
-    """
-    if not expected_checksum:
-        logger.warning(
-            "[SkillTurboEnvironment] skill_checksum 未配置，跳过 SHA256 校验；"
-            "外部 turbo code 将在进程内执行，建议配置 checksum 以保障完整性。"
-            "skill_dir=%s",
-            pptx_root,
-        )
-        return True
-
-    actual = _compute_dir_checksum(pptx_root)
-    if actual == expected_checksum:
-        logger.info("[SkillTurboEnvironment] skill_checksum 校验通过: %s", actual)
-        return True
-
-    logger.warning(
-        "[SkillTurboEnvironment] skill_checksum 校验失败！期望=%s 实际=%s pptx_root=%s",
-        expected_checksum, actual, pptx_root,
-    )
-    return False
-
 
 # _load_skill_meta / find_skill_root_file 已提取到 skill_meta.py
 # （消除 loader↔environment 循环依赖；本模块经顶部 import 引入）
@@ -181,11 +118,6 @@ class SkillTurboEnvironment:
         self._skill_root: str = self._resolve_skill_root()
         # [TEMP-EXTERNAL-SKILL] skill_name: PPT skill 的外部目录名（默认 pptx-craft）。
         self._skill_name: str = config.get("skill_name") or "pptx-craft"
-        # [TEMP-EXTERNAL-SKILL] skill_checksum: 外部 skill 目录的 SHA256 校验值（转测前手动填写）。
-        self._skill_checksum: str = config.get("skill_checksum") or ""
-        # [TEMP-EXTERNAL-SKILL] skill_checksum_ok: SHA256 校验结果，在 _load 中计算
-        # （_verify_external_skill_checksum，独立于 skill_codes_dir）。
-        self._skill_checksum_ok: bool = False
         # skill_code 静态安全校验器，使用 builtin_skill_code profile：
         # 允许安全标准库和 skill_turbo 内部模块 import，禁止 os/subprocess 等危险模块，
         # 禁止 getattr/eval/open 等危险调用，禁止 Path 文件 IO 和 dunder 属性访问。
@@ -362,16 +294,6 @@ class SkillTurboEnvironment:
                 external,
             )
             self._skill_name = external
-
-    @property
-    def skill_checksum(self) -> str:
-        """[TEMP-EXTERNAL-SKILL] 外部 skill 目录的 SHA256 校验值。"""
-        return self._skill_checksum
-
-    @property
-    def skill_checksum_ok(self) -> bool:
-        """[TEMP-EXTERNAL-SKILL] SHA256 校验是否通过（空值时为 True）。"""
-        return self._skill_checksum_ok
 
     @property
     def skill_codes_dir(self) -> str:
@@ -706,10 +628,6 @@ class SkillTurboEnvironment:
         # 必须在 _load 编排层独立调用，不能嵌在 _scan_skills_dir 内部
         self._scan_external_turbo_skills()
 
-        # [TEMP-EXTERNAL-SKILL] SHA256 校验独立于 skill_codes_dir 执行：
-        # 外部 turbo-only 形态（skill_codes_dir 为空）下不可被短路。
-        self._verify_external_skill_checksum()
-
     def _scan_skills_dir(self) -> None:
         """扫描 ``skill_codes_dir`` 目录注册自定义 skill。
 
@@ -811,21 +729,6 @@ class SkillTurboEnvironment:
         # 写入缓存（仅当成功计算到 mtime 时）
         if current_mtime > 0.0:
             self._scan_cache[cache_key] = (current_mtime, scanned_skills)
-
-    def _verify_external_skill_checksum(self) -> None:
-        """[TEMP-EXTERNAL-SKILL] 在框架层完成 SHA256 校验，结果注入到 inputs 供 skill_code 读取。
-
-        校验目标：{skill_root}/{skill_name} 子目录（如 office-claw-skills/pptx-craft），
-        而非整个 skill_root 根目录（根目录包含多个 skill，任一变更都会导致校验失败）。
-        """
-        if self._skill_root:
-            skill_dir = str(Path(self._skill_root) / self._skill_name)
-            self._skill_checksum_ok = _verify_skill_checksum(
-                skill_dir, self._skill_checksum
-            )
-        else:
-            # skill_root 未解析时跳过校验（默认 True）
-            self._skill_checksum_ok = True
 
     def _scan_external_turbo_skills(self) -> None:
         """扫描已注册技能目录下各技能的 turbo/turbo_codes，注册外部 skill。
