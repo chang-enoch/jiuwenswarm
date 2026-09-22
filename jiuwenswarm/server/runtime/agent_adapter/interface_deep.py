@@ -7594,13 +7594,41 @@ class JiuWenSwarmDeepAdapter:
 
     @staticmethod
     def _build_filesystem_rail() -> SysOperationRail | None:
-        """Build SysOperationRail."""
+        """Build SysOperationRail (bash swapped to FlashBashTool for PATH hardening).
+
+        If the flash tools package (or its openjiuwen dependency chain) fails
+        to import, fall back to the stock ``SysOperationRail`` so the agent
+        still gets a working filesystem/shell toolset instead of ``None``.
+        Only returns ``None`` when *both* the flash override and the stock
+        rail fail to construct.
+        """
+        fs_rail: SysOperationRail | None = None
         try:
-            fs_rail = SysOperationRail()
+            from jiuwenswarm.agents.harness.flash.tools.flash_bash_tool import (
+                FlashBashSysOperationRail,
+            )
+
+            fs_rail = FlashBashSysOperationRail()
             logger.info("[JiuWenSwarmDeepAdapter] SysOperationRail create success")
         except Exception as exc:
-            logger.warning("[JiuWenSwarmDeepAdapter] SysOperationRail create failed: %s", exc)
-            fs_rail = None
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] flash rail unavailable, "
+                "falling back to stock SysOperationRail: %s",
+                exc,
+            )
+            try:
+                fs_rail = SysOperationRail()
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] stock SysOperationRail fallback "
+                    "create success"
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] stock SysOperationRail "
+                    "fallback also failed: %s",
+                    fallback_exc,
+                )
+                fs_rail = None
         return fs_rail
 
     @staticmethod

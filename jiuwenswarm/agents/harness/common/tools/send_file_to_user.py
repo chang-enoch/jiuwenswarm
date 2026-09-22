@@ -78,6 +78,38 @@ def _normalize_sent_file_path(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/").lower()
 
 
+_MIN_XLSX_BYTES = 6000
+
+
+def _xlsx_size_warning(file_path: str) -> str | None:
+    """Return a warning string for suspiciously small workbook files, else None.
+
+    仅供提醒，不拦截发送：极小工作簿可能是合法产物，也可能来自构建工具链
+    失败后生成的空白文件（仅含默认空 Sheet1）。
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in (".xlsx", ".xlsm"):
+        return None
+    try:
+        size = os.path.getsize(file_path)
+    except OSError:
+        return None
+    if size < _MIN_XLSX_BYTES:
+        return (
+            f"⚠️ 文件「{os.path.basename(file_path)}」大小仅为 {size} 字节"
+            f"（低于建议阈值 {_MIN_XLSX_BYTES} 字节），"
+            "可能为空白或未正确渲染的工作簿。建议先用 read_file 确认内容，"
+            "若只有空白默认 Sheet1 则说明生成失败，应重新生成后再发送。"
+        )
+    return None
+
+
+def _append_size_warnings(result: str, size_warnings: list[str]) -> str:
+    if result and size_warnings:
+        return result + "\n" + "\n".join(size_warnings)
+    return result
+
+
 def _partition_sent_files(
     session_id: str,
     paths: list[str],
@@ -279,12 +311,17 @@ class SendFileToolkit:
 
         valid_files = []
         missing_files = []
+        size_warnings: list[str] = []
         for fp in abs_file_path_list:
             fp = str(fp).strip()
             if not fp:
                 continue
             if os.path.isfile(fp):
                 valid_files.append(fp)
+                hint = _xlsx_size_warning(fp)
+                if hint:
+                    size_warnings.append(hint)
+                    logger.warning("[SendFileToolkit] 疑似空白工作簿: %s", fp)
             else:
                 missing_files.append(fp)
                 logger.warning("[SendFileToolkit] 文件不存在: %s", fp)
@@ -335,24 +372,26 @@ class SendFileToolkit:
         # 企业默认：OBS URL 经当前 chat SSE（不依赖 PushRegistry）。
         # 个人版不进此分支，保持本机 path + send_push / 显式 file_transfer。
         if self._should_use_obs_download():
-            return await self._send_file_via_obs(
+            result = await self._send_file_via_obs(
                 valid_files,
                 missing_files,
                 skipped_files,
                 route,
                 target_channel_list,
             )
+            return _append_size_warnings(result, size_warnings)
 
         from jiuwenswarm.common.file_transfer_config import get_file_transfer_config
 
         if get_file_transfer_config().enabled:
-            return await self._send_file_distributed(
+            result = await self._send_file_distributed(
                 valid_files,
                 missing_files,
                 skipped_files,
                 route,
                 target_channel_list,
             )
+            return _append_size_warnings(result, size_warnings)
 
         try:
             from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
@@ -461,6 +500,7 @@ class SendFileToolkit:
                 result_parts.append("以下文件不存在，未发送：")
                 for mf in missing_files:
                     result_parts.append(f"  - {mf}")
+            result_parts.extend(size_warnings)
             return "\n".join(result_parts)
         except Exception as e:
             logger.exception(
@@ -498,7 +538,6 @@ class SendFileToolkit:
             load_minio_upload_config,
             upload_local_file_to_minio,
         )
-
         from jiuwenswarm.common.audit_emit import emit_audit_evt, emit_audit_ua
 
         session = get_subagent_parent_session()
