@@ -78,7 +78,7 @@ def session(mode="agent"):
     agent = runtime()
     resolver = AsyncMock(return_value=agent)
     control = SteeringSession(resolver)
-    binding = control.open(
+    binding = control.bind_request(
         run_request(params={"mode": mode, "invocation_id": "invocation-1"})
     )
     return control, binding, agent, resolver
@@ -146,7 +146,7 @@ async def test_rerun_and_wrong_invocation_do_not_receive_late_inputs():
     control, _, agent, _ = session()
     result = await control.handle(control_request(invocation_id="other"), query=False)
     assert result["reason"] == "RUN_NOT_ACTIVE"
-    control.open(run_request(request_id="run-2"))
+    control.bind_request(run_request(request_id="run-2"))
     result = await control.handle(control_request(), query=False)
     assert result["reason"] == "RUN_NOT_ACTIVE"
     agent.steer_active.assert_not_awaited()
@@ -157,7 +157,7 @@ async def test_final_receipts_survive_original_stream_closing():
     control, binding, agent, _ = session()
     await control.handle(control_request(), query=False)
     agent.receipts["input-1"]["status"] = "consumed"
-    await control.close(binding)
+    await control.finish_request(binding)
     assert binding.inputs["input-1"].runtime is None
     result = await control.handle(control_request(query=True), query=True)
     assert result["status"] == "consumed"
@@ -172,7 +172,7 @@ async def test_final_receipts_survive_original_stream_closing():
 async def test_missing_consumption_evidence_after_finish_becomes_unknown():
     control, binding, _, _ = session()
     await control.handle(control_request(), query=False)
-    await control.close(binding)
+    await control.finish_request(binding)
     assert (await control.handle(control_request(query=True), query=True))[
         "status"
     ] == "unknown"
@@ -349,7 +349,8 @@ async def test_unknown_session_query_does_not_allocate_agent_manager(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_actual_adapter_stream_binding_survives_until_original_stream_ends():
+@pytest.mark.parametrize("outcome", ["complete", "error", "cancel"])
+async def test_actual_adapter_stream_finalizes_binding_when_original_stream_ends(outcome):
     from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
         JiuWenSwarmDeepAdapter,
     )
@@ -364,6 +365,8 @@ async def test_actual_adapter_stream_binding_survives_until_original_stream_ends
     async def chunks(request, inputs):
         started.set()
         await finish.wait()
+        if outcome == "error":
+            raise RuntimeError("stream failed")
         yield SimpleNamespace(payload={"content": "original output"})
 
     adapter._process_message_stream_impl = chunks
@@ -382,12 +385,27 @@ async def test_actual_adapter_stream_binding_survives_until_original_stream_ends
     assert result["status"] == "accepted"
     assert not task.done()
     adapter._instance.receipts["input-1"]["status"] = "consumed"
-    finish.set()
-    await task
-    assert outputs == [{"content": "original output"}]
+    if outcome == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        finish.set()
+        if outcome == "error":
+            with pytest.raises(RuntimeError, match="stream failed"):
+                await task
+        else:
+            await task
+    expected = [{"content": "original output"}] if outcome == "complete" else []
+    assert outputs == expected
     assert (await adapter.process_steering(control_request(query=True), query=True))[
         "status"
     ] == "consumed"
+    assert await adapter.process_steering(
+        control_request(query=True, input_id=""), query=True
+    ) == {"supported": False, "reason": "RUN_NOT_ACTIVE"}
+    late = control_request(input_id="late", client_message_id="late")
+    assert (await adapter.process_steering(late, query=False))["reason"] == "RUN_NOT_ACTIVE"
 
 
 @pytest.mark.asyncio
@@ -482,7 +500,7 @@ async def test_approval_chat_send_does_not_replace_original_steering_binding(
     adapter._parent_session_id = "session-1"
     adapter._instance = runtime()
     adapter._steering_control = SteeringSession(adapter._resolve_steering_runtime)
-    original = adapter._steering_control.open(run_request())
+    original = adapter._steering_control.bind_request(run_request())
 
     async def approval_ack(*args):
         yield SimpleNamespace(payload={"event_type": "runtime.accepted"})
@@ -571,7 +589,7 @@ async def test_acp_control_only_resolves_existing_alias(known_alias):
 @pytest.mark.asyncio
 async def test_status_cannot_claim_an_unbound_invocation():
     control, _, agent, _ = session()
-    original = control.open(run_request(params={"mode": "agent"}))
+    original = control.bind_request(run_request(params={"mode": "agent"}))
     result = await control.handle(control_request(query=True, input_id=""), query=True)
     assert result == {"supported": False, "reason": "RUN_NOT_ACTIVE"}
     assert original.invocation_id == ""
@@ -592,3 +610,51 @@ async def test_status_rejects_chat_only_parameters_before_lookup():
     await handle_chat_steering(ctx)
     wire = ctx.sink.send_wire.await_args.args[0]
     assert wire["body"]["details"]["reason"] == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_scoped,method,params,interactive",
+    [
+        pytest.param(False, ReqMethod.CHAT_SEND, {}, False, id="root-adapter"),
+        pytest.param(True, ReqMethod.CHAT_STEER, {}, False, id="control-request"),
+        pytest.param(True, ReqMethod.CHAT_SEND, {"input_mode": "steer"}, False, id="steer"),
+        pytest.param(True, ReqMethod.CHAT_SEND, {"input_mode": "follow_up"}, False, id="follow-up"),
+        pytest.param(
+            True, ReqMethod.CHAT_SEND,
+            {"mode": "team", "source": "permission_interrupt"}, True,
+            id="team-permission",
+        ),
+        pytest.param(
+            True, ReqMethod.CHAT_SEND,
+            {"mode": "team", "source": "ask_user_interrupt"}, True,
+            id="team-answer",
+        ),
+    ],
+)
+async def test_non_owner_stream_preserves_original_steering_binding(
+    session_scoped, method, params, interactive
+):
+    from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+        JiuWenSwarmDeepAdapter,
+    )
+
+    adapter = JiuWenSwarmDeepAdapter.__new__(JiuWenSwarmDeepAdapter)
+    adapter._is_session_scoped_adapter = session_scoped
+    control, original, _, _ = session()
+    adapter._steering_control = control
+
+    async def chunks(*args):
+        yield SimpleNamespace(payload={"event_type": "runtime.accepted"})
+
+    adapter._process_message_stream_impl = chunks
+    request = run_request(request_id="non-owner", req_method=method, params=params)
+    query = InteractiveInput() if interactive else "follow-up"
+    outputs = [
+        chunk.payload
+        async for chunk in adapter.process_message_stream_impl(request, {"query": query})
+    ]
+    assert outputs == [{"event_type": "runtime.accepted"}]
+    assert original.active
+    assert (await control.handle(control_request(), query=False))["status"] == "accepted"

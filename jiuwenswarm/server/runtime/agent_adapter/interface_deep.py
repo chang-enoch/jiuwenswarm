@@ -140,6 +140,7 @@ from jiuwenswarm.agents.harness.common.tools.deepresearch.deepresearch_rewrite_h
 
 if TYPE_CHECKING:
     from openjiuwen.harness.schema.config import SubAgentConfig
+    from jiuwenswarm.server.runtime.agent_adapter.steering import SteeringSession
     from jiuwenswarm.server.runtime.agent_config_service import AgentDefinition
 
 GOAL_UPDATED_EVENT_TYPE = InteractionEventType.GOAL_UPDATED.value
@@ -2480,6 +2481,7 @@ class JiuWenSwarmDeepAdapter:
         self._audio_tools: list[Any] = []
         self._instance_overrides: dict[str, Any] = {}
         self._is_session_scoped_adapter: bool = False
+        self._steering_control: SteeringSession | None = None
         self._parent_session_id: str | None = None
         # Active request-scoped OfficeClaw MCP registration for this session
         # adapter. Used for safe short-name cleanup and diagnostics; invoke
@@ -18548,29 +18550,39 @@ class JiuWenSwarmDeepAdapter:
             return {"status": "unknown"} if query else {"status": "not_applied", "reason": "RUN_NOT_ACTIVE"}
         return await control.handle(request, query=query)
 
+    def _should_bind_steering_request(
+        self, request: AgentRequest, inputs: dict[str, Any]
+    ) -> bool:
+        from jiuwenswarm.server.runtime.agent_adapter.team_helpers import is_team_control_continuation
+
+        if (
+            not self._is_session_scoped_adapter
+            or request.req_method not in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_RESUME)
+            or self._should_inject_into_existing_interaction(request.params)
+        ):
+            return False
+        if self._is_subagent_approval_answer(
+            str((request.params or {}).get("request_id") or ""), request.params
+        ):
+            return False
+        return not is_team_control_continuation(request, inputs.get("query"))
+
     async def process_message_stream_impl(
         self, request: AgentRequest, inputs: dict[str, Any]
     ) -> AsyncIterator[AgentResponseChunk]:
         from jiuwenswarm.server.runtime.agent_adapter.steering import SteeringSession
-        from jiuwenswarm.server.runtime.agent_adapter.team_helpers import is_team_control_continuation
 
         binding = None
-        if (self._is_session_scoped_adapter
-                and request.req_method in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_RESUME)
-                and not self._should_inject_into_existing_interaction(request.params)
-                and not self._is_subagent_approval_answer(
-                    str((request.params or {}).get("request_id") or ""), request.params
-                )
-                and not is_team_control_continuation(request, inputs.get("query"))):
+        if self._should_bind_steering_request(request, inputs):
             if getattr(self, "_steering_control", None) is None:
                 self._steering_control = SteeringSession(self._resolve_steering_runtime)
-            binding = self._steering_control.open(request)
+            binding = self._steering_control.bind_request(request)
         try:
             async for chunk in self._process_message_stream_impl(request, inputs):
                 yield chunk
         finally:
             if binding is not None:
-                await self._steering_control.close(binding)
+                await self._steering_control.finish_request(binding)
 
     async def _process_message_stream_impl(
         self, request: AgentRequest, inputs: dict[str, Any]

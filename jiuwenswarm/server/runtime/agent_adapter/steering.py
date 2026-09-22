@@ -77,7 +77,8 @@ class SteeringSession:
         self._bindings: OrderedDict[str, _Binding] = OrderedDict()
         self._active: _Binding | None = None
 
-    def open(self, request: AgentRequest) -> _Binding:
+    def bind_request(self, request: AgentRequest) -> _Binding:
+        """Register the in-memory owner of an existing request stream."""
         params = request.params or {}
         binding = _Binding(
             request_id=request.request_id,
@@ -106,7 +107,8 @@ class SteeringSession:
             and binding.identity == request_identity(request)
         )
 
-    async def close(self, binding: _Binding) -> None:
+    async def finish_request(self, binding: _Binding) -> None:
+        """End acceptance, snapshot receipts and release runtime references."""
         async with binding.lock:
             binding.active = False
             if self._active is binding:
