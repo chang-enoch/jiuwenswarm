@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
+import os
+import uuid
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -16,14 +17,17 @@ from openjiuwen.core.foundation.llm import Model
 from openjiuwen.core.runner import Runner
 
 from jiuwenswarm.server.runtime.skill_turbo.validator import PlanCodeValidator
+from jiuwenswarm.server.runtime.skill_turbo.skill_meta import (
+    find_skill_root_file,
+    load_skill_meta,
+)
 
 if TYPE_CHECKING:
     from jiuwenswarm.server.runtime.skill_turbo.tools_loader import ToolLoaderContext
 
 logger = logging.getLogger(__name__)
 
-# 当 config 未显式指定时，使用本仓库内置 skill_codes 目录。
-_DEFAULT_SKILL_CODES_DIR = str((Path(__file__).resolve().parent / "skill_codes"))
+# 当 config 未显式指定时，使用本仓库内置 skills 目录。
 _DEFAULT_SKILLS_DIR = str((Path(__file__).resolve().parent / "skills"))
 
 # skill_code 文件系统目录 -> import 包前缀（用于 Validator/Executor 白名单）。
@@ -32,60 +36,8 @@ _DEFAULT_SKILL_CODE_IMPORT_PACKAGE = (
     "jiuwenswarm.server.runtime.skill_turbo.skill_codes"
 )
 
-# [TEMP-EXTERNAL-SKILL] MD校时排除的目录/文件模式
-_CHECKSUM_EXCLUDE_DIRS = {"node_modules", "__pycache__", ".git"}
-_CHECKSUM_EXCLUDE_FILES = {".gitkeep"}
-
-
-def _compute_dir_checksum(dir_path: str) -> str:
-    """[TEMP-EXTERNAL-SKILL] 计算目录的确定性 SHA256。
-
-    递归遍历目录所有文件（排除 node_modules/__pycache__/.git/.gitkeep），
-    按相对路径排序，对每个文件内容算 SHA256，
-    拼接所有 ``relative_path:sha256`` 后对整体再算一次 SHA256。
-
-    此函数位于框架层（environment.py），不受 skill_code 安全校验约束，
-    可以自由使用 hashlib、rglob、read_bytes 等被沙箱禁止的能力。
-    """
-    root = Path(dir_path).resolve()
-    entries: list[str] = []
-    for file_path in sorted(root.rglob("*")):
-        if not file_path.is_file():
-            continue
-        # 排除特定目录和文件
-        if any(part in _CHECKSUM_EXCLUDE_DIRS for part in file_path.relative_to(root).parts):
-            continue
-        if file_path.name in _CHECKSUM_EXCLUDE_FILES:
-            continue
-        rel = str(file_path.relative_to(root))
-        content_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
-        entries.append(f"{rel}:{content_sha256}")
-    combined = "\n".join(entries)
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
-
-
-def _verify_skill_checksum(pptx_root: str, expected_checksum: str) -> bool:
-    """[TEMP-EXTERNAL-SKILL] 校验外部 skill 目录的 SHA256。
-
-    expected_checksum 为空时跳过校验（返回 True）。
-    校验失败时打 WARNING 日志但不阻塞执行（临时方案）。
-
-    此函数位于框架层（environment.py），不受 skill_code 安全校验约束。
-    """
-    if not expected_checksum:
-        logger.info("[SkillTurboEnvironment] skill_checksum 为空，跳过 SHA256 校验")
-        return True
-
-    actual = _compute_dir_checksum(pptx_root)
-    if actual == expected_checksum:
-        logger.info("[SkillTurboEnvironment] skill_checksum 校验通过: %s", actual)
-        return True
-
-    logger.warning(
-        "[SkillTurboEnvironment] skill_checksum 校验失败！期望=%s 实际=%s pptx_root=%s",
-        expected_checksum, actual, pptx_root,
-    )
-    return False
+# _load_skill_meta / find_skill_root_file 已提取到 skill_meta.py
+# （消除 loader↔environment 循环依赖；本模块经顶部 import 引入）
 
 
 @dataclass
@@ -97,6 +49,14 @@ class Skill:
     skill_md: str
     plan_code: str | None = None
     match_keywords: list[str] = field(default_factory=list)
+    # [TEMP-EXTERNAL-SKILL] 外部 skill 目录名（meta.json external_name，
+    # 如 office-claw-skills/pptx-content-summarizer）。planner 路由选中后
+    # 由 env.set_skill_name 同步为 executor 注入的 inputs["skill_name"]。
+    external_name: str = ""
+
+    # 外部 turbo（技能目录）来源信息；内置 skill_codes 注册时为空。
+    package_name: str = ""      # 动态包名（如 "skill_turbo_codes_ppt"）
+    turbo_codes_dir: str = ""   # turbo_codes 目录绝对路径
 
     # match() 方法已移除：实际路由走 planner 的 LLM 通道，
     # match_keywords 字段保留，仅作为 LLM 路由 payload 的描述输入。
@@ -117,6 +77,14 @@ class SkillTurboEnvironment:
     # 用于跨请求复用扫盘 + AST 校验结果，仅在文件 mtime 变化时重新扫描。
     _scan_cache: ClassVar[dict[str, tuple[float, list["Skill"]]]] = {}
 
+    # 外部 turbo 扫描缓存：key=技能根目录绝对路径 frozenset，
+    # value=(各 turbo_codes 目录 max .py mtime 快照 dict, Skill 列表)
+    _external_scan_cache: ClassVar[
+        dict[frozenset[str], tuple[dict[str, float], list["Skill"]]]
+    ] = {}
+
+    _tool_info_last_export: ClassVar[dict[str, str]] = {}
+
     def __init__(self, config: dict[str, Any]):
         self._config = config
         self._soul: str = config.get("soul", "")
@@ -133,11 +101,11 @@ class SkillTurboEnvironment:
         # 没有 card 时 session.pre_run/post_run 会崩溃，导致 HITL resume_ctx 无法持久化。
         self._card: Any = config.get("card")
 
-        # skills/skill_codes 路径默认兜底到包内目录，避免 Executor 无法 import。
+        # skills 路径默认兜底到包内目录；skill_codes 内置目录已随迁移删除
+        # 语义：config 缺失或显式空串 -> 禁用内置扫描；
+        # 非空但无效 -> _scan 时 warning 并跳过。
         self._skills_dir: str = config.get("skills_dir") or _DEFAULT_SKILLS_DIR
-        self._skill_codes_dir: str = (
-            config.get("skill_codes_dir") or _DEFAULT_SKILL_CODES_DIR
-        )
+        self._skill_codes_dir: str = str(config.get("skill_codes_dir") or "")
         # skill_code 的 Python 包前缀，独立于文件系统路径，由配置或默认值决定。
         self._skill_code_import_package: str = (
             config.get("skill_code_import_package")
@@ -150,15 +118,11 @@ class SkillTurboEnvironment:
         self._skill_root: str = self._resolve_skill_root()
         # [TEMP-EXTERNAL-SKILL] skill_name: PPT skill 的外部目录名（默认 pptx-craft）。
         self._skill_name: str = config.get("skill_name") or "pptx-craft"
-        # [TEMP-EXTERNAL-SKILL] skill_checksum: 外部 skill 目录的 SHA256 校验值（转测前手动填写）。
-        self._skill_checksum: str = config.get("skill_checksum") or ""
-        # [TEMP-EXTERNAL-SKILL] skill_checksum_ok: SHA256 校验结果，在 _scan_skills_dir 中计算。
-        self._skill_checksum_ok: bool = False
         # skill_code 静态安全校验器，使用 builtin_skill_code profile：
         # 允许安全标准库和 skill_turbo 内部模块 import，禁止 os/subprocess 等危险模块，
         # 禁止 getattr/eval/open 等危险调用，禁止 Path 文件 IO 和 dunder 属性访问。
         # 未来 LLM 动态生成的 skill_code 应使用 for_generated_skill_code() 更严格规则。
-        self._skill_code_validator = PlanCodeValidator.for_builtin_skill_code(
+        self._skill_code_validator = PlanCodeValidator.for_skill_code(
             allowed_import_prefixes=self.skill_code_import_prefixes
         )
         # 严格模式：True 时内置 skill_code 校验失败直接抛 ValueError 阻止启动；
@@ -167,6 +131,11 @@ class SkillTurboEnvironment:
         self._strict_builtin_skill_validation: bool = bool(
             config.get("strict_builtin_skill_validation", False)
         )
+        # 外部 turbo code 门面注册：保证任何 code import 前
+        # sys.modules["skill_turbo_runtime"] 可解析（幂等）。
+        from jiuwenswarm.server.runtime.skill_turbo.runtime import ensure_runtime_facade
+
+        ensure_runtime_facade()
         self._load(config)
 
     def _resolve_skill_root(self) -> str:
@@ -308,15 +277,23 @@ class SkillTurboEnvironment:
         """[TEMP-EXTERNAL-SKILL] PPT skill 的外部目录名。"""
         return self._skill_name
 
-    @property
-    def skill_checksum(self) -> str:
-        """[TEMP-EXTERNAL-SKILL] 外部 skill 目录的 SHA256 校验值。"""
-        return self._skill_checksum
+    def set_skill_name(self, skill: "Skill") -> None:
+        """[TEMP-EXTERNAL-SKILL] planner 路由选中 skill 后同步外部目录名。
 
-    @property
-    def skill_checksum_ok(self) -> bool:
-        """[TEMP-EXTERNAL-SKILL] SHA256 校验是否通过（空值时为 True）。"""
-        return self._skill_checksum_ok
+        多外部 skill 场景（pptx-craft / pptx-content-summarizer）：config 构造期
+        的默认值只覆盖首个技能，路由命中其他技能时必须以 meta.json
+        external_name 为准更新 _skill_name，executor 注入 inputs["skill_name"]
+        与 persist_node_artifacts 的技能归属才能对上。不影响构造期已完成的
+        checksum 校验（其目标目录在 _load 时已锁定）。
+        """
+        external = str(getattr(skill, "external_name", "") or "").strip()
+        if external and external != self._skill_name:
+            logger.info(
+                "[SkillTurboEnvironment] set_skill_name: %s -> %s",
+                self._skill_name,
+                external,
+            )
+            self._skill_name = external
 
     @property
     def skill_codes_dir(self) -> str:
@@ -328,11 +305,18 @@ class SkillTurboEnvironment:
 
     @property
     def skill_code_import_prefixes(self) -> list[str]:
-        """Validator 用：允许的 import 包前缀（基于包名，非文件系统路径）。"""
+        """Validator 用：允许的 import 包前缀（内置包 + 已注册动态包）。"""
+        prefixes: list[str] = []
         package = self._skill_code_import_package.strip().strip(".")
-        if not package:
-            return []
-        return [f"{package}."]
+        if package:
+            prefixes.append(f"{package}.")
+        from jiuwenswarm.server.runtime.skill_turbo.turbo_package_loader import (
+            registered_packages,
+        )
+
+        for pkg in registered_packages():
+            prefixes.append(f"{pkg}.")
+        return prefixes
 
     @property
     def skill_codes_parent_dir(self) -> str:
@@ -390,14 +374,25 @@ class SkillTurboEnvironment:
         return None
 
     def get_tool_info_list(self) -> list[dict[str, Any]]:
-        """获取工具描述列表（供 Planner prompt 使用）。"""
-        return [
-            {
+        """获取工具描述列表（供 Planner prompt 和 CodeGen 使用）。
+
+        返回每个工具的 name、description 和 input_params（参数 schema）。
+        CodeGen 据此生成正确的 call_tool 参数名。
+        """
+        result: list[dict[str, Any]] = []
+        for name, card in self._tools.items():
+            entry: dict[str, Any] = {
                 "name": name,
                 "description": getattr(card, "description", ""),
             }
-            for name, card in self._tools.items()
-        ]
+            input_params = getattr(card, "input_params", None)
+            if input_params:
+                if isinstance(input_params, dict):
+                    entry["input_params"] = input_params
+                elif hasattr(input_params, "model_json_schema"):
+                    entry["input_params"] = input_params.model_json_schema()
+            result.append(entry)
+        return result
 
     # ────────────────────── Skill 注册/查询 ──────────────────────
 
@@ -453,7 +448,6 @@ class SkillTurboEnvironment:
         - 通过 ``ToolLoaderContext`` 透传 sys_operation / 模型配置 / 各类开关。
         """
         from jiuwenswarm.server.runtime.skill_turbo.tools_loader import (
-            ToolLoaderContext as _Ctx,
             load_all,
             load_send_file_tools,
         )
@@ -474,6 +468,67 @@ class SkillTurboEnvironment:
             )
 
         self._refresh_send_file_tools(ctx, load_send_file_tools)
+        # 在 send_file_to_user 注册之后再导出，确保 tool_info.json 含全部工具 schema
+        self._export_tool_info()
+
+    def _export_tool_info(self) -> None:
+        """将已注册工具的元数据（含参数 schema）导出为 JSON 文件。
+
+        导出路径优先取 config["tool_info_export_path"]，未配置时默认
+        ``<workspace>/tool_info.json``（workspace 由 ``get_user_workspace_dir``
+        解析，OfficeAce 部署下为 ``~/.office-claw/.jiuwenclaw``）。
+        CodeGen（skill-turbo-converter）通过 read_file 查询该文件，获取
+        call_tool 参数名/类型的 ground truth。
+
+        并发/一致性策略：
+        - 内容去重：与类级缓存中上次导出文本一致时直接跳过写盘，
+          消除每请求重复 I/O（工具 schema 在请求间基本不变）；
+        - 原子写：内容变化时先写同目录临时文件再 ``os.replace`` 原子替换，
+          读方（CodeGen）要么看到旧完整文件要么新完整文件，不会读到撕裂 JSON，
+          多实例写同一路径时也以最后写者为准（内容一致则无损）；
+        - 降级：任何异常仅 WARNING 不抛出，导出失败不影响主任务流程。
+        """
+        import json
+
+        from jiuwenswarm.common.utils import get_user_workspace_dir
+
+        export_path = self._config.get("tool_info_export_path") or str(
+            get_user_workspace_dir() / "tool_info.json"
+        )
+        try:
+            tool_info = self.get_tool_info_list()
+            payload = json.dumps(tool_info, ensure_ascii=False, indent=2)
+            p = Path(str(export_path))
+            if (
+                self._tool_info_last_export.get(str(p)) == payload
+                and p.is_file()
+            ):
+                logger.debug(
+                    "[SkillTurboEnvironment] tool_info unchanged, skip export: %s",
+                    p,
+                )
+                return
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(f"{p.name}.tmp-{uuid.uuid4().hex[:8]}")
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, p)
+            finally:
+                # replace 成功后 tmp 已不存在；失败时 best-effort 清理残留
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            self._tool_info_last_export[str(p)] = payload
+            logger.info(
+                "[SkillTurboEnvironment] tool_info exported to %s (tools=%d)",
+                p,
+                len(tool_info),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[SkillTurboEnvironment] _export_tool_info failed: %s", exc
+            )
 
     def build_tool_loader_context(
         self,
@@ -569,6 +624,10 @@ class SkillTurboEnvironment:
         # 扫描 skills_dir 注册所有 skill（内置 + 自定义）。
         self._scan_skills_dir()
 
+        # 外部 turbo code发现注册；同名时外部覆盖内置。
+        # 必须在 _load 编排层独立调用，不能嵌在 _scan_skills_dir 内部
+        self._scan_external_turbo_skills()
+
     def _scan_skills_dir(self) -> None:
         """扫描 ``skill_codes_dir`` 目录注册自定义 skill。
 
@@ -585,25 +644,22 @@ class SkillTurboEnvironment:
             缓存 key 包含目录内所有 .py 的最大 mtime。后续请求若 mtime 未变，
             直接复用缓存的 Skill 实例，跳过磁盘 IO 和 AST 校验。
         """
-        # 优先使用配置的路径，如果无效则回退到默认路径
-        base = Path(self._skill_codes_dir or "")
+        # 空串（config 缺失或显式禁用）：跳过内置扫描（外部 turbo-only 形态）。
+        # 生产每请求都会走到这里，debug 级避免日志噪音。
+        if not self._skill_codes_dir:
+            logger.debug(
+                "[SkillTurboEnvironment] _scan_skills_dir skipped: disabled by empty config"
+            )
+            return
+
+        # 配置了路径但无效：告警并跳过（内置默认目录已随迁移删除，不再回退）
+        base = Path(self._skill_codes_dir)
         if not base.is_dir():
             logger.warning(
                 "[SkillTurboEnvironment] _scan_skills_dir config path not found: %s",
                 self._skill_codes_dir,
             )
-            # 回退到默认路径
-            default_path = Path(_DEFAULT_SKILL_CODES_DIR)
-            if not default_path.is_dir():
-                logger.info(
-                    "[SkillTurboEnvironment] _scan_skills_dir skipped: both config and default paths not found"
-                )
-                return
-            base = default_path
-            logger.info(
-                "[SkillTurboEnvironment] _scan_skills_dir fallback to default path: %s",
-                base,
-            )
+            return
 
         # mtime 缓存：未变则复用上次扫描结果，跳过扫盘 + AST 校验
         cache_key = str(base.resolve())
@@ -645,12 +701,15 @@ class SkillTurboEnvironment:
                 # 构建 plan_code
                 plan_code = self._build_plan_code(skill_name, root_file)
 
+                # 路由元数据：meta.json > 默认（目录名作 description/keyword）
+                meta = load_skill_meta(skill_name, skill_dir)
                 skill = Skill(
                     name=skill_name,
-                    description=f"{skill_name} 任务流",
+                    description=str(meta.get("description") or f"{skill_name} 任务流"),
                     skill_md="",
                     plan_code=plan_code,
-                    match_keywords=[skill_name],
+                    match_keywords=list(meta.get("match_keywords") or [skill_name]),
+                    external_name=str(meta.get("external_name") or "").strip(),
                 )
                 # 注册技能（使用技能名作为默认描述和匹配关键词）
                 self.register_skill(skill)
@@ -671,17 +730,107 @@ class SkillTurboEnvironment:
         if current_mtime > 0.0:
             self._scan_cache[cache_key] = (current_mtime, scanned_skills)
 
-        # [TEMP-EXTERNAL-SKILL] 在框架层完成 SHA256 校验，结果注入到 inputs 供 skill_code 读取。
-        # 校验目标：{skill_root}/{skill_name} 子目录（如 office-claw-skills/pptx-craft），
-        # 而非整个 skill_root 根目录（根目录包含多个 skill，任一变更都会导致校验失败）。
-        if self._skill_root:
-            skill_dir = str(Path(self._skill_root) / self._skill_name)
-            self._skill_checksum_ok = _verify_skill_checksum(
-                skill_dir, self._skill_checksum
+    def _scan_external_turbo_skills(self) -> None:
+        """扫描已注册技能目录下各技能的 turbo/turbo_codes，注册外部 skill。
+
+        约定即协议：{skill_root}/{external_name}/turbo/turbo_codes/{skill_name}/
+        存在入口文件即视为加速面（无技能清单硬编码）。外部 skill 同名时
+        覆盖内置注册（外部优先）。
+
+        缓存：roots 绝对路径 frozenset 为 key，各 turbo_codes 目录
+        max .py mtime 快照失效。
+        """
+        from jiuwenswarm.server.runtime.skill_turbo.turbo_package_loader import (
+            discover_external_turbo_skills,
+            ensure_turbo_package,
+        )
+
+        try:
+            from jiuwenswarm.common.utils import resolve_agent_registered_skill_dirs
+
+            roots = [Path(p) for p in resolve_agent_registered_skill_dirs()]
+        except Exception as exc:
+            logger.debug(
+                "[SkillTurboEnvironment] external scan: resolve dirs failed: %s", exc
             )
-        else:
-            # skill_root 未解析时跳过校验（默认 True）
-            self._skill_checksum_ok = True
+            return
+        if not roots:
+            return
+
+        cache_key = frozenset(str(p.resolve()) for p in roots if p.is_dir())
+        if not cache_key:
+            return
+
+        try:
+            discovered = discover_external_turbo_skills(skill_roots=roots)
+            mtime_snapshot = {
+                item.turbo_codes_dir: self._compute_skill_codes_mtime(
+                    Path(item.turbo_codes_dir)
+                )
+                for item in discovered
+            }
+        except Exception as exc:
+            logger.warning(
+                "[SkillTurboEnvironment] external scan failed: %s", exc, exc_info=True
+            )
+            return
+
+        cached = self._external_scan_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_snapshot:
+            for skill in cached[1]:
+                ensure_turbo_package(skill.name, skill.turbo_codes_dir)
+                self.register_skill(skill)
+            return
+
+        if not discovered:
+            logger.warning(
+                "[SkillTurboEnvironment] external turbo scan: skill dirs configured "
+                "but no turbo skills discovered; acceleration will degrade to "
+                "standard flow. roots=%s",
+                [str(p) for p in roots],
+            )
+
+        scanned: list[Skill] = []
+        for item in discovered:
+            skill_dir = Path(item.turbo_codes_dir) / item.skill_name
+            if not self._validate_skill_code_dir(
+                item.skill_name,
+                skill_dir,
+                validator=self._validator_for_external_skill(item.skill_name),
+            ):
+                continue
+            package_name = ensure_turbo_package(item.skill_name, item.turbo_codes_dir)
+            if not package_name:
+                logger.warning(
+                    "[SkillTurboEnvironment] external turbo skill=%s rejected: "
+                    "package name collision",
+                    item.skill_name,
+                )
+                continue
+            skill = Skill(
+                name=item.skill_name,
+                description=str(
+                    item.meta.get("description") or f"{item.skill_name} 任务流"
+                ),
+                skill_md="",
+                plan_code=None,  # 外部 skill 由 planner 按入口文件动态组装
+                match_keywords=list(
+                    item.meta.get("match_keywords") or [item.skill_name]
+                ),
+                external_name=item.external_name,
+                package_name=package_name,
+                turbo_codes_dir=item.turbo_codes_dir,
+            )
+            self.register_skill(skill)
+            scanned.append(skill)
+            logger.info(
+                "[SkillTurboEnvironment] external turbo registered skill=%s "
+                "external=%s package=%s",
+                item.skill_name,
+                item.external_name,
+                package_name,
+            )
+        self._external_scan_cache[cache_key] = (mtime_snapshot, scanned)
 
     @staticmethod
     def _compute_skill_codes_mtime(base: Path) -> float:
@@ -704,8 +853,37 @@ class SkillTurboEnvironment:
             return 0.0
         return max(mtimes, default=0.0)
 
-    def _validate_skill_code_dir(self, skill_name: str, skill_dir: Path) -> bool:
-        """加载 skill 时校验目录内所有 Python 代码。"""
+    def _validator_for_external_skill(self, skill_name: str) -> PlanCodeValidator:
+        """外部 turbo skill 专用 validator：内置前缀 + 该技能自身动态包前缀"""
+        from jiuwenswarm.server.runtime.skill_turbo.turbo_package_loader import (
+            dynamic_package_prefix,
+            is_dynamic_package_prefix,
+        )
+
+        pkg_prefix = dynamic_package_prefix(skill_name)
+        prefixes = [
+            p
+            for p in self.skill_code_import_prefixes
+            if not is_dynamic_package_prefix(p)
+        ]
+        prefixes.append(pkg_prefix)
+        return PlanCodeValidator.for_skill_code(
+            allowed_import_prefixes=prefixes
+        )
+
+    def _validate_skill_code_dir(
+        self,
+        skill_name: str,
+        skill_dir: Path,
+        *,
+        validator: PlanCodeValidator | None = None,
+    ) -> bool:
+        """加载 skill 时校验目录内所有 Python 代码。
+
+        ``validator`` 缺省用 ``_skill_code_validator``（内置扫描路径）；
+        外部 turbo 扫描路径传入经 ``_validator_for_external_skill``
+        构造的专用 validator（含该技能自身动态包前缀）。
+        """
         if not skill_dir.is_dir():
             logger.warning(
                 "[SkillTurboEnvironment] skill_code validation failed: skill=%s dir not found: %s",
@@ -730,7 +908,7 @@ class SkillTurboEnvironment:
                 success = False
                 continue
 
-            errors = self._skill_code_validator.validate(code)
+            errors = (validator or self._skill_code_validator).validate(code)
             if errors:
                 logger.warning(
                     "[SkillTurboEnvironment] skill_code validation failed: skill=%s file=%s errors=%s",
@@ -752,32 +930,8 @@ class SkillTurboEnvironment:
 
     @staticmethod
     def _find_skill_root_file(skill_dir: Path) -> Path | None:
-        """查找技能入口文件。
-
-        优先级：
-            1. {skill_name}_gen_root.py
-            2. {skill_name}_root.py
-            3. 任意 *_gen_root.py（按名称排序）
-            4. 任意 *_root.py（按名称排序）
-            5. plan_code.py（兜底入口，须与 planner._find_skill_root_file 保持一致）
-        """
-        skill_name = skill_dir.name
-        candidates = [
-            skill_dir / f"{skill_name}_gen_root.py",
-            skill_dir / f"{skill_name}_root.py",
-            *sorted(skill_dir.glob("*_gen_root.py")),
-            *sorted(skill_dir.glob("*_root.py")),
-            skill_dir / "plan_code.py",
-        ]
-
-        seen: set[Path] = set()
-        for candidate in candidates:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            if candidate.is_file():
-                return candidate
-        return None
+        """查找技能入口文件（委托模块级 find_skill_root_file，单一实现）。"""
+        return find_skill_root_file(skill_dir)
 
     def _build_plan_code(self, skill_name: str, root_file: Path) -> str:
         """构建技能的 plan_code。"""
