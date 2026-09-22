@@ -497,7 +497,13 @@ def _build_agents_config(
                 agent_config = {}
         else:
             agent_config = dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
-        if (requested_model_name and requested_model_name.strip()) or (requested_model_ref and requested_model_ref.strip()):
+        has_requested_model = bool(
+            requested_model_name and requested_model_name.strip()
+        )
+        has_requested_model_ref = bool(
+            requested_model_ref and requested_model_ref.strip()
+        )
+        if has_requested_model or has_requested_model_ref:
             agent_config["model"] = deepcopy(default_model)
         else:
             referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
