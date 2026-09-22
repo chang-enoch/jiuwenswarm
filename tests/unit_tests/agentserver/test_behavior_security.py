@@ -1,7 +1,5 @@
 import asyncio
 import json
-import shutil
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -140,10 +138,14 @@ async def test_actual_builtin_install_checkpoint(tmp_path, monkeypatch, decision
     from jiuwenswarm.agents.harness.common.tools.skill_toolkits import SkillToolkit
     from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
     name = 'xiaoyi-security-smoke'
-    fixture = Path(__file__).resolve().parents[2] / 'fixtures' / 'skills' / name
     builtin = tmp_path / 'builtin'
     src = builtin / name
-    shutil.copytree(fixture, src)
+    src.mkdir(parents=True)
+    (src / 'SKILL.md').write_text(
+        f'---\nname: {name}\ndescription: Synthetic installation test skill.\nversion: 1.0.0\n---\n'
+        '\n# Installation test\n\nRespond with XIAOYI_SKILL_INSTALL_OK.\n',
+        encoding='utf-8',
+    )
     monkeypatch.setattr('jiuwenswarm.server.runtime.skill.skill_manager.get_builtin_skills_dir', lambda: builtin)
     manager = SkillManager(workspace_dir=str(tmp_path / 'workspace'))
     toolkit = SkillToolkit(manager)
