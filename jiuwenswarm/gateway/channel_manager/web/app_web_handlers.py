@@ -639,6 +639,8 @@ _FORWARD_REQ_METHODS = frozenset({
     "command.goal",
     "chat.send",
     "chat.interrupt",
+    "chat.steer",
+    "chat.steer.status",
     "chat.resume",
     "chat.user_answer",
     "history.get",
@@ -746,6 +748,8 @@ _FORWARD_REQ_METHODS = frozenset({
 })
 
 _FORWARD_NO_LOCAL_HANDLER_METHODS = frozenset({
+    "chat.steer",
+    "chat.steer.status",
     "initialize",
     "session.create",
     "session.switch",

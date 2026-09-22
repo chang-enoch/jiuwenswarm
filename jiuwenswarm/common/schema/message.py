@@ -12,6 +12,8 @@ class ReqMethod(Enum):
     ACP_TOOL_RESPONSE = "acp.tool_response"
 
     CHAT_SEND = "chat.send"
+    CHAT_STEER = "chat.steer"
+    CHAT_STEER_STATUS = "chat.steer.status"
     CHAT_RESUME = "chat.resume"
     CHAT_CANCEL = "chat.interrupt"
     CHAT_ANSWER = "chat.user_answer"

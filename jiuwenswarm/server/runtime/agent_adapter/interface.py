@@ -2507,6 +2507,14 @@ class JiuWenSwarm:
         plan_language = str(params.get("plan_language") or "").strip().lower()
         return plan_language in {"cn", "en"}
 
+    def owns_steering_request(self, request: AgentRequest) -> bool:
+        check = getattr(self._adapter, "owns_steering_request", None)
+        return callable(check) and check(request)
+
+    async def process_steering(self, request: AgentRequest, *, query: bool) -> dict[str, Any]:
+        # Pure lookup: do not ensure an adapter, prepare a turn, or attach output.
+        return await self._adapter.process_steering(request, query=query)
+
     async def process_message(self, request: AgentRequest) -> AgentResponse:
         """处理非流式请求.
 

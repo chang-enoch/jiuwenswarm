@@ -140,6 +140,7 @@ from jiuwenswarm.agents.harness.common.tools.deepresearch.deepresearch_rewrite_h
 
 if TYPE_CHECKING:
     from openjiuwen.harness.schema.config import SubAgentConfig
+    from jiuwenswarm.server.runtime.agent_adapter.steering import SteeringSession
     from jiuwenswarm.server.runtime.agent_config_service import AgentDefinition
 
 GOAL_UPDATED_EVENT_TYPE = InteractionEventType.GOAL_UPDATED.value
@@ -2476,6 +2477,7 @@ class JiuWenSwarmDeepAdapter:
         self._audio_tools: list[Any] = []
         self._instance_overrides: dict[str, Any] = {}
         self._is_session_scoped_adapter: bool = False
+        self._steering_control: SteeringSession | None = None
         self._parent_session_id: str | None = None
         # Active request-scoped OfficeClaw MCP registration for this session
         # adapter. Used for safe short-name cleanup and diagnostics; invoke
@@ -18632,7 +18634,65 @@ class JiuWenSwarmDeepAdapter:
             metadata=request.metadata,
         )
 
+    async def _resolve_steering_runtime(self, mode: str, channel_id: str) -> Any:
+        from jiuwenswarm.server.runtime.agent_adapter.steering import TEAM_MODES
+
+        if mode in TEAM_MODES:
+            from jiuwenswarm.agents.harness.team.team_manager import peek_team_manager
+
+            manager = peek_team_manager()
+            if manager is None:
+                return None
+            return await manager.get_active_steering_leader(self._parent_session_id)
+        return self._instance
+
+    def owns_steering_request(self, request: AgentRequest) -> bool:
+        adapter = self if self._is_session_scoped_adapter else self._get_cached_session_adapter(request.session_id)
+        control = getattr(adapter, "_steering_control", None)
+        return control is not None and control.owns(request)
+
+    async def process_steering(self, request: AgentRequest, *, query: bool) -> dict[str, Any]:
+        adapter = self if self._is_session_scoped_adapter else self._get_cached_session_adapter(request.session_id)
+        control = getattr(adapter, "_steering_control", None)
+        if control is None:
+            return {"status": "unknown"} if query else {"status": "not_applied", "reason": "RUN_NOT_ACTIVE"}
+        return await control.handle(request, query=query)
+
+    def _should_bind_steering_request(
+        self, request: AgentRequest, inputs: dict[str, Any]
+    ) -> bool:
+        from jiuwenswarm.server.runtime.agent_adapter.team_helpers import is_team_control_continuation
+
+        if (
+            not self._is_session_scoped_adapter
+            or request.req_method not in (ReqMethod.CHAT_SEND, ReqMethod.CHAT_RESUME)
+            or self._should_inject_into_existing_interaction(request.params)
+        ):
+            return False
+        if self._is_subagent_approval_answer(
+            str((request.params or {}).get("request_id") or ""), request.params
+        ):
+            return False
+        return not is_team_control_continuation(request, inputs.get("query"))
+
     async def process_message_stream_impl(
+        self, request: AgentRequest, inputs: dict[str, Any]
+    ) -> AsyncIterator[AgentResponseChunk]:
+        from jiuwenswarm.server.runtime.agent_adapter.steering import SteeringSession
+
+        binding = None
+        if self._should_bind_steering_request(request, inputs):
+            if getattr(self, "_steering_control", None) is None:
+                self._steering_control = SteeringSession(self._resolve_steering_runtime)
+            binding = self._steering_control.bind_request(request)
+        try:
+            async for chunk in self._process_message_stream_impl(request, inputs):
+                yield chunk
+        finally:
+            if binding is not None:
+                await self._steering_control.finish_request(binding)
+
+    async def _process_message_stream_impl(
         self, request: AgentRequest, inputs: dict[str, Any]
     ) -> AsyncIterator[AgentResponseChunk]:
         """Execute a streaming request; yield response chunks.
@@ -20691,6 +20751,22 @@ class JiuWenSwarmDeepAdapter:
             if hasattr(chunk, "type") and hasattr(chunk, "payload"):
                 chunk_type = chunk.type
                 payload = chunk.payload
+
+                if chunk_type == "steering_consumed":
+                    # Only the root/leader receipt may divide the user's main
+                    # conversation. A member's private input is not root input.
+                    role = getattr(chunk, "role", None)
+                    role_value = getattr(role, "value", role)
+                    if role is not None and str(role_value).strip().lower() != "leader":
+                        return None
+                    input_ids = payload.get("input_ids") if isinstance(payload, dict) else None
+                    if (not isinstance(input_ids, list) or not input_ids
+                            or any(not isinstance(value, str) or not value.strip() for value in input_ids)):
+                        return None
+                    return {
+                        "event_type": "chat.steering_consumed",
+                        "input_ids": list(dict.fromkeys(input_ids)),
+                    }
 
                 if chunk_type == GOAL_UPDATED_EVENT_TYPE:
                     return JiuWenSwarmDeepAdapter._interaction_goal_updated_payload(payload)
