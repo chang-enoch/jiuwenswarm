@@ -744,8 +744,34 @@ def redo_session_files(
     }
 
 
+def _is_member_history_record(record: dict[str, Any]) -> bool:
+    """团队成员归因记录判定：member_name 顶层字段或 member-* request_id 前缀。
+
+    与 context_handoff.is_member_history_record 同口径（那边面向前情注入，
+    这边面向上下文重建净化；各自独立避免跨模块耦合）。
+    """
+    if str(record.get("member_name") or "").strip():
+        return True
+    return str(record.get("request_id") or "").startswith("member-")
+
+
+# 成员产出注记的截断长度（与 context_handoff 的交接口径一致）
+_MEMBER_OUTPUT_NOTE_CHARS = 200
+
+# 团队期身份复位注记：净化重建（drop_member_internals=True）且历史中含团队期
+# 记录（mode=team 顶层字段或成员归因记录）时，追加在恢复消息序列末尾——
+# 团队期 leader 答复（主理人口吻）逐字回归为"助手自己说过的话"，不给锚点
+# 默认角色会把主理人身份当成自己的口吻延续。
+_TEAM_IDENTITY_RESET_NOTE = (
+    "（注：以上包含你此前以专家团主理人身份与用户协作期间的对话记录；"
+    "自本条之后你已恢复为默认助手身份，请以默认助手身份继续与用户对话。）"
+)
+
+
 def _build_context_messages_from_history(
-    history_records: list[dict[str, Any]],
+        history_records: list[dict[str, Any]],
+        *,
+        drop_member_internals: bool = False,
 ) -> tuple[list[Any], int]:
     """Convert history.jsonl records into a list of openjiuwen BaseMessage.
 
@@ -771,6 +797,14 @@ def _build_context_messages_from_history(
     tool_call/tool_result structure, and final text to fully reconstruct
     the conversation context for the LLM.
 
+    ``drop_member_internals``：团队模式历史混入成员归因记录
+    （member_name / member-* request_id）。默认 False 保真重建（rewind 等
+    场景不变）；True 时成员内部工具/推理事件丢弃（否则被当成主 agent 自己
+    的 tool_calls 注入，角色错乱），成员 chat.final 折叠为带归属的 assistant
+    注记（截断 200 字），且若历史中含团队期记录（mode=team 或成员归因），
+    在恢复序列末尾追加身份复位注记（_TEAM_IDENTITY_RESET_NOTE），防止
+    主理人口吻被默认角色当作自己的历史口吻延续。refresh/warmup 路径传 True。
+
     State machine:
       - reasoning_buffer: accumulates chat.reasoning text chunks
       - current_tool_calls: collects tool_calls for the current LLM call
@@ -791,6 +825,8 @@ def _build_context_messages_from_history(
     skipped = 0
     reasoning_buffer: list[str] = []
     current_tool_calls: list[dict[str, Any]] = []
+    # 团队期记录检出（身份复位注记用）：mode=team 顶层字段或成员归因记录
+    saw_team_era = False
     # Track all tool_call_ids that have been emitted in AssistantMessages.
     # Used to detect orphaned tool_results (e.g. ask_user's preliminary
     # empty result that arrives before the actual chat.tool_call event).
@@ -824,6 +860,30 @@ def _build_context_messages_from_history(
                 if isinstance(p, str) or (isinstance(p, dict) and p.get("type") == "text")
             )
         content = str(content)
+
+        if not saw_team_era and (
+            str(record.get("mode") or "") == "team"
+            or _is_member_history_record(record)
+        ):
+            saw_team_era = True
+
+        # ── 团队模式成员归因记录净化（drop_member_internals）──
+        # 成员内部工具/推理事件若按主 agent 自己的行为重建，模型会看到"自己"
+        # 调用了从未拥有的团队工具（角色错乱）；成员可见产出折叠为归属注记。
+        if drop_member_internals and _is_member_history_record(record):
+            if role == "assistant" and event_type == "chat.final" and content.strip():
+                if reasoning_buffer or current_tool_calls:
+                    _flush_pending_assistant()
+                member_name = str(record.get("member_name") or "").strip() or "成员"
+                note_text = content.strip()
+                if len(note_text) > _MEMBER_OUTPUT_NOTE_CHARS:
+                    note_text = note_text[:_MEMBER_OUTPUT_NOTE_CHARS].rstrip() + "…"
+                context_messages.append(AssistantMessage(
+                    content=f"（团队成员 {member_name} 的产出）：{note_text}",
+                ))
+            else:
+                skipped += 1
+            continue
 
         # ── User message ──
         if role == "user":
@@ -963,6 +1023,13 @@ def _build_context_messages_from_history(
             "_build_context_messages_from_history: removed %d unresolved tool_call(s)",
             removed_unresolved,
         )
+
+    # 团队期身份复位注记：仅净化重建路径（drop_member_internals=True）且历史
+    # 确实含团队期记录时追加，作为序列末条——leader 的主理人口吻答复逐字回归
+    # 后，给默认角色一个明确的身份切换锚点。注记只进内存上下文，不回写
+    # history.jsonl；后处理只过滤 unresolved tool_calls，不受影响。
+    if drop_member_internals and saw_team_era:
+        filtered_messages.append(AssistantMessage(content=_TEAM_IDENTITY_RESET_NOTE))
 
     return filtered_messages, skipped
 
@@ -1104,11 +1171,11 @@ async def _add_messages_to_context(context: Any, messages: list[Any]) -> None:
 
 
 async def _append_peer_history_to_context(
-    *,
-    deep_agent: "DeepAgent",
-    session_id: str,
-    delta_records: list[Any],
-    log_label: str,
+        *,
+        deep_agent: "DeepAgent",
+        session_id: str,
+        delta_records: list[Any],
+        log_label: str,
 ) -> bool:
     """Append peer turns onto the live compressed window. Do not rebuild or persist."""
     react_agent = getattr(deep_agent, "react_agent", None)
@@ -1125,7 +1192,10 @@ async def _append_peer_history_to_context(
     if not delta_records:
         return True
 
-    context_messages, skipped = _build_context_messages_from_history(delta_records)
+    # refresh 场景面向"主 agent 视角的续聊上下文"：成员内部事件净化
+    context_messages, skipped = _build_context_messages_from_history(
+        delta_records, drop_member_internals=True
+    )
     if not context_messages:
         logger.info(
             "%s: delta had no rebuildable messages session=%s skipped=%d",
@@ -1179,11 +1249,12 @@ async def _persist_session_context(
 
 
 async def _restore_session_context_from_history(
-    *,
-    deep_agent: "DeepAgent",
-    session_id: str,
-    history_records: list[Any],
-    log_label: str = "warmup_session_context",
+        *,
+        deep_agent: "DeepAgent",
+        session_id: str,
+        history_records: list[Any],
+        log_label: str = "warmup_session_context",
+        drop_member_internals: bool = False,
 ) -> bool:
     """Cold-start restore: create_context from history records. Does not clear a live window."""
     react_agent = getattr(deep_agent, "react_agent", None)
@@ -1194,7 +1265,9 @@ async def _restore_session_context_from_history(
     if not isinstance(history_records, list) or not history_records:
         return False
 
-    context_messages, skipped = _build_context_messages_from_history(history_records)
+    context_messages, skipped = _build_context_messages_from_history(
+        history_records, drop_member_internals=drop_member_internals
+    )
     if not context_messages:
         logger.info("%s: no rebuildable messages in history for %s", log_label, session_id)
         return False
@@ -1239,7 +1312,7 @@ async def warmup_session_context(
     deep_agent: "DeepAgent",
     session_id: str,
     exclude_request_id: str | None = None,
-) -> bool:
+) -> str | None:
     """Restart-safe restore of context_engine messages.
 
     在新建 session adapter（``start_interaction`` 之后）调用。恢复顺序：
@@ -1254,20 +1327,30 @@ async def warmup_session_context(
     ``chat.send`` 会在 adapter 冷启动前先把当前用户消息持久化。调用方可传入
     ``exclude_request_id``，使 warmup 仅恢复此前历史；当前轮仍由正常的 inputs
     路径注入一次，避免首轮在模型上下文中重复。
+
+    返回本次恢复覆盖到的 history 尾 request_id，供调用方作 synced 指纹：
+    - 快照恢复 → 快照尾指纹（session metadata ``context_snapshot_tail``；
+      老会话无记录回退磁盘尾=旧行为）。快照可能停在团队期之前（团队轮次不
+      经默认 agent、不写其快照），若回退磁盘尾会让 refresh 误判"已同步"，
+      团队期增量永远补不回来——快照尾指纹即为此而设。
+    - 历史重灌 → 重灌记录的尾（已排除在途请求）。
+    - 未恢复（全新会话/失败）→ None。
     """
     react_agent = getattr(deep_agent, "react_agent", None)
     if react_agent is None:
         logger.warning("warmup_session_context: no react_agent for %s", session_id)
-        return False
+        return None
 
     context_engine = react_agent.context_engine
     if context_engine.get_context(session_id=session_id) is not None:
         # 内存上下文已存在（进程未重启 / 已 warmup / rewind 重建过）
-        return True
+        return load_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
 
     if not history_exists(session_id):
         # 全新会话，磁盘无历史，静默跳过
-        return False
+        return None
 
     session = resolve_live_agent_session(deep_agent, session_id)
     if session is None:
@@ -1281,7 +1364,7 @@ async def warmup_session_context(
             await session.pre_run(inputs=None)
         except Exception as exc:
             logger.warning("warmup_session_context: pre_run failed for %s: %s", session_id, exc)
-            return False
+            return None
 
     # ── 优先：从持久化 checkpointer 恢复压缩后的 context ──
     # create_context 不带 history_messages → _load_state_from_session 恢复压缩
@@ -1292,28 +1375,40 @@ async def warmup_session_context(
         react_agent=react_agent,
         session_id=session_id,
     ):
-        return True
+        from jiuwenswarm.server.runtime.session.session_metadata import (
+            get_context_snapshot_tail,
+        )
+
+        return get_context_snapshot_tail(session_id) or load_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
 
     # ── 兜底：checkpointer 无可用快照时，从磁盘 history.jsonl 全量重灌 ──
     try:
         history_records = load_history_records(session_id)
     except OSError as exc:
         logger.warning("warmup_session_context: failed to read history for %s: %s", session_id, exc)
-        return False
+        return None
 
     if not isinstance(history_records, list) or not history_records:
-        return False
+        return None
 
     history_records = _exclude_history_request_id(history_records, exclude_request_id)
     if not history_records:
-        return False
+        return None
 
-    return await _restore_session_context_from_history(
+    restored = await _restore_session_context_from_history(
         deep_agent=deep_agent,
         session_id=session_id,
         history_records=history_records,
         log_label="warmup_session_context",
+        # warmup 面向"主 agent 续聊"：团队成员内部事件净化；
+        # rewind 的同名调用保持默认 False（保真重建是有意契约）
+        drop_member_internals=True,
     )
+    if not restored:
+        return None
+    return history_tail_request_id(history_records)
 
 
 async def refresh_session_context_if_stale(
@@ -1351,11 +1446,15 @@ async def refresh_session_context_if_stale(
 
     context_engine = react_agent.context_engine
     if context_engine.get_context(session_id=session_id) is None:
-        await warmup_session_context(
+        warmed_tail = await warmup_session_context(
             deep_agent=deep_agent,
             session_id=session_id,
             exclude_request_id=exclude_request_id,
         )
+        if warmed_tail is not None:
+            # warmup 自报覆盖尾：快照恢复时可能是快照尾（早于磁盘尾），
+            # 原样返回让调用方存为指纹，下一问 refresh 才能把增量补回
+            return warmed_tail
         return disk_tail if disk_tail is not None else synced
 
     if disk_tail is None or disk_tail == synced:
@@ -1375,14 +1474,58 @@ async def refresh_session_context_if_stale(
     delta = _slice_history_after_fingerprint(filtered, synced)
     log_label = "refresh_session_context_if_stale"
     if delta is None:
+        # 指纹失效（rewind 截断/历史轮换等）旧行为是 WARNING 后放弃同步——
+        # 上下文凭空停更且无任何恢复。改为全量重建兜底：活窗内容本就源自
+        # 磁盘历史（在途请求由 exclude_request_id 排除在外），清窗重建不丢数据
         logger.warning(
-            "%s: fingerprint missing from history session=%s disk_tail=%s previous=%s",
+            "%s: fingerprint missing from history session=%s disk_tail=%s previous=%s; "
+            "falling back to full rebuild",
             log_label,
             session_id,
             disk_tail,
             synced,
         )
-        return synced
+        try:
+            await context_engine.clear_context(session_id=session_id)
+        except Exception as exc:
+            logger.warning(
+                "%s: clear_context before rebuild failed session=%s: %s",
+                log_label,
+                session_id,
+                exc,
+            )
+            return synced
+        rebuilt = await _restore_session_context_from_history(
+            deep_agent=deep_agent,
+            session_id=session_id,
+            history_records=filtered,
+            log_label=log_label,
+            drop_member_internals=True,
+        )
+        if not rebuilt:
+            return synced
+        session = resolve_live_agent_session(deep_agent, session_id)
+        if session is None:
+            logger.warning(
+                "%s: no live session to persist rebuilt context for %s",
+                log_label,
+                session_id,
+            )
+            return synced
+        if not await _persist_session_context(
+            session=session,
+            context_engine=context_engine,
+            session_id=session_id,
+            log_label=log_label,
+        ):
+            return synced
+        logger.info(
+            "%s: session=%s rebuilt context after fingerprint loss disk_tail=%s",
+            log_label,
+            session_id,
+            disk_tail,
+        )
+        return disk_tail
 
     restored = await _append_peer_history_to_context(
         deep_agent=deep_agent,
@@ -1474,7 +1617,7 @@ async def rewind_session_context(
     # live context — otherwise the next chat.send keeps the rewound turns.
     if not history_records:
         logger.info("rewind_session_context: empty history for %s; clearing live context", session_id)
-        return await _apply_rewound_context(
+        applied = await _apply_rewound_context(
             deep_agent=deep_agent,
             react_agent=react_agent,
             session_id=session_id,
@@ -1482,6 +1625,9 @@ async def rewind_session_context(
             context_messages=[],
             skipped=0,
         )
+        if applied:
+            _record_snapshot_tail(session_id, None)
+        return applied
 
     # --- 2. Convert history.json records → openjiuwen BaseMessage list ---
     context_messages, skipped = _build_context_messages_from_history(history_records)
@@ -1494,7 +1640,7 @@ async def rewind_session_context(
             content="[Continue from where the conversation was rewound.]"
         ))
 
-    return await _apply_rewound_context(
+    applied = await _apply_rewound_context(
         deep_agent=deep_agent,
         react_agent=react_agent,
         session_id=session_id,
@@ -1502,6 +1648,32 @@ async def rewind_session_context(
         context_messages=context_messages,
         skipped=skipped,
     )
+    if applied:
+        # rewind 已提交快照：快照覆盖尾回收到截断后的历史尾，
+        # 否则 warmup 快照恢复会拿着截断前的指纹让 refresh 误判
+        _record_snapshot_tail(session_id, history_tail_request_id(history_records))
+    return applied
+
+
+def _record_snapshot_tail(session_id: str, tail_request_id: Any) -> None:
+    """快照尾指纹维护的安全包装：失败仅告警（ rewind 等主流程不受影响）。"""
+    try:
+        from jiuwenswarm.server.runtime.session.session_metadata import (
+            clear_context_snapshot_tail,
+            set_context_snapshot_tail,
+        )
+
+        if tail_request_id:
+            set_context_snapshot_tail(session_id, tail_request_id)
+        else:
+            clear_context_snapshot_tail(session_id)
+    except Exception as exc:
+        logger.warning(
+            "record snapshot tail failed: session=%s tail=%s error=%s",
+            session_id,
+            tail_request_id,
+            exc,
+        )
 
 
 def resolve_live_agent_session(deep_agent: "DeepAgent", session_id: str) -> Any | None:

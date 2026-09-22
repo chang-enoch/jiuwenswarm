@@ -20,11 +20,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from jiuwenswarm.server.runtime.agent_adapter.context_handoff import (
+    try_clear_context_handoff_marker,
+    try_set_context_handoff_marker,
+)
 from jiuwenswarm.server.runtime.expert import expert_store as _expert_store
 
 logger = logging.getLogger(__name__)
 
-_BUSY_MESSAGE = "当前回合执行中，请等回合结束"
+_BUSY_MESSAGE = "任务正在执行中，请等待完成后再试"
 
 # 专家团专用基础模板：config modes.team.expert_group 存在时优先，否则回退默认模板
 _EXPERT_GROUP_TEMPLATE_ID = "expert_group"
@@ -41,6 +45,23 @@ def read_package_type(package_dir: Path) -> str:
     if isinstance(manifest, dict) and manifest.get("package_type") == "agent_group":
         return "team"
     return "agent"
+
+
+def _handoff_from_label(previous_expert_id: str, previous_expert_type: str) -> str:
+    """前情块的来源角色标注：装团前任是谁，前情块就如实写谁接待过用户。
+
+    通用问答（无前任专家）→「通用助手」；单专家→「专家「XX」」（显示名解析
+    失败兜底「单专家」）；换团→「另一个专家团」。标注防 leader 把前任角色
+    的口吻/承诺误认成自己说的（人设穿帮）。
+    """
+    if previous_expert_type == "team":
+        return "另一个专家团"
+    if previous_expert_id:
+        name = _resolve_expert_display_name(
+            previous_expert_id, previous_expert_type or "agent"
+        )
+        return f"专家「{name}」" if name else "单专家"
+    return "通用助手"
 
 
 # ---- 历史消息专家身份快照（按消息落盘"当时是谁答的"） ----
@@ -501,6 +522,13 @@ class ExpertService:
             session_id, expert_id, team_name, team_template_id or "default",
             previous_expert_id, previous_expert_type,
         )
+        # 模式切换上下文交接：会话已有历史时打标记，
+        # 下个团队首轮把切换前的前情注入 leader 用户输入
+        try_set_context_handoff_marker(
+            session_id,
+            team_name=team_name,
+            from_label=_handoff_from_label(previous_expert_id, previous_expert_type),
+        )
         return ExpertOpResult(
             ok=True,
             payload={
@@ -622,6 +650,8 @@ class ExpertService:
         stopped = await self._stop_team_runtime(session_id, reason="expert.unload")
         # 显式退团：级联清理 team DB（换团不清——换回同团依赖 DB 现场存活）
         cleanup_expert_group_team_db(str(metadata.get("team_name") or ""))
+        # 未首发即卸团：清掉未消费的上下文交接标记，避免残留污染下次装团
+        try_clear_context_handoff_marker(session_id)
         # 退团恢复：按会话 work_mode 查注册表回该模式的单 agent canonical
         # （work→agent / code→code.normal / design→design），修掉"写死回 agent
         # 致 code/design 会话退团降级为 work"的缺陷。

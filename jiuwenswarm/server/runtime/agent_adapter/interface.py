@@ -3202,6 +3202,22 @@ class JiuWenSwarm:
                 content=finalized_assistant_message,
             )
 
+        # 轮末记录快照尾指纹：单 agent 轮次结束时框架侧 save_contexts+commit
+        # 已把上下文快照落库，此处记下本轮 rid 作为快照覆盖尾。团队模式轮次
+        # 不经默认 agent、不写其快照，必须排除——否则快照尾虚报覆盖，
+        # warmup 快照恢复后团队期增量会被误判"已同步"而丢失。
+        if rid and request.params.get("mode") != "team":
+            try:
+                from jiuwenswarm.server.runtime.session.session_metadata import (
+                    set_context_snapshot_tail,
+                )
+
+                set_context_snapshot_tail(session_id, rid)
+            except Exception as exc:
+                logger.warning(
+                    "[session_id=%s] 记录快照尾指纹失败: %s", session_id, exc
+                )
+
         # cloud memory: after chat hook
         if memory_mode == "cloud":
             assistant_message = final_answer_content or "".join(final_answer_chunks)

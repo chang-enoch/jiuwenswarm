@@ -435,6 +435,53 @@ def _enqueue_write(
                 _METADATA_CACHE[session_id] = written.copy()
 
 
+# checkpointer 快照覆盖到的 history 尾（"快照尾指纹"）。
+# 默认 agent 每轮结束由框架侧 save_contexts+commit 落快照，jiuwenswarm 在轮末
+# 把该轮 request_id 记入本 key；warmup 从快照恢复时以它为 synced tail，
+# refresh 才能把"快照之后追加的历史"（典型：团队期记录不经默认 agent，
+# 快照停在装团前）增量补回。无记录（老会话）时调用方回退磁盘尾=旧行为。
+_SNAPSHOT_TAIL_KEY = "context_snapshot_tail"
+
+
+def get_context_snapshot_tail(session_id: str) -> str | None:
+    """读取快照尾指纹；无记录返回 None。"""
+    value = str(_read_metadata(session_id).get(_SNAPSHOT_TAIL_KEY) or "").strip()
+    return value or None
+
+
+def clear_context_snapshot_tail(session_id: str) -> None:
+    """清除快照尾指纹（如 rewind 清空全部历史后，快照覆盖尾归零）。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    metadata = _read_metadata(sid)
+    if _SNAPSHOT_TAIL_KEY not in metadata:
+        return
+    metadata.pop(_SNAPSHOT_TAIL_KEY, None)
+    _enqueue_write(sid, metadata)
+
+
+def set_context_snapshot_tail(session_id: str, request_id: Any) -> None:
+    """轮末记录快照尾指纹（同值短路，同步落盘）。
+
+    只在框架轮末保存（save_contexts+commit）之后调用——记录超前于快照会让
+    refresh 误判"已同步"而丢增量；落后的记录（宕机窗）只会让下次 warmup 后
+    refresh 多补 ≤1 轮增量，方向安全。同步写为把该崩溃窗压到最小。
+    会话目录无 metadata（非常规会话/单测）时静默跳过，不隐式建目录。
+    """
+    sid = (session_id or "").strip()
+    rid = str(request_id or "").strip()
+    if not sid or not rid:
+        return
+    metadata = _read_metadata(sid)
+    if not metadata:
+        return
+    if str(metadata.get(_SNAPSHOT_TAIL_KEY) or "") == rid:
+        return
+    metadata[_SNAPSHOT_TAIL_KEY] = rid
+    _enqueue_write(sid, metadata, sync_write=True)
+
+
 def _auto_title(content: str) -> str:
     """从首条用户消息自动生成会话标题"""
     # 先剥离所有小写 XML 注入标签，
