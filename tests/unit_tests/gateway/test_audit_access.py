@@ -12,6 +12,7 @@ from openjiuwen_runtime.foundation.audit import (
     reset_audit_manager,
 )
 
+from jiuwenswarm.common.audit_gate import is_audit_config_enabled
 from jiuwenswarm.gateway.config.audit.access import (
     apply_audit_log_config_payload,
     apply_audit_log_config_row,
@@ -68,6 +69,8 @@ def test_apply_payload_sets_gateway_service() -> None:
     result = apply_audit_log_config_payload(_sample_body())
     assert result["ok"] is True
     assert result["service"] == "gateway"
+    assert result["source"] == "db"
+    assert is_audit_config_enabled() is True
     cfg = get_audit_manager().config
     assert cfg.service == "gateway"
     assert cfg.identity.system_code == "JIUWEN"
@@ -95,9 +98,12 @@ def test_apply_row_uses_body() -> None:
     assert get_audit_manager().config.identity.system_code == "FROM-ROW"
 
 
-def test_apply_none_restores_default_with_gateway_service() -> None:
+def test_apply_none_disables_emit_with_gateway_service() -> None:
     apply_audit_log_config_payload(_sample_body(system_code="TMP"))
-    apply_audit_log_config_payload(None)
+    assert is_audit_config_enabled() is True
+    result = apply_audit_log_config_payload(None)
+    assert result["source"] == "disabled"
+    assert is_audit_config_enabled() is False
     cfg = get_audit_manager().config
     assert cfg.service == "gateway"
     assert cfg.identity.system_code == "-"
@@ -130,7 +136,26 @@ async def test_reload_from_db_prefers_repository(monkeypatch) -> None:
         monkeypatch.setattr("jiuwenswarm.edition.is_enterprise", lambda: True)
         result = await reload_audit_log_config_from_db()
         assert result["ok"] is True
+        assert result["source"] == "db"
+        assert is_audit_config_enabled() is True
         assert get_audit_manager().config.identity.system_code == "COLD"
         assert get_audit_manager().config.service == "gateway"
+    finally:
+        clear_enterprise_record_repositories()
+
+
+@pytest.mark.asyncio
+async def test_reload_from_empty_db_disables_emit(monkeypatch) -> None:
+    store = InMemoryPersistentBackend()
+    repo = EnterpriseRecordRepository(store, "audit_log_config", instance_id="")
+    set_enterprise_record_repository("audit_log_config", repo)
+    try:
+        apply_audit_log_config_payload(_sample_body())
+        assert is_audit_config_enabled() is True
+        monkeypatch.setattr("jiuwenswarm.edition.is_enterprise", lambda: True)
+        result = await reload_audit_log_config_from_db()
+        assert result["ok"] is True
+        assert result["source"] == "disabled"
+        assert is_audit_config_enabled() is False
     finally:
         clear_enterprise_record_repositories()
