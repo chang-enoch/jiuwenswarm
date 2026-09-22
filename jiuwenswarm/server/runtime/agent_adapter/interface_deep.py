@@ -6651,7 +6651,7 @@ class JiuWenSwarmDeepAdapter:
         model_ref = str(request.params.get("model_ref") or "").strip()
         if model_ref:
             model = self._resolve_model_by_identity(model_ref)
-            actual = str(getattr(model.model_client_config, "model_name", "") or "").strip()
+            actual = str(getattr(model.model_config, "model_name", "") or "").strip()
             if requested and requested != actual:
                 raise ValueError(
                     f"model_name does not match model_ref: expected {requested!r}, found {actual!r}"

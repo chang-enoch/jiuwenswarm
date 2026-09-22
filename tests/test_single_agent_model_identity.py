@@ -15,15 +15,16 @@ def _adapter(*models):
     adapter._model_identity_to_keys = {}
     for i, model in enumerate(models):
         config = model.model_client_config
-        ref = build_model_identity_reference(config.model_name, vars(config))
+        ref = build_model_identity_reference(model.model_config.model_name, vars(config))
         adapter._model_identity_to_keys.setdefault(ref, []).append(f"glm-5.3#{i}")
     return adapter
 
 
 def _model(base, name="glm-5.3"):
-    return SimpleNamespace(model_client_config=SimpleNamespace(
-        api_base=base, model_name=name, client_provider="OpenAI"
-    ))
+    return SimpleNamespace(
+        model_client_config=SimpleNamespace(api_base=base, client_provider="OpenAI"),
+        model_config=SimpleNamespace(model_name=name),
+    )
 
 
 def _request(**params):
