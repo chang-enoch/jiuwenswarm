@@ -26,6 +26,44 @@ from jiuwenswarm.edition import is_enterprise
 
 logger = logging.getLogger(__name__)
 
+# Enterprise audit shims. ``jiuwenswarm.common.audit_emit`` lives only on the
+# dev-stable line — some downstream forks (e.g. dev-stable-ee) ship without
+# it, so importing it eagerly would break the OBS path at runtime. Wrap the
+# import in :func:`_safe_emit_audit_evt` / :func:`_safe_emit_audit_ua` so the
+# tool degrades silently to no-op when the module is unavailable. On forks
+# that do ship ``audit_emit``, this routes through its internal
+# ``telemetry.audit`` adapter (see :mod:`jiuwenswarm.common.audit_emit`).
+try:
+    from jiuwenswarm.common.audit_emit import (
+        emit_audit_evt as _emit_audit_evt_impl,
+        emit_audit_ua as _emit_audit_ua_impl,
+    )
+    _AUDIT_EMIT_AVAILABLE: bool = True
+except ImportError:
+    _emit_audit_evt_impl = None  # type: ignore[assignment]
+    _emit_audit_ua_impl = None  # type: ignore[assignment]
+    _AUDIT_EMIT_AVAILABLE = False
+
+
+def _safe_emit_audit_evt(**fields: Any) -> None:
+    """Best-effort ``emit_audit_evt`` with graceful no-op when unavailable."""
+    if not _AUDIT_EMIT_AVAILABLE or _emit_audit_evt_impl is None:
+        return
+    try:
+        _emit_audit_evt_impl(**fields)
+    except Exception as exc:  # noqa: BLE001 - audit must never break delivery
+        logger.warning("[SendFileToolkit] emit_audit_evt failed: %s", exc)
+
+
+def _safe_emit_audit_ua(**fields: Any) -> None:
+    """Best-effort ``emit_audit_ua`` with graceful no-op when unavailable."""
+    if not _AUDIT_EMIT_AVAILABLE or _emit_audit_ua_impl is None:
+        return
+    try:
+        _emit_audit_ua_impl(**fields)
+    except Exception as exc:  # noqa: BLE001 - audit must never break delivery
+        logger.warning("[SendFileToolkit] emit_audit_ua failed: %s", exc)
+
 # Per-request send_file routing context (session_id / request_id / channel_id / metadata).
 # send_file_to_user 工具按全局名注册成单例时，并发请求会互相覆盖实例字段。
 # 此 ContextVar 按 async 上下文隔离；工具执行时优先据此解析当前请求路由，
@@ -327,12 +365,10 @@ class SendFileToolkit:
                 logger.warning("[SendFileToolkit] 文件不存在: %s", fp)
 
         if not valid_files:
-            from jiuwenswarm.common.audit_emit import emit_audit_evt
-
             msg_parts = ["发送文件失败：所有文件均不存在"]
             for mf in missing_files:
                 msg_parts.append(f"  - {mf}")
-            emit_audit_evt(
+            _safe_emit_audit_evt(
                 SUBMDL="file",
                 PROC="send_file_to_user",
                 MSG=msg_parts[0],
@@ -538,11 +574,10 @@ class SendFileToolkit:
             load_minio_upload_config,
             upload_local_file_to_minio,
         )
-        from jiuwenswarm.common.audit_emit import emit_audit_evt, emit_audit_ua
 
         session = get_subagent_parent_session()
         if session is None or not hasattr(session, "write_stream"):
-            emit_audit_evt(
+            _safe_emit_audit_evt(
                 SUBMDL="file",
                 PROC="send_file_to_user",
                 MSG="no_write_stream",
@@ -558,7 +593,7 @@ class SendFileToolkit:
             minio_cfg = load_minio_upload_config()
         except Exception as exc:
             logger.warning("[SendFileToolkit] OBS 配置不可用: %s", exc)
-            emit_audit_evt(
+            _safe_emit_audit_evt(
                 SUBMDL="file",
                 PROC="send_file_to_user",
                 MSG=str(exc)[:512],
@@ -603,7 +638,7 @@ class SendFileToolkit:
             parts = ["发送文件失败：全部文件上传对象存储失败"]
             for ff in failed_files:
                 parts.append(f"  - {ff['file']}: {ff['error']}")
-            emit_audit_evt(
+            _safe_emit_audit_evt(
                 SUBMDL="file",
                 PROC="send_file_to_user",
                 MSG=parts[0],
@@ -633,7 +668,7 @@ class SendFileToolkit:
                 "[SendFileToolkit] write_stream chat.file 失败 session_id=%s",
                 route.session_id,
             )
-            emit_audit_evt(
+            _safe_emit_audit_evt(
                 SUBMDL="file",
                 PROC="send_file_to_user",
                 MSG=str(exc)[:512],
@@ -643,7 +678,7 @@ class SendFileToolkit:
             return f"发送文件失败：写入对话流失败（{exc}）"
 
         _mark_files_sent(route.session_id, sent_ok)
-        emit_audit_ua(
+        _safe_emit_audit_ua(
             SUBMDL="file",
             PROC="send_file_to_user",
             session_id=route.session_id,
