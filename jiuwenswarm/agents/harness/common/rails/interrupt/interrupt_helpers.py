@@ -290,7 +290,13 @@ def build_permission_rail(
     from jiuwenswarm.common.e2a.acp.acp_tool_updates import build_acp_tool_descriptor
     from jiuwenswarm.common.utils import get_config_file, get_workspace_dir
 
-    permission_config = config.get("permissions", {})
+    from jiuwenswarm.common.behavior_security import (
+        ACTIVE_BEHAVIOR, desktop_security_active, skill_confirmation_pending,
+    )
+    behavior_enabled = desktop_security_active()
+    permission_config = dict(config.get("permissions", {}))
+    if behavior_enabled:
+        permission_config["defer_unmatched"] = True
     tools_config = permission_config.setdefault("tools", {})
     if isinstance(tools_config, dict):
         tools_config.setdefault("configure_channel", "allow")
@@ -377,7 +383,7 @@ def build_permission_rail(
             req: PermissionConfirmationRequest,
         ) -> PermissionConfirmResponse | str | None:
             channel = TOOL_PERMISSION_CHANNEL_ID.get() or "web"
-            if channel not in {"web", "tui", "acp"}:
+            if channel not in {"web", "tui", "acp"} and not behavior_enabled:
                 tool_call = req.tool_call
                 tool_name = getattr(tool_call, "name", "") if tool_call is not None else ""
                 logger.info(
@@ -481,6 +487,11 @@ def build_permission_rail(
 
             perm_ctx = TOOL_PERMISSION_CONTEXT.get()
 
+            # Installation has already passed the tool-input checkpoint. Its
+            # confirmation belongs to the install barrier, not tool persistence.
+            if behavior_enabled and skill_confirmation_pending(inp.ctx):
+                return ("approve",)
+
             # issue #1976: ask_user has its own dedicated interrupt rail. The
             # permission rail intercepts *every* tool, so on resume it grabs the
             # ask_user answer (keyed by tool_call_id) as its own user_input,
@@ -540,6 +551,8 @@ def build_permission_rail(
             )
 
             snapshot = get_permissions_with_session_overlay(session_id=session_id)
+            if behavior_enabled:
+                snapshot = {**snapshot, "defer_unmatched": True}
             return build_trusted_dirs_permission_config(
                 snapshot,
                 runtime_trusted_dirs_state,
@@ -560,6 +573,12 @@ def build_permission_rail(
                 logger.warning("[InterruptHelpers] persist_session_allow_rule failed: %s", exc)
                 return False
 
+        async def _behavior_evaluated(request):
+            active = ACTIVE_BEHAVIOR.get()
+            if active is not None:
+                return await active[0].on_permission_evaluated(request)
+            return None
+
         host = ToolPermissionHost(
             get_permissions_snapshot=_get_permissions_snapshot,
             persist_allow_rule=_persist_allow_rule,
@@ -568,6 +587,7 @@ def build_permission_rail(
             permission_yaml_path=get_config_file(),
             request_permission_confirmation=_request_permission_confirmation,
             permission_scene_hook=_permission_scene_hook,
+            on_permission_evaluated=_behavior_evaluated if behavior_enabled else None,
         )
 
         permission_rail = PermissionInterruptRail(

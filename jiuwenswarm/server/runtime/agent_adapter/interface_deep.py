@@ -4976,6 +4976,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             return None
 
     def _build_cspl_sentinel_rail(self) -> CsplSentinelRail | None:
+        from jiuwenswarm.common.behavior_security import BehaviorSecurityBridge, desktop_security_active
+        if desktop_security_active():
+            from jiuwenswarm.agents.harness.common.rails.behavior_security_rail import BehaviorSecurityRail
+            from jiuwenswarm.common.config import get_config
+            return BehaviorSecurityRail(BehaviorSecurityBridge(get_config()))
         try:
             cspl_cfg = CsplConfig.load()
             if not cspl_cfg.enabled:

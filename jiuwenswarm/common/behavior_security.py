@@ -1,0 +1,214 @@
+"""Desktop behavior bridge: raw events only; cloud contracts live in claw_desktop."""
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import copy
+import hashlib
+import json
+import os
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from openjiuwen.harness.security import PermissionLevel, PermissionResult, SkillInstallContext, before_skill_install
+from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_SESSION_ID
+from jiuwenswarm.common.np_transport import named_pipe_transport_for
+from jiuwenswarm.common.utils import logger
+
+ACTIVE_BEHAVIOR: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("active_behavior", default=None)
+PENDING_SKILL = "behavior_security.pending_skill"
+
+
+def desktop_security_active() -> bool:
+    # Explicit host capability. Other hosts, including old desktops, keep their behavior.
+    return os.environ.get("CLAW_BEHAVIOR_SECURITY") == "1" and bool(os.environ.get("CLAW_SKILL_TOKEN"))
+
+
+def _session_id(ctx: Any) -> str:
+    session = getattr(ctx, "session", None)
+    getter = getattr(session, "get_session_id", None)
+    return str(CURRENT_SESSION_ID.get() or (getter() if callable(getter) else getattr(session, "session_id", "")) or "")
+
+
+def _event_id(ctx: Any, stage: str, suffix: str = "") -> str:
+    call = ctx.inputs.tool_call
+    turn = ctx.extra.get("behavior.turn_id", "")
+    args = json.dumps(ctx.inputs.tool_args, sort_keys=True, ensure_ascii=False, default=str)
+    raw = f"{_session_id(ctx)}:{turn}:{getattr(call, 'id', '')}:{ctx.inputs.tool_name}:{args}:{stage}:{suffix}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def raw_event(ctx: Any, stage: str, suffix: str = "") -> dict:
+    call = ctx.inputs.tool_call
+    tool = {"id": str(getattr(call, "id", "")), "name": ctx.inputs.tool_name,
+            "arguments": copy.deepcopy(ctx.inputs.tool_args)}
+    if stage == "tool.after":
+        tool["result"] = copy.deepcopy(ctx.inputs.tool_result)
+        if ctx.exception:
+            tool["error"] = type(ctx.exception).__name__
+    event = {"version": 1, "eventId": _event_id(ctx, stage, suffix), "stage": stage,
+             "sessionId": _session_id(ctx), "tool": tool}
+    if "behavior.dialogue_context" in ctx.extra:
+        event["dialogueContext"] = copy.deepcopy(ctx.extra["behavior.dialogue_context"])
+    # Pydantic tool results must be normalized before scheduling, while the
+    # original context and data are still alive. No cloud body is built here.
+    return json.loads(json.dumps(event, ensure_ascii=False, default=lambda value:
+        value.model_dump(mode="json") if hasattr(value, "model_dump") else str(value)))
+
+
+class BehaviorSecurityBridge:
+    """Bounded reporting tasks and one decision per behavior/checkpoint."""
+    def __init__(self, config: dict, *, transport=None):
+        self.config = config
+        self.transport = transport
+        self.tasks: set[asyncio.Task] = set()
+        self.decisions: OrderedDict[str, PermissionResult] = OrderedDict()
+        self.local_decisions: OrderedDict[str, PermissionResult] = OrderedDict()
+
+    async def _send(self, event: dict) -> dict:
+        section = self.config.get("xiaoyi_work_security", {}).get("cloud_authorization", {})
+        timeout = max(0.1, min(float(section.get("timeout_ms", 4000)) / 1000, 30))
+        try:
+            transport = self.transport or named_pipe_transport_for("np://claw-skill")
+            async with asyncio.timeout(timeout):
+                async with httpx.AsyncClient(transport=transport, timeout=timeout) as client:
+                    response = await client.post("http://claw-skill/internal/behavior-security/v1",
+                        headers={"Authorization": f"Bearer {os.environ.get('CLAW_SKILL_TOKEN', '')}"},
+                        json=event)
+                    response.raise_for_status()
+                    body = response.json()
+                    return body if isinstance(body, dict) else {"decision": "unavailable"}
+        except Exception:
+            logger.warning("[behavior-security] %s %s unavailable", event["stage"], event["mode"])
+            return {"decision": "unavailable"}
+
+    def report(self, event: dict) -> None:
+        if len(self.tasks) >= 64:
+            logger.warning("[behavior-security] local report queue full")
+            return
+        task = asyncio.create_task(self._send({**event, "mode": "report"}))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def decide(self, event: dict, local: PermissionResult) -> PermissionResult:
+        key = event["eventId"]
+        if key in self.decisions:
+            return self.decisions[key]
+        cloud_enabled = self.config.get("xiaoyi_work_security", {}).get("cloud_authorization", {}).get("enabled", False)
+        if not local.is_undetermined:
+            self.report(event)
+            result = local
+        elif not cloud_enabled:
+            self.report(event)
+            result = PermissionResult(PermissionLevel.ASK, reason="请授权本次操作（云端授权未开启）")
+        else:
+            reply = await self._send({**event, "mode": "authorize"})
+            decision = reply.get("decision")
+            if decision in {"allow", "clarify"}:
+                # CLARIFY has no agreed question field/round-trip protocol yet.
+                # Requirement explicitly permits this one operation in that case.
+                result = PermissionResult(PermissionLevel.ALLOW, reason="cloud:" + decision)
+            elif decision == "deny":
+                result = PermissionResult(PermissionLevel.DENY, reason=str(reply.get("reason") or "云端拒绝本次操作"))
+            else:
+                result = PermissionResult(PermissionLevel.ASK, reason="云端不可用，请授权本次操作")
+        self.decisions[key] = result
+        if len(self.decisions) > 512:
+            self.decisions.popitem(last=False)
+        return result
+
+    async def on_permission_evaluated(self, request):
+        ctx = request.ctx
+        ctx.extra["behavior.local_permission"] = request.result
+        ctx.extra["behavior.input_observed"] = True
+        self.local_decisions[_event_id(ctx, "tool.before")] = request.result
+        if len(self.local_decisions) > 512:
+            self.local_decisions.popitem(last=False)
+        return await self.decide(raw_event(ctx, "tool.before"), request.result)
+
+    async def close(self):
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+
+
+def skill_confirmation_pending(ctx: Any) -> bool:
+    return bool(ctx.session and ctx.session.get_state(PENDING_SKILL + ":" + _event_id(ctx, "tool.before")))
+
+
+async def check_agent_skill_install(staged: Path, destination: Path, name: str, source: str) -> None:
+    """Barrier immediately before mutation. Non-Agent installation is outside this phase."""
+    active = ACTIVE_BEHAVIOR.get()
+    if active is None:
+        return
+    bridge, ctx, _loop = active
+    if ctx.extra.get("behavior.finished"):
+        raise PermissionError("安装调用已经取消或结束")
+    # Internal snapshot identity only; NOT the still-undecided cloud file.hash.
+    def fingerprint():
+        digest = hashlib.sha256()
+        files = sorted(staged.rglob("*")) if staged.is_dir() else [staged]
+        for path in files:
+            if path.is_file():
+                digest.update(str(path.relative_to(staged) if staged.is_dir() else path.name).encode())
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        return digest.hexdigest()
+    snapshot = await asyncio.to_thread(fingerprint)
+    event = raw_event(ctx, "skill.before_install", f"{destination}:{snapshot}")
+    event["skill"] = {"name": name, "source": source, "stagedPath": str(staged), "destination": str(destination)}
+    context = SkillInstallContext(event["eventId"], name, source, staged, destination)
+    state_key = PENDING_SKILL + ":" + _event_id(ctx, "tool.before")
+    pending = ctx.session.get_state(state_key) if ctx.session else None
+    from openjiuwen.harness.rails.security.tool_security_rail import PermissionInterruptRail
+    from openjiuwen.harness.rails.interrupt.interrupt_base import BaseInterruptRail
+    helper = BaseInterruptRail()
+    response = helper._get_user_input(ctx, ctx.inputs.tool_call.id)
+    if pending == event["eventId"] and response is not None:
+        answer = PermissionInterruptRail.parse_confirm_payload(response)
+        if answer is not None:
+            ctx.session.update_state({state_key: None})
+            if answer.approved:
+                return
+            raise PermissionError("用户拒绝安装技能")
+
+    async def evaluate(_context):
+        local = ctx.extra.get("behavior.local_permission")
+        if local is None:
+            local = PermissionResult(PermissionLevel.UNDETERMINED)
+        # Explicit ASK was already confirmed for this install tool invocation.
+        if local.needs_approval:
+            local = PermissionResult(PermissionLevel.ALLOW, reason="local_install_confirmation")
+        return await bridge.decide(event, local)
+
+    result = await before_skill_install(context, evaluate)
+    if ctx.extra.get("behavior.finished"):
+        raise PermissionError("安装调用已经取消或结束")
+    if result.is_allowed:
+        if await asyncio.to_thread(fingerprint) != snapshot:
+            raise PermissionError("技能内容在授权期间发生变化，请重新安装")
+        if ctx.extra.get("behavior.finished"):
+            raise PermissionError("安装调用已经取消或结束")
+        return
+    if result.needs_approval:
+        if ctx.session:
+            ctx.session.update_state({state_key: event["eventId"]})
+        ctx.extra["behavior.install_confirmation"] = f"权限确认：是否安装技能 {name}？{result.reason or ''}"
+    raise PermissionError(result.reason or "技能安装未获授权")
+
+
+def check_agent_skill_install_sync(staged: Path, destination: Path, name: str, source: str) -> None:
+    """Worker-thread adapter; contextvars are propagated by asyncio.to_thread."""
+    active = ACTIVE_BEHAVIOR.get()
+    if active is not None:
+        future = asyncio.run_coroutine_threadsafe(check_agent_skill_install(staged, destination, name, source), active[2])
+        try:
+            future.result(timeout=35)
+        except BaseException:
+            future.cancel()
+            raise
