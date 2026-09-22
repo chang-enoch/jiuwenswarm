@@ -63,6 +63,7 @@ import {
   useWorkspaceStore,
   useCronStore,
 } from './stores';
+import { chatRoutePath } from './multi-session/routing/route';
 import { useChatRoute } from './multi-session/routing/useChatRoute';
 import {
   MAIN_NAV_STORAGE_KEY,
@@ -509,7 +510,8 @@ function AppContent() {
       sessionIdRef.current = route.sessionId;
       setSessionId(route.sessionId);
     } else if (route.kind === 'chat-new') {
-      if (window.location.pathname !== '/chat/new') navigate({ kind: 'chat-new' }, { replace: true });
+      const newChatPath = chatRoutePath({ kind: 'chat-new' }).split('?')[0];
+      if (window.location.pathname !== newChatPath) navigate({ kind: 'chat-new' }, { replace: true });
       if (preserveSelectedProjectOnChatNewRef.current) {
         preserveSelectedProjectOnChatNewRef.current = false;
       } else {

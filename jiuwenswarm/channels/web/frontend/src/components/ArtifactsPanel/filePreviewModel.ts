@@ -16,25 +16,28 @@ export type PreviewKind = TextKind | 'html' | 'image' | 'pdf' | 'docx' | 'spread
 const TEXT_EXTENSIONS = new Set(['conf', 'csv', 'ini', 'log', 'text', 'txt']);
 const IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'ico', 'jfif', 'jpeg', 'jpg', 'png', 'svg', 'webp']);
 
+import { resolveApiUrl } from '../../utils/env';
 function inlineDownloadUrl(downloadUrl: string, origin: string): string {
-  const url = new URL(downloadUrl, origin);
+  // 文件下载/预览地址统一加接口前缀，再附加 inline=1 让浏览器内联预览而非下载。
+  const resolved = resolveApiUrl(downloadUrl);
+  const url = new URL(resolved, origin);
   url.searchParams.set('inline', '1');
   return url.pathname + url.search;
 }
 
 export function artifactDownloadUrl(resource: PreviewResource): string | null {
-  if (resource.downloadUrl) return resource.downloadUrl;
-  return resource.path ? `/file-api/raw-file?path=${encodeURIComponent(resource.path)}` : null;
+  if (resource.downloadUrl) return resolveApiUrl(resource.downloadUrl);
+  return resource.path ? resolveApiUrl(`/file-api/raw-file?path=${encodeURIComponent(resource.path)}`) : null;
 }
 
 export function artifactBinaryPreviewUrl(resource: PreviewResource, origin: string): string | null {
   if (resource.downloadUrl) return inlineDownloadUrl(resource.downloadUrl, origin);
-  return resource.path ? `/file-api/raw-file?path=${encodeURIComponent(resource.path)}` : null;
+  return resource.path ? resolveApiUrl(`/file-api/raw-file?path=${encodeURIComponent(resource.path)}`) : null;
 }
 
 export function artifactTextPreviewUrl(resource: PreviewResource, origin: string): string | null {
   if (resource.downloadUrl) return inlineDownloadUrl(resource.downloadUrl, origin);
-  return resource.path ? `/file-api/file-content?path=${encodeURIComponent(resource.path)}&encoding=auto` : null;
+  return resource.path ? resolveApiUrl(`/file-api/file-content?path=${encodeURIComponent(resource.path)}&encoding=auto`) : null;
 }
 
 export function previewKind(file: PreviewFile): PreviewKind {

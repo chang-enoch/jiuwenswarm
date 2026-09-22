@@ -7,6 +7,7 @@ import {
   managerAuthenticatedFetch,
   redirectToManagerLogin,
 } from './authSession';
+import { resolveApiUrl } from '../../utils/env';
 
 interface ManagerResponse<T> {
   code: number;
@@ -47,17 +48,18 @@ export const managerAuthProvider: EnterpriseAuthProvider = {
   redirectToLogin() {
     return redirectToManagerLogin();
   },
-  getCurrentUser: () => requestJson<EnterpriseUser>('/idp/v1/auth/me'),
+  // 所有 /idp、/manager-api 请求统一经 resolveApiUrl 拼接门户接口前缀后再发起（VITE_API_PREFIX 为空时原样返回）。
+  getCurrentUser: () => requestJson<EnterpriseUser>(resolveApiUrl('/idp/v1/auth/me')),
   async listAgentContexts() {
     const result = await requestJson<ManagerResponse<{ contexts: EnterpriseAgentContext[] }>>(
-      '/manager-api/v1/user-console/agent-contexts',
+      resolveApiUrl('/manager-api/v1/user-console/agent-contexts'),
     );
     if (result.code !== 200) throw new EnterpriseAuthError(result.code, result.message || '加载 Agent 上下文失败');
     return result.data?.contexts ?? [];
   },
   async setActiveCluster(jiuwenclawId: string) {
     const result = await requestJson<ManagerResponse<{ jiuwenclaw_id: string }>>(
-      '/manager-api/v1/user-console/active-cluster',
+      resolveApiUrl('/manager-api/v1/user-console/active-cluster'),
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -72,7 +74,7 @@ export const managerAuthProvider: EnterpriseAuthProvider = {
     const refreshToken = getManagerRefreshToken();
     if (refreshToken) {
       try {
-        await fetch('/idp/v1/auth/logout', {
+        await fetch(resolveApiUrl('/idp/v1/auth/logout'), {
           method: 'POST',
           headers: {
             ...(getManagerAccessToken()

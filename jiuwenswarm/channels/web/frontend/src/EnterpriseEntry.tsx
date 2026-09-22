@@ -68,8 +68,16 @@ function entryPath(): string {
   // 刷新落在具体会话路由上时必须保留原路径：引导完成后 activateContext 会
   // replaceState 回本函数拼出的地址，若把 /chat/<sessionId> 折叠成 /chat/，
   // App 挂载时就解析不到会话 id，刷新后历史不恢复（点侧栏才回来）。
-  if (/^\/chat\/[^/]+/.test(pathname)) return pathname;
-  return pathname.startsWith('/chat') ? '/chat/' : '/';
+  if (/\/chat\/[^/]+/.test(pathname)) return pathname;
+  const chatIndex = pathname.indexOf('/chat');
+  if (chatIndex !== -1) {
+    return `${pathname.slice(0, chatIndex)}/chat/`;
+  }
+  const base = (import.meta.env.BASE_URL || '/').replace(/\/+$/, '');
+  if (base && !pathname.startsWith(base)) {
+    return `${base}/`;
+  }
+  return pathname.endsWith('/') ? pathname : `${pathname}/`;
 }
 
 const ACTIVE_CLUSTER_STORAGE_KEY = 'jiuwenclaw_active_cluster';

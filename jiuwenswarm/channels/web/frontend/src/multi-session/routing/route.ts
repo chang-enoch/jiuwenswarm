@@ -6,8 +6,26 @@ export type ChatRoute =
   | { kind: 'chat-session'; sessionId: string }
   | { kind: 'not-found'; pathname: string };
 
+function basePath(): string {
+  const base = (import.meta.env.BASE_URL || '/').replace(/\/+$/, '');
+  return base === '/' ? '' : base;
+}
+
+function withoutBasePath(pathname: string): string {
+  const base = basePath();
+  if (!base || pathname === base) return pathname === base ? '/' : pathname;
+  return pathname.startsWith(`${base}/`) ? pathname.slice(base.length) : pathname;
+}
+
+function withBasePath(pathname: string): string {
+  const base = basePath();
+  if (!base || pathname === base || pathname.startsWith(`${base}/`)) return pathname;
+  return `${base}${pathname.startsWith('/') ? pathname : `/${pathname}`}`;
+}
+
 export function parseChatRoute(pathname: string): ChatRoute | null {
-  const path = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+  const appPath = withoutBasePath(pathname);
+  const path = appPath.length > 1 ? appPath.replace(/\/+$/, '') : appPath;
   if (path === '/' || path === '/chat' || path === '/chat/new') return { kind: 'chat-new' };
   const match = path.match(/^\/chat\/([^/]+)$/);
   if (!match) return null;
@@ -27,7 +45,7 @@ function appendEnterpriseScope(path: string): string {
 }
 
 export function chatRoutePath(route: ChatRoute): string {
-  if (route.kind === 'chat-new') return appendEnterpriseScope('/chat/new');
-  if (route.kind === 'chat-session') return appendEnterpriseScope(`/chat/${encodeURIComponent(route.sessionId)}`);
+  if (route.kind === 'chat-new') return appendEnterpriseScope(withBasePath('/chat/new'));
+  if (route.kind === 'chat-session') return appendEnterpriseScope(withBasePath(`/chat/${encodeURIComponent(route.sessionId)}`));
   return appendEnterpriseScope(route.pathname);
 }

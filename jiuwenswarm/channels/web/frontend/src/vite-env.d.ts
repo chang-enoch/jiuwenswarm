@@ -10,6 +10,8 @@ interface ImportMetaEnv {
   readonly VITE_WEB_HTTP_BASE?: string;
   readonly VITE_JIUWENSWARM_EDITION?: string;
   readonly VITE_LOGIN_AUTH_SIMULATE?: string;
+  readonly VITE_BASE_PATH?: string;
+  readonly VITE_API_PREFIX?: string;
 }
 
 interface ImportMeta {
