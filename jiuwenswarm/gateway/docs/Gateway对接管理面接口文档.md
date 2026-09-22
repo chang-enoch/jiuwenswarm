@@ -1,7 +1,7 @@
 # Gateway对接管理面接口文档
 
 > 范围：Manager（`applications/manager`）通过 HTTP 调用 Gateway **Config Receiver**（`jiuwenswarm/.../manager_config_receiver`）的全部接口。  
-> **本文不是**浏览器 / 前端使用的 Web HTTP（默认端口 **19002**，见 [Gateway Http接口文档.md](../../../docs/zh/Gateway%20Http接口文档.md)）。
+> **本文不是**浏览器 / 前端使用的 Web HTTP（默认端口 **19002**，见 [Gateway Web HTTP接口文档.md](./Gateway%20Web%20HTTP接口文档.md)）。
 
 
 ---
@@ -30,7 +30,7 @@
 | Base | `gateway_config_host` | `http://{host}:19002/api/v1` |
 | 信封 | `{ code, message, data }` | `{ request_id, ok, data\|error, metadata }` |
 | 流式 | 无 SSE 会话流 | 流式仅 SSE |
-| 身份 | HTTP 层无 Web 租户头模型；依赖内网 / TLS（见 §16.7） | 企业推荐 `X-User-Id` / `X-Group-Id` / `X-Bot-Id` 等 |
+| 身份 | HTTP 层无 Web 租户头模型；依赖内网 / TLS（见 §18.7） | 企业推荐 `X-User-Id` / `X-Group-Id` / `X-Bot-Id` 等 |
 
 **交互原则**
 
@@ -1509,11 +1509,132 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-## 13. 应用配置 — 日志脱敏规则（`log_masking_rule`）
+## 13. 应用配置 — 审计日志（`audit_log_config`）
+
+单行配置。权威内容在 `body`；Gateway 落盘后本进程热加载，并 `trigger_runtime_config_update`。OTEL 开关与 endpoint 由部署 `OTEL_*` / TelemetryRuntime 决定，**不由本接口驱动**。
+
+### 13.1 Upsert 审计日志配置
+
+- **接口名称**：Upsert 审计日志配置
+- **请求方法**：`PUT`
+- **请求路径**：`/api/v1/audit-log`
+- **请求参数**（Body）：
+
+
+| 字段名 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `body` | object | 是 | 完整可下发 payload |
+| `body.format` | object | 是 | 字段清单 |
+| `body.format.schema_version` | string | 是 | 默认 `"1.0.0"` |
+| `body.format.header_fields` | string[] | 是 | 头部属性键 |
+| `body.format.content_fields` | string[] | 是 | 内容属性键 |
+| `body.format.required_fields` | string[] | 是 | 须为 header∪content 子集 |
+| `body.format.placeholder` | string | 否 | 默认 `"-"` |
+| `body.format.timestamp_format` | string | 否 | 默认 `"yyyyMMdd-HH:mm:ss.SSS"` |
+| `body.data_center` | string | 是 | 审计头部 |
+| `body.system_code` | string | 是 | 审计头部 |
+| `body.node` | string | 否 | 审计头部，建议 `IP:PORT` |
+| `source` | string | 否 | 默认 `"manager"` |
+| `revision` | int | 否 | 默认 `1` |
+
+
+顶层 `data_center` / `system_code` / `node` 若传入，可覆盖 `body` 内同名字段。
+
+- **返回参数**：`data` 为落库行（含 `body`）
+- **请求示例**：
+
+```json
+{
+  "body": {
+    "format": {
+      "schema_version": "1.0.0",
+      "header_fields": [
+        "schema_version", "timestamp", "level", "data_center",
+        "system_code", "node", "trace_id", "txn_seq",
+        "pid", "tid", "caller"
+      ],
+      "content_fields": [
+        "UID", "CUSTID", "SRCIP", "DSTIP", "COST",
+        "UA", "EVT", "MSG", "RSPCD", "SUBMDL", "PROC",
+        "SVRNAM", "ACTION", "SANDBOXID", "RESULT"
+      ],
+      "required_fields": [
+        "timestamp", "level", "UID", "CUSTID", "SRCIP", "DSTIP",
+        "RSPCD", "SUBMDL", "PROC"
+      ],
+      "placeholder": "-",
+      "timestamp_format": "yyyyMMdd-HH:mm:ss.SSS"
+    },
+    "data_center": "N",
+    "system_code": "99900180001",
+    "node": "10.0.0.1:8080"
+  },
+  "source": "manager",
+  "revision": 1
+}
+```
+
+- **返回示例**：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": 1,
+    "body": {
+      "format": {
+        "schema_version": "1.0.0",
+        "header_fields": ["schema_version", "timestamp", "level", "data_center", "system_code", "node", "trace_id", "txn_seq", "pid", "tid", "caller"],
+        "content_fields": ["UID", "CUSTID", "SRCIP", "DSTIP", "COST", "UA", "EVT", "MSG", "RSPCD", "SUBMDL", "PROC", "SVRNAM", "ACTION", "SANDBOXID", "RESULT"],
+        "required_fields": ["timestamp", "level", "UID", "CUSTID", "SRCIP", "DSTIP", "RSPCD", "SUBMDL", "PROC"],
+        "placeholder": "-",
+        "timestamp_format": "yyyyMMdd-HH:mm:ss.SSS"
+      },
+      "data_center": "N",
+      "system_code": "99900180001",
+      "node": "10.0.0.1:8080"
+    },
+    "source": "manager",
+    "revision": 1
+  }
+}
+```
 
 
 
-### 13.0 表结构（`log_masking_rule`）
+### 13.2 删除审计日志配置
+
+- **接口名称**：删除审计日志配置（清除配置并停止写出）
+- **请求方法**：`DELETE`
+- **请求路径**：`/api/v1/audit-log`
+- **请求参数**：`{}`
+- **返回参数**：`data` 为 `null`
+- **请求示例**：
+
+```json
+{}
+```
+
+- **返回示例**：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": null
+}
+```
+
+---
+
+
+
+## 14. 应用配置 — 日志脱敏规则（`log_masking_rule`）
+
+
+
+### 14.0 表结构（`log_masking_rule`）
 
 
 | 字段名                | 类型                    | 必填  | 说明                      |
@@ -1535,7 +1656,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-### 13.1 创建日志脱敏规则
+### 14.1 创建日志脱敏规则
 
 - **接口名称**：创建日志脱敏规则
 - **请求方法**：`POST`
@@ -1589,7 +1710,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-### 13.2 更新日志脱敏规则
+### 14.2 更新日志脱敏规则
 
 - **接口名称**：更新日志脱敏规则
 - **请求方法**：`PATCH`
@@ -1620,7 +1741,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-### 13.3 删除日志脱敏规则
+### 14.3 删除日志脱敏规则
 
 - **接口名称**：删除日志脱敏规则
 - **请求方法**：`DELETE`
@@ -1648,11 +1769,11 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-## 14. 实例数据生命周期
+## 15. 实例数据生命周期
 
 无独立业务表；`purge` 会清理本 Gateway 上已同步的模板 / 资源 / 应用配置等表（含 channel / cron / Manager 公钥等；不可逆）。
 
-### 14.1 清理实例配置数据
+### 15.1 清理实例配置数据
 
 - **接口名称**：实例数据生命周期（purge）
 - **请求方法**：`POST`
@@ -1701,7 +1822,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-## 15. Manager 侧调用映射（速查）
+## 16. Manager 侧调用映射（速查）
 
 
 | Gateway 能力    | Manager 代码位置                                                                    |
@@ -1716,6 +1837,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 | Agent 模板/资源推送 | `core/template/push_agent_template_to_gateway.py`                               |
 | Agent 资源业务    | `core/instance_resource/instance_agent_resource_service.py`                     |
 | 应用配置          | `core/application_config/*.py`                                                  |
+| 审计日志配置        | `core/application_config/audit_log_config.py` → `/api/v1/audit-log`             |
 | 上线全量同步        | `core/instance/instance_data_lifecycle.py`                                      |
 | 删实例清理         | `purge_gateway_instance_data`                                                   |
 
@@ -1724,7 +1846,7 @@ HMAC 密钥、Bearer token、长期明文下载凭证不得出现在模板或普
 
 
 
-## 16. 源码索引
+## 17. 源码索引
 
 
 | 侧             | 路径                                                                                                                             |
@@ -1744,14 +1866,14 @@ Gateway OpenAPI：`{gateway_config_host}/docs`。
 
 
 
-## 17. 与旧 Gateway 接口的差异
+## 18. 与旧 Gateway 接口的差异
 
 > 旧实现：`jiuwenswarm/.../packages/jiuwenclaw-ee/gateway/extensions/manager_ws_client`  
-> 新实现：`manager_config_receiver`（本文档 §1–§16 所描述的 HTTP Config Receiver）
+> 新实现：`manager_config_receiver`（本文档 §1–§17 所描述的 HTTP Config Receiver）
 
 旧链路是 **Gateway 作为 WebSocket 客户端连上 Manager**，由 Manager 下发 `config.push` 帧；新链路是 **Manager 作为 HTTP 客户端主动调用** Gateway 的 `gateway_config_host`。业务落库语义大体对齐，但传输、寻址、操作编码与能力边界均已切换。
 
-### 17.1 架构与连接模型
+### 18.1 架构与连接模型
 
 
 | 维度          | 旧（`manager_ws_client`）                                                   | 新（本文档 HTTP）                                               |
@@ -1767,7 +1889,7 @@ Gateway OpenAPI：`{gateway_config_host}/docs`。
 
 
 
-### 17.2 报文形态对比
+### 18.2 报文形态对比
 
 **旧：**`config.push` **帧（示意）**
 
@@ -1811,7 +1933,7 @@ Content-Type: application/json
 
 
 
-### 17.3 操作编码：`op` → HTTP 方法
+### 18.3 操作编码：`op` → HTTP 方法
 
 
 | 旧 `op`（payload 内）                    | 新 HTTP                            | 说明                                                                                                      |
@@ -1821,12 +1943,12 @@ Content-Type: application/json
 | `upsert`                             | `PUT /api/v1/...`                 | logging 等单文档配置                                                                                          |
 | `delete`                             | `DELETE /api/v1/...` 或 `.../{id}` | 无业务字段时 Body `{}`                                                                                        |
 | `sync`                               | **无对等单接口**                        | 旧版全量对账（upsert 全集 + 删差集）；新版由 Manager 上线引导时多次 REST 推送，或 `POST /api/v1/instance-data-lifecycle`（`purge`）清理 |
-| `activate` / `deactivate`（仅 channel） | **本 Receiver 未提供**                | 见 §17.5                                                                                                 |
+| `activate` / `deactivate`（仅 channel） | **本 Receiver 未提供**                | 见 §18.5                                                                                                 |
 
 
 
 
-### 17.4 能力映射速查
+### 18.4 能力映射速查
 
 
 | 旧 `config` key               | 旧入口                               | 新 HTTP 路径（本文档）                                                                 |
@@ -1839,6 +1961,7 @@ Content-Type: application/json
 | `permissions_config`（旧实例级）   | 旧 WS 应用配置                         | `/api/v1/permissions-templates`（**改为** `permissions_template` CRUD，见 §8）       |
 | —                            | 无                                 | `/api/v1/mcp-templates`（**新增** `mcp_template` CRUD，见 §9）                       |
 | `logging_config`             | `apply_logging_config`            | `/api/v1/logging`                                                              |
+| —                            | 无                                 | `/api/v1/audit-log`（**新增** `audit_log_config`，见 §13）                          |
 | `log_masking_rule`           | `apply_log_masking_rule`          | `/api/v1/log-masking-rules`                                                    |
 | `instance_data_lifecycle`    | `apply_instance_data_lifecycle`   | `/api/v1/instance-data-lifecycle`                                              |
 | —                            | 无                                 | `/api/v1/agent-templates`（**新增**）                                              |
@@ -1847,7 +1970,7 @@ Content-Type: application/json
 
 
 
-### 17.5 旧有、本文档未覆盖的能力
+### 18.5 旧有、本文档未覆盖的能力
 
 下列 key 仍存在于旧 `manager_ws_client` 路由中，**不在**本 Config Receiver HTTP 文档范围内（去向以当前产品设计为准：策略/映射可能仍在 Manager 侧编排，或改由 Runtime 通道下发）：
 
@@ -1868,7 +1991,7 @@ Content-Type: application/json
 
 
 
-### 17.6 数据模型与实例隔离
+### 18.6 数据模型与实例隔离
 
 
 | 维度                | 旧                                                              | 新                                                                                                                     |
@@ -1880,7 +2003,7 @@ Content-Type: application/json
 
 
 
-### 17.7 安全与副作用
+### 18.7 安全与副作用
 
 
 | 项           | 旧                                                         | 新                                                          |
@@ -1892,7 +2015,7 @@ Content-Type: application/json
 
 
 
-### 17.8 迁移时注意点
+### 18.8 迁移时注意点
 
 1. **不要把旧** `op` **JSON 原样 POST**：须改成对应 REST 方法与路径；模板 create 的 Body 是资源字段本身，不是 `{ "op":"create", "template":{...} }`。
 2. **无** `sync` **单接口**：上线全量对齐改为 Manager 按资源逐条（或批量多次）HTTP 推送；删实例仍用 lifecycle `purge`。

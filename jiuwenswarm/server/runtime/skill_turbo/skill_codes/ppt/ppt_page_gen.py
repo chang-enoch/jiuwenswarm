@@ -247,11 +247,16 @@ def _extract_designer_section(
     新 skill：主文件含「写前版面意图」；弹性布局/HTML/页面布局/视觉在 appendix.md；
     图表/图片在 charts.md / images.md，按页类型按需注入。
 
-    for_content_template_fill=True（content-template 填槽）：不注入长附录，
-    改用密度短清单；图表候选页仅附图表切片。
+    for_content_template_fill=True（content-template 填槽）：不注入长附录；
+    注入密度短清单 + designer §3.1 C/D/D-2 + 页型最低信息结构表原文；
+    图表候选页另附图表切片。
     """
     if for_content_template_fill:
         parts = [_CONTENT_FILL_DENSITY_CHECKLIST]
+        parts.extend(_extract_content_fill_designer_31_slices(text))
+        density_floor = _extract_content_fill_density_floor_slice(text)
+        if density_floor:
+            parts.append(density_floor)
         if include_charts:
             chart_src = charts_text or text
             chart_section = ""
@@ -391,6 +396,53 @@ _CONTENT_FILL_DENSITY_CHECKLIST = """### PAGE_CONTENT 密度硬约束（精简�
 - 字号纪律：卡片/要点克制；标题宜短、要点 ≤6 条、正文 ≤14px、说明 ≤11px。
 - 图表候选页须完成 CHART_SCAFFOLD 三步激活（见 designer §激活）；非图表页保持 scaffold 注释 dormant。
 - 禁止重写 YAML 预算、开 subagent、整页重写骨架。"""
+
+
+def _extract_content_fill_designer_31_slices(text: str) -> list[str]:
+    """从 designer 主文件抽取 §3.1 C/D/D-2（止于 E / 3.2），供 content-template 填槽注入。"""
+    if not (text or "").strip():
+        return []
+    # 优先整段 C→D-2（含分块要点 + form 表 + 骨架表）；止于 E / 3.2，不注入写前版面意图。
+    chunk = _extract_bounded_section(
+        text,
+        "**C. 内容分块",
+        (
+            "\n**E. 写前版面意图",
+            "\n#### 3.2",
+            "\n### 阶段 4",
+            "\n## ",
+        ),
+    )
+    if chunk:
+        return [chunk]
+    # 无 C 锚点时分别抽 D / D-2（兼容残缺 fixture）。
+    parts: list[str] = []
+    d_form = _extract_bounded_section(
+        text,
+        "**D. 表达形式选择",
+        ("\n**D-2.", "\n**E. 写前版面意图", "\n#### 3.2", "\n## "),
+    )
+    if d_form:
+        parts.append(d_form)
+    d2 = _extract_bounded_section(
+        text,
+        "**D-2. 承载骨架配方",
+        ("\n**E. 写前版面意图", "\n#### 3.2", "\n## "),
+    )
+    if d2:
+        parts.append(d2)
+    return parts
+
+
+def _extract_content_fill_density_floor_slice(text: str) -> str:
+    """从 designer 主文件抽取「按页面类型的最低信息结构」表原文。"""
+    if not (text or "").strip():
+        return ""
+    return _extract_bounded_section(
+        text,
+        "##### 按页面类型的最低信息结构",
+        ("\n##### ", "\n#### ", "\n### ", "\n## "),
+    )
 
 
 _PRESET_STYLE_IDS = {"business-classic", "tech-minimal", "elegant-narrative", "industrial-tech"}
@@ -1407,22 +1459,6 @@ def _validate_custom_content_template_fill_output(
     return True, ""
 
 
-def _build_content_layout_template(page_type: str) -> str:
-    layout = _PAGE_LAYOUT_TEMPLATES.get(page_type, "")
-    if not layout:
-        return ""
-    return (
-        layout
-        .replace('<div class="content-safe flex flex-col">\n', "")
-        .replace('  <header class="flex-shrink-0">4-6 个关键数字卡片，flex</header>\n', "")
-        .replace('  <header class="flex-shrink-0">3 个关键数字卡片</header>\n', "")
-        .replace('  <header class="flex-shrink-0">4 个关键数字卡片</header>\n', "")
-        .replace('  <footer class="flex-shrink-0">数据来源汇总条</footer>\n', "")
-        .replace('  <footer class="flex-shrink-0">案例素材详细描述 + 数据来源页脚</footer>\n', "")
-        .replace("</div>\n```\n", "```\n")
-    )
-
-
 def _build_content_template_fill_prompt(
     *,
     page_number: int,
@@ -1494,7 +1530,8 @@ def _build_content_template_fill_prompt(
             f"{task_text.strip()}\n"
         )
     constraints_block = _style_constraints_block(style_constraints)
-    layout_template = _build_content_layout_template(page_type)
+    # 填槽路径不用 Turbo 自创同质 _PAGE_LAYOUT_TEMPLATES；定型权威=已注入的 designer 原文切片。
+    layout_template = ""
     rewrite_section = ""
     if rewrite_hint:
         original_section = ""
@@ -1698,7 +1735,9 @@ def _build_content_template_fill_system_prompt(
     )
     if style_id == "custom":
         prompt = (
-            "你是 PPT 内容页模板填充师，不是设计师。"
+            "你是 PPT 内容页模板填充师。"
+            "框架（chrome）只填槽、不得改写；"
+            "{{PAGE_CONTENT}} 须遵守已注入的 designer §3.1 与页型最低信息结构原文。"
             "替换预铺 HTML 中实际出现的占位符（含 {{THEME_CSS_VARIABLES}}、"
             "{{THEME_CSS_RULES}}、{{PAGE_TITLE}}、{{PAGE_CONTENT}}、{{PAGE_FOOTER}}，"
             "未提供的主题槽填空）。保留框架 class/@layer/theme-contract 插槽结构；"
@@ -1712,7 +1751,9 @@ def _build_content_template_fill_system_prompt(
         prompt += "只输出完整 HTML 原文，不要解释、不要 Markdown 代码块。"
         return prompt
     prompt = (
-        "你是 PPT 内容页模板填充师，不是设计师。"
+        "你是 PPT 内容页模板填充师。"
+        "框架（chrome）只填槽、不得改写；"
+        "{{PAGE_CONTENT}} 须遵守已注入的 designer §3.1 与页型最低信息结构原文。"
         "唯一任务：在预铺 HTML 上替换 {{PAGE_TITLE}}、{{PAGE_CONTENT}}、{{PAGE_FOOTER}} 三处占位符。"
     )
     if is_chart:

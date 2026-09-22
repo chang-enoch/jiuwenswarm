@@ -20,6 +20,7 @@ from openjiuwen.agent_teams.paths import team_home
 from openjiuwen.agent_teams.runtime.pool import RuntimeState
 from openjiuwen.agent_teams.schema.blueprint import TeamAgentSpec
 from openjiuwen.agent_teams.context import reset_session_id, set_session_id
+from openjiuwen.agent_teams import observability as team_observability
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.common.logging import server_logger
 from openjiuwen.harness import DeepAgent
@@ -56,7 +57,7 @@ from jiuwenswarm.agents.harness.team.distributed_runtime import (
 from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
 from jiuwenswarm.agents.harness.team import kv_cache_hooks
 from jiuwenswarm.agents.harness.team.remote_member_bootstrap import release_a2x_reservations_for_session
-from jiuwenswarm.agents.harness.team.team_skill_links import sync_skill_dir_links
+from jiuwenswarm.agents.harness.team.team_skill_links import offload_link_sync, sync_skill_dir_links
 from jiuwenswarm.common.config import (
     get_config,
     get_default_models,
@@ -64,11 +65,9 @@ from jiuwenswarm.common.config import (
     get_skill_create_enabled,
     get_skill_evolution_enabled,
 )
-from jiuwenswarm.agents.harness.observability_runtime import (
-    acquire_observability_demand,
-    build_observability_config,
-    release_observability_demand,
-)
+from jiuwenswarm.agents.harness.observability_runtime import build_observability_config
+from jiuwenswarm.observability.config import load_trajectory_store_settings  # noqa: E402
+from jiuwenswarm.observability.runtime import sync_trajectory_runtime  # noqa: E402
 from jiuwenswarm.common.reasoning_injector import build_reasoning_model_request_kwargs
 from jiuwenswarm.agents.harness.team.team_runtime_inheritance import (
     MemberInfo,
@@ -141,6 +140,9 @@ def sync_team_observability() -> None:
     Evolution also requests the provider when the explicit switch is disabled.
     """
     global _observability_active, _runtime_managed_observability
+
+    config = get_config()
+    trajectory_settings = load_trajectory_store_settings(config)
     try:
         unified_active = bool(_get_unified_runtime().is_unified_active())
     except Exception as exc:
@@ -152,7 +154,7 @@ def sync_team_observability() -> None:
         # Same gap as single-agent: unified runtime must still host the
         # shared TrajectorySpanProcessor for skill / team evolution rails.
         try:
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 ensure_trajectory_span_processor_attached,
             )
 
@@ -163,17 +165,24 @@ def sync_team_observability() -> None:
                 "on unified path: %s",
                 exc,
             )
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime init failed: %s", exc)
         return
     if _runtime_managed_observability:
         _observability_active = False
         _runtime_managed_observability = False
 
-    config = get_config()
     cfg = config.get("team_observability", {}) or {}
     evolution_requested = get_skill_evolution_enabled(config)
-    want_enabled = bool(cfg.get("enabled", False)) or evolution_requested
+    want_enabled = bool(cfg.get("enabled", False)) or trajectory_settings.enabled or evolution_requested
 
     if not want_enabled:
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime stop failed: %s", exc)
         if _observability_active:
             shutdown_team_observability()
         return
@@ -185,12 +194,13 @@ def sync_team_observability() -> None:
             service_name="jiuwenswarm",
             traces_dir=traces_dir,
         )
-        provider_existed = acquire_observability_demand(
-            "team",
-            observability_config=obs_cfg,
-        )
+        provider_existed = team_observability.acquire_observability(obs_cfg)
         was_active = _observability_active
         _observability_active = True
+        try:
+            sync_trajectory_runtime(trajectory_settings, demand="team")
+        except Exception as exc:
+            logger.warning("[TeamObservability] trajectory runtime init failed: %s", exc)
         if not was_active and not provider_existed:
             if cfg.get("exporter", "otlp_grpc") == "file":
                 logger.info(
@@ -223,7 +233,7 @@ def shutdown_team_observability() -> None:
         _runtime_managed_observability = False
         return
     try:
-        release_observability_demand("team")
+        team_observability.release_observability()
         _observability_active = False
         logger.info("[TeamObservability] disabled")
     except Exception as exc:
@@ -1342,8 +1352,17 @@ class TeamManager:
         )
 
     @staticmethod
-    def _initialize_team_shared_skill_links(spec: TeamAgentSpec) -> None:
-        """Initialize team shared skill links from the global skill root."""
+    async def _initialize_team_shared_skill_links(spec: TeamAgentSpec) -> None:
+        """Initialize team shared skill links from the global skill root.
+
+        The sync is filesystem-heavy - one lstat per global skill entry plus one
+        link creation per new skill - and runs once per team on the first
+        request. It must not run inline on the event loop: on 2026-09-18 a
+        machine where each ``cmd.exe`` junction creation cost about a second
+        stalled the loop for 268s (BUG20260918365771). It also must complete
+        before the first team turn starts, so callers await it rather than
+        fire-and-forget.
+        """
         global_skills_dir = get_agent_skills_dir()
         if not global_skills_dir.exists():
             logger.warning("[TeamManager] global_skills_dir does not exist: %s", global_skills_dir)
@@ -1357,8 +1376,11 @@ class TeamManager:
 
         team_shared_skills_dir = Path(ws_path) / "skills"
 
-        team_shared_skills_dir.mkdir(parents=True, exist_ok=True)
-        sync_skill_dir_links(global_skills_dir, team_shared_skills_dir)
+        def _sync() -> None:
+            team_shared_skills_dir.mkdir(parents=True, exist_ok=True)
+            sync_skill_dir_links(global_skills_dir, team_shared_skills_dir)
+
+        await asyncio.to_thread(_sync)
 
         logger.info("[TeamManager] Initialized team shared skill links: %s", team_shared_skills_dir)
 
@@ -1371,13 +1393,13 @@ class TeamManager:
         return Path(ws_path) / "skills"
 
     @staticmethod
-    def ensure_team_shared_skills_initialized(spec: TeamAgentSpec) -> None:
+    async def ensure_team_shared_skills_initialized(spec: TeamAgentSpec) -> None:
         """Ensure team shared skills are available in the team workspace."""
-        TeamManager._initialize_team_shared_skill_links(spec)
+        await TeamManager._initialize_team_shared_skill_links(spec)
 
-    def ensure_team_shared_skills_ready_for_session(self, session_id: str, spec: TeamAgentSpec) -> None:
+    async def ensure_team_shared_skills_ready_for_session(self, session_id: str, spec: TeamAgentSpec) -> None:
         """Ensure team shared skills are initialized and registered for refresh."""
-        self.ensure_team_shared_skills_initialized(spec)
+        await self.ensure_team_shared_skills_initialized(spec)
         self.register_team_shared_skill_link_target(
             session_id,
             self._resolve_team_shared_skills_dir(spec),
@@ -1388,7 +1410,12 @@ class TeamManager:
         self._team_shared_skill_link_targets[session_id] = target
 
     def refresh_team_shared_skill_links(self, session_id: str) -> bool:
-        """Refresh team shared skill links from global skills."""
+        """Refresh team shared skill links from global skills.
+
+        The sync is offloaded to a worker thread when this runs on the event
+        loop (rail refresh callbacks are sync callables invoked there); see
+        ``offload_link_sync``.
+        """
         target = self._team_shared_skill_link_targets.get(session_id)
         if target is None:
             logger.debug("[TeamManager] no team shared skill link target for session_id=%s", session_id)
@@ -1397,8 +1424,12 @@ class TeamManager:
         if not global_skills_dir.exists():
             logger.warning("[TeamManager] global_skills_dir does not exist: %s", global_skills_dir)
             return False
-        sync_skill_dir_links(global_skills_dir, target)
-        logger.info("[TeamManager] Refreshed team shared skill links: session_id=%s target=%s", session_id, target)
+        offload_link_sync(global_skills_dir, target)
+        logger.info(
+            "[TeamManager] Scheduled refresh of team shared skill links: session_id=%s target=%s",
+            session_id,
+            target,
+        )
         return True
 
     def refresh_all_team_shared_skill_links(self) -> int:
@@ -1463,7 +1494,7 @@ class TeamManager:
             team_agent.channel_id = bootstrap.channel_id  # 记录 channel，供 _destroy_other_sessions 按 channel 隔离
             self._team_agents[session_id] = team_agent
             # After build, initialize team shared skill links.
-            self.ensure_team_shared_skills_ready_for_session(session_id, spec)
+            await self.ensure_team_shared_skills_ready_for_session(session_id, spec)
 
             if self._is_distributed_mode(config_base):
                 try:
@@ -1834,7 +1865,8 @@ class TeamManager:
             logger.info("[TeamManager] all teams cleaned")
 
     def get_team_agent(self, session_id: str) -> TeamAgent | None:
-        return self._team_agents.get(session_id)
+        """Return the live Team leader for either supported runtime path."""
+        return self._team_agents.get(session_id) or self._runner_team_agents.get(session_id)
 
     def _lookup_cached_team_agent(self, session_id: str) -> TeamAgent | None:
         """Return the live TeamAgent if this process still holds one."""

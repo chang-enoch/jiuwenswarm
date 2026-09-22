@@ -49,19 +49,77 @@ _OUTLINE_CONTENT = """### P3: 市场趋势
 """
 
 
-def test_extract_designer_for_fill_uses_density_checklist_only():
+_DESIGNER_31_SLICE = """
+#### 3.1 选材与定型（选内容 + 定表达形式）
+
+**C. 内容分块（强制）**
+
+把素材切成 3–6 个内容块。MARKER_C_BLOCKS
+
+**D. 表达形式选择（强制）**
+
+| 素材特征 | 首选形式 | 可选 | 不得使用 |
+| --- | --- | --- | --- |
+| 时间序列、趋势、同比环比 | 折线图 / 柱状图（ECharts） | 带升降标记的指标卡 | 纯文字罗列数值 |
+| 多对象 × 多维度对比 | 表格 / 对比矩阵 | 分组柱状图 | 并列大段文字 |
+
+MARKER_D_FORM_TABLE
+
+**D-2. 承载骨架配方（强制，选完形式紧接着定）**
+
+| 形式 | 稳定骨架 |
+| --- | --- |
+| 表格 / 对比矩阵 | 默认 `<table class="w-full">` 自然行高 |
+| 统计图表 | 见 charts.md 固定配方 |
+
+选定即冻结：承载骨架属于本步的决定。MARKER_D2_SKELETON
+
+**E. 写前版面意图（生成 HTML 前必须完成）**
+
+写前确认 role/form。MARKER_E_INTENT
+
+#### 3.2 版面落地（简化规则）
+
+3.2 不应进入 content-fill 切片 MARKER_32_LEAK
+
+##### 按页面类型的最低信息结构（下限）
+
+| 页面类型 | 最低语义结构 | 证据要求 |
+| --- | --- | --- |
+| `technology` 架构页 | ≥3 个层级或模块 + 职责 + 关系 | 含总结或关键设计原则 |
+| `case` 案例页 | 背景、问题、方案、结果四段 | 结果含至少 1 项可验证指标 |
+
+MARKER_DENSITY_FLOOR
+
+##### 信息表达转换规则
+
+转换规则不应进入下限切片 MARKER_CONVERT_LEAK
+""".strip()
+
+
+def test_extract_designer_for_fill_includes_31_form_not_appendix():
     long_designer = (
         "## 用户显式要求优先\n必须遵守用户色板\n\n"
-        "**E. 写前版面意图**\n长文版面意图若干行\n\n"
+        f"{_DESIGNER_31_SLICE}\n\n"
         "## 关键原则\n禁止空卡片\n"
     )
     out = _extract_designer_section(
         long_designer,
         for_content_template_fill=True,
-        appendix_text="## 弹性布局模式\n很多附录文字\n",
+        appendix_text="## 弹性布局模式\n很多附录文字 MARKER_FLEX_LEAK\n",
     )
     assert _CONTENT_FILL_DENSITY_CHECKLIST in out
+    assert "MARKER_D_FORM_TABLE" in out
+    assert "MARKER_D2_SKELETON" in out
+    assert "MARKER_C_BLOCKS" in out
+    assert "选定即冻结" in out
+    assert "MARKER_DENSITY_FLOOR" in out
+    assert "按页面类型的最低信息结构" in out
+    assert "MARKER_E_INTENT" not in out
     assert "写前版面意图" not in out
+    assert "MARKER_32_LEAK" not in out
+    assert "MARKER_CONVERT_LEAK" not in out
+    assert "MARKER_FLEX_LEAK" not in out
     assert "弹性布局模式" not in out
 
 
@@ -75,6 +133,66 @@ def test_extract_designer_for_fill_appends_charts_when_requested():
     )
     assert _CONTENT_FILL_DENSITY_CHECKLIST in out
     assert "CHART_SCAFFOLD" in out
+
+
+def test_content_fill_prompt_omits_homogeneous_layout_shell_and_uses_31():
+    prompt = _build_content_template_fill_prompt(
+        page_number=3,
+        style_id="custom",
+        style_text="style body",
+        outline_page=_OUTLINE_CONTENT,
+        research_page="趋势数据与对比矩阵",
+        outline_full="full outline unused",
+        seed_html=_MINIMAL_SEED_HTML,
+        designer_md_text=_DESIGNER_31_SLICE,
+    )
+    assert "MARKER_D_FORM_TABLE" in prompt
+    assert "MARKER_D2_SKELETON" in prompt
+    assert "选定即冻结" in prompt
+    assert "MARKER_DENSITY_FLOOR" in prompt
+    assert "本页定型已冻结" not in prompt
+    assert "primary_form" not in prompt
+    assert "禁止跨页复用同一套" not in prompt
+    assert "4-6 个关键数字卡片" not in prompt
+    assert "6 个核心论点卡片" not in prompt
+    assert "参考布局（data 类型" not in prompt
+    assert "参考布局（trend 类型" not in prompt
+
+
+def test_custom_content_fill_system_prompt_requires_31_form_not_anti_designer():
+    text = _build_content_template_fill_system_prompt(
+        style_id="custom",
+        page_type="content",
+        outline_page=_OUTLINE_CONTENT,
+        research_page="research",
+    )
+    assert "不是设计师" not in text
+    assert "§3.1" in text or "designer §3.1" in text
+    assert "页型最低信息结构" in text
+    assert "PAGE_CONTENT" in text
+    assert "chrome" in text.lower() or "框架" in text
+    assert "primary_form" not in text
+
+
+def test_content_fill_prompt_has_no_turbo_form_freeze():
+    outline = """### P5: 模型
+- **类型**: technology
+- **标题**: 分工模型
+"""
+    for style_id in ("custom", "business-classic"):
+        prompt = _build_content_template_fill_prompt(
+            page_number=5,
+            style_id=style_id,
+            style_text="style",
+            outline_page=outline,
+            research_page="research",
+            outline_full="",
+            seed_html=_MINIMAL_SEED_HTML,
+            designer_md_text=_DESIGNER_31_SLICE,
+        )
+        assert "本页定型已冻结" not in prompt
+        assert "layout_recipe_not_realized" not in prompt
+        assert "MARKER_DENSITY_FLOOR" in prompt
 
 
 def test_fix_chart_scaffold_activation_strips_html_comment_markers():

@@ -258,6 +258,7 @@ from jiuwenswarm.server.runtime.agent_adapter.llm_io_trace import (
 from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     SKILL_EVOLUTION_APPROVAL_SCHEMA,
+    PermissionRailBuildOptions,
     build_permission_rail,
     convert_interactions_to_ask_user_question,
 )
@@ -297,7 +298,14 @@ from jiuwenswarm.agents.harness.common.rails.concurrent_safe_rails import (
 )
 from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.common.hooks_config import load_hooks_config
+from jiuwenswarm.common.log_context import reset_log_session_id, set_log_session_id
 from jiuwenswarm.common.log_preview import preview_text
+from jiuwenswarm.common.mode_matrix import (
+    canonicalize_mode_text,
+    compose_web_mode,
+    deprecate_mode,
+    normalize_work_mode,
+)
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
 from jiuwenswarm.server.hooks.user_hook_rail import UserHookRail
@@ -324,10 +332,12 @@ from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context
 from jiuwenswarm.agents.harness.common.rails.permissions.config_loader import (
     get_base_permissions_config,
     get_effective_permissions_config,
+    lookup_standard_permissions_agent_id,
     merge_session_permissions_overlay,
     reset_permissions_agent_base,
     reset_permissions_session_scope,
     resolve_permissions_body_from_enterprise,
+    resolve_yaml_agent_permissions_body,
     setup_permissions_agent_base,
     setup_permissions_session_scope,
 )
@@ -337,8 +347,12 @@ from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager
 from jiuwenswarm.server.runtime.prompt_attachment_loader import PromptAttachmentLoader
 from jiuwenswarm.server.runtime.agent_adapter.evolution_helpers import (
     EVOLUTION_ACCEPT_LABELS,
+    AUTO_REBUILD_SOURCE_MANUAL,
+    AUTO_REBUILD_SOURCE_WATCHER,
     EVOLUTION_EXECUTE_LABELS,
+    AutoRebuildJob,
     EvolutionPushContext,
+    auto_rebuild_job,
     REGULAR_EVOLUTION_SLASH_WARNING_PHRASES,
     TEAM_EVOLUTION_EVENT_TIMEOUT_SEC,
     TEAM_EVOLUTION_HIDDEN_TERMINAL_STAGES,
@@ -358,11 +372,14 @@ from jiuwenswarm.server.runtime.agent_adapter.evolution_helpers import (
     is_evolution_outcome_event,
     merge_evolution_disabled_skills,
     push_evolution_event,
+    push_evolution_generated,
     push_evolution_progress,
+    push_evolution_published,
     push_evolution_status,
     record_ids_from_pending_approval,
     reject_evolution_records,
     resolve_evolution_event_timeout_sec,
+    snapshot_auto_evolution_metric_items,
     sync_evolution_disabled_skills,
     team_evolution_terminal_progress,
     terminal_stage,
@@ -426,6 +443,9 @@ from jiuwenswarm.agents.harness.common.rails.a2a_outbound_toolkit_rail import (
 )
 from jiuwenswarm.symphony.config import load_symphony_config
 from jiuwenswarm.agents.harness.common.tools.wiki_tools import wiki_ingest, wiki_query, wiki_lint
+from jiuwenswarm.agents.harness.common.long_horizon.tools import (
+    get_decorated_tools as get_long_horizon_tools,
+)
 from jiuwenswarm.agents.harness.common.tools.harness_named_web_tools import (
     build_jiuwen_harness_named_web_tools,
 )
@@ -753,6 +773,18 @@ def get_runtime_tool_a2a_policy_id() -> str:
     return _RUNTIME_TOOL_A2A_POLICY_ID.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_observability_mode(params: dict[str, Any]) -> str:
+    """Return the canonical mode written into trajectory span attributes."""
+    raw_mode = params.get("mode", "agent")
+    normalized_mode = canonicalize_mode_text(raw_mode)
+    work_mode = normalize_work_mode(params.get("work_mode"))
+    if work_mode is not None:
+        composed_mode = compose_web_mode(normalized_mode, work_mode)
+        if composed_mode is not None:
+            return str(deprecate_mode(composed_mode[2]))
+    return str(deprecate_mode(raw_mode))
 
 _PERSISTENT_CHECKPOINTER_LOCK: asyncio.Lock | None = None
 _PERSISTENT_CHECKPOINTER_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
@@ -1667,28 +1699,95 @@ def _deep_agent_kv_cache_affinity_config(
 
 def _build_context_assemble_rail(
     disabled_tools: list[str] | None = None,
+    tool_name_allowlist: list[str] | None = None,
 ) -> ContextAssembleRail | None:
     """Build ContextAssembleRail.
 
     ``disabled_tools`` seeds the tools prompt hide-list. Product adapters own
     the blacklist data flow at construction time (and optional later
-    ``update_disabled_tools`` calls). Compatible with older openjiuwen / test
-    fakes whose constructor does not accept ``disabled_tools=``: fall back to
-    no-arg construction and ``update_disabled_tools`` when available.
+    ``update_disabled_tools`` calls).
+
+    ``tool_name_allowlist`` (typically ProgressiveToolRail.eager_tools) keeps the
+    system ``# 可用工具`` section aligned with the fixed eager schema so deferred
+    / OfficeClaw MCP registrations do not rewrite the prompt prefix mid-task.
+    Compatible with older openjiuwen / test fakes whose constructor does not
+    accept the newer kwargs.
+
+    Merge order: land agent-core !2840 (``tool_name_allowlist`` + tools-section
+    fingerprint ``has_section`` guard) before this change. Without !2840 the
+    modern kwargs raise ``TypeError`` and we silently fall back to the legacy
+    constructor / optional setter path.
     """
     try:
+        ctor_path = "modern"
+        effective_disabled: list[str] | None = disabled_tools
+        effective_allowlist: list[str] | None = tool_name_allowlist
         try:
-            context_assemble_rail = ContextAssembleRail(disabled_tools=disabled_tools)
+            context_assemble_rail = ContextAssembleRail(
+                disabled_tools=disabled_tools,
+                tool_name_allowlist=tool_name_allowlist,
+            )
         except TypeError:
-            context_assemble_rail = ContextAssembleRail()
-            update = getattr(context_assemble_rail, "update_disabled_tools", None)
-            if callable(update) and disabled_tools:
-                update(disabled_tools)
-        logger.info("[JiuWenSwarmDeepAdapter] ContextAssembleRail create success")
+            # Requested allowlist is not in effect until a setter applies it.
+            effective_allowlist = None
+            try:
+                context_assemble_rail = ContextAssembleRail(disabled_tools=disabled_tools)
+                ctor_path = "legacy_disabled_kw"
+            except TypeError:
+                context_assemble_rail = ContextAssembleRail()
+                ctor_path = "legacy_no_args"
+                effective_disabled = None
+                update = getattr(context_assemble_rail, "update_disabled_tools", None)
+                if callable(update) and disabled_tools:
+                    update(disabled_tools)
+                    effective_disabled = list(disabled_tools)
+            setter = getattr(context_assemble_rail, "set_tool_name_allowlist", None)
+            if callable(setter) and tool_name_allowlist is not None:
+                setter(tool_name_allowlist)
+                effective_allowlist = list(tool_name_allowlist)
+        # Prefer instance state when the rail exposes what actually stuck.
+        for attr in ("tool_name_allowlist", "_tool_name_allowlist"):
+            if hasattr(context_assemble_rail, attr):
+                effective_allowlist = getattr(context_assemble_rail, attr)
+                break
+        for attr in ("disabled_tools", "_disabled_tools"):
+            if hasattr(context_assemble_rail, attr):
+                value = getattr(context_assemble_rail, attr)
+                if isinstance(value, (set, frozenset)):
+                    effective_disabled = sorted(str(item) for item in value)
+                elif value is not None:
+                    effective_disabled = list(value)
+                else:
+                    effective_disabled = None
+                break
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] ContextAssembleRail create success "
+            "(path=%s disabled_tools=%s allowlist=%s)",
+            ctor_path,
+            list(effective_disabled) if effective_disabled else None,
+            list(effective_allowlist) if effective_allowlist else None,
+        )
     except Exception as exc:
         logger.warning("[JiuWenSwarmDeepAdapter] ContextAssembleRail create failed: %s", exc)
         context_assemble_rail = None
     return context_assemble_rail
+
+
+def _sync_context_assemble_tool_allowlist(
+    assemble: ContextAssembleRail | None,
+    progressive: Any | None,
+) -> None:
+    """Keep ContextAssemble tools-section allowlist aligned with eager schema."""
+    if assemble is None:
+        return
+    setter = getattr(assemble, "set_tool_name_allowlist", None)
+    if not callable(setter):
+        return
+    if progressive is None:
+        setter(None)
+        return
+    eager = getattr(progressive, "eager_tools", None) or []
+    setter(list(eager))
 
 
 def _resolve_session_memory_config(context_engine_cfg: dict[str, Any]) -> dict[str, Any] | None:
@@ -2255,9 +2354,13 @@ class JiuWenSwarmDeepAdapter:
         apply_deepagent_task_plan_binding_patch()
         self._instance: DeepAgent | None = None
         self._project_dir: str | None = None
-        # 企业多租户：企业版下可用外部传入的隔离 workspace / 租户 ID
+        # 多租户：调用方（企业版 AgentManager / 个人版 TenantAgentPool）显式
+        # 传入的隔离 workspace 优先，均未传时才回退全局默认工作区。此前个人版
+        # 被企业门禁挡掉、强制落全局默认，导致 officeclaw 租户请求的记忆文件
+        # 与索引全写进 agent_default。agent_id / service_id 保持企业语义不变
+        # （个人版的租户身份经 env 命名空间传递，不走这两个字段）。
         enterprise = is_enterprise()
-        if workspace_dir and enterprise:
+        if workspace_dir:
             self._workspace_dir: str = str(
                 collapse_nested_agent_workspace_dir(workspace_dir)
             )
@@ -2344,14 +2447,17 @@ class JiuWenSwarmDeepAdapter:
         self._skill_evolution_rail: SkillEvolutionRail | None = None
         self._evolution_interrupt_rail: EvolutionInterruptRail | None = None
         self._ttse_rail: Any | None = None
-        self._pending_auto_rebuild_skills: list[str] = []
+        self._pending_auto_rebuild_jobs: dict[str, AutoRebuildJob] = {}
         self._auto_rebuild_lock = asyncio.Lock()
         self._auto_rebuild_task: asyncio.Task | None = None
+        # Entry ids already pushed as ``chat.evolution_generated`` (skill\\0id).
+        self._auto_evolution_generated_ids: set[str] = set()
         self._skill_create_rail: SkillCreateRail | None = None
         self._subagent_rail: SubagentRail | None = None
         self._ask_user_rail: StructuredAskUserRail | None = None
         self._permission_rail: Any = None
         self._agent_permissions_body: dict[str, Any] | None = None
+        self._permissions_persist_agent_id: str | None = None
         self._skill_active_state_rail: SkillActiveStateRail | None = None
         self._skill_credential_injection_rail: SkillCredentialInjectionRail | None = None
         self._avatar_rail: Any = None
@@ -5486,6 +5592,7 @@ class JiuWenSwarmDeepAdapter:
             self._enterprise_resource_id_from_request(request) or None
         )
         self._agent_permissions_body = resolve_permissions_body_from_enterprise(loaded)
+        self._permissions_persist_agent_id = None
         if loaded is not None and self._skill_manager is not None:
             try:
                 await self._skill_manager.apply_skill_source_configs(
@@ -6809,7 +6916,7 @@ class JiuWenSwarmDeepAdapter:
         if is_enterprise() and self._workspace_dir:
             # 企业多租户：挂载当前 workspace 根，修复下载路径权限
             shared_dir = str(Path(self._workspace_dir).resolve().parent.parent)
-        return create_sandbox_sysop_card(
+        card = create_sandbox_sysop_card(
             sandbox_url,
             sandbox_type,
             files_runtime=runtime.get("files"),
@@ -6822,6 +6929,7 @@ class JiuWenSwarmDeepAdapter:
             startup_mode=get_sandbox_startup_mode(),
             shared_dir=shared_dir,
         )
+        return card
 
     def _resolve_project_dir_for_sandbox(self) -> str | None:
         """Best-effort lookup of the user project directory for sandbox builds.
@@ -7073,6 +7181,17 @@ class JiuWenSwarmDeepAdapter:
                     return registered_sys_operation
                 logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", result.msg())
                 return None
+            # 仅在真正 add 成功（非复用）时打 create_sandbox UA
+            if runtime.get("enabled") and sandbox_url and sandbox_type:
+                from jiuwenswarm.common.audit_emit import emit_audit_ua
+                from jiuwenswarm.common.audit_net import resolve_peer_ip
+
+                emit_audit_ua(
+                    SUBMDL="sandbox",
+                    PROC="create_sandbox",
+                    sandbox_type=sandbox_type,
+                    DSTIP=resolve_peer_ip(sandbox_url),
+                )
             return Runner.resource_mgr.get_sys_operation(sysop_card.id)
         except Exception as exc:
             logger.warning("[JiuWenSwarmDeepAdapter] add sys_operation failed: %s", exc)
@@ -7917,7 +8036,7 @@ class JiuWenSwarmDeepAdapter:
         """
         if not get_skill_evolution_enabled(config):
             return None
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -8029,7 +8148,7 @@ class JiuWenSwarmDeepAdapter:
                     base_url=emb_cfg["base_url"],
                     model=emb_cfg["model"],
                 )
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 
@@ -8162,7 +8281,7 @@ class JiuWenSwarmDeepAdapter:
             if self._skill_manager is not None
             else []
         )
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -8377,7 +8496,7 @@ class JiuWenSwarmDeepAdapter:
                 logger.debug("[JiuWenSwarmDeepAdapter] SkillCreateRail disabled by config")
                 return None
 
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 
@@ -8784,6 +8903,17 @@ class JiuWenSwarmDeepAdapter:
             has_base_url = embed_config.get("base_url") if isinstance(embed_config, dict) else None
             has_model = embed_config.get("model") if isinstance(embed_config, dict) else None
             if not all([has_api_key, has_base_url, has_model]):
+                embed_cfg = config.get("embed") if isinstance(config, dict) else None
+                embed_cfg = embed_cfg if isinstance(embed_cfg, dict) else {}
+                embed_config = {
+                    "api_key": embed_cfg.get("embed_api_key"),
+                    "base_url": embed_cfg.get("embed_base_url") or embed_cfg.get("embed_api_base"),
+                    "model": embed_cfg.get("embed_model"),
+                }
+                has_api_key = embed_config.get("api_key")
+                has_base_url = embed_config.get("base_url")
+                has_model = embed_config.get("model")
+            if not all([has_api_key, has_base_url, has_model]):
                 logger.warning(
                     "[JiuWenSwarmDeepAdapter] MemoryRail create failed: No available embedding config"
                 )
@@ -9127,19 +9257,17 @@ class JiuWenSwarmDeepAdapter:
         # for task-loop runs, or agent.<name>.invoke for single-round) under the root
         # run span per iteration/round. It is the only thing that creates the
         # task_iteration / invoke spans that llm.call + tool.* nest under. It
-        # self-disables (before_* returns early when get_team_span() is None), so
+        # self-disables (before_* returns early when there is no run root span), so
         # attaching it unconditionally is safe and also adapts to runtime
         # enable/disable of agent_observability without rebuilding the agent.
+        # The harness rail owns the complete single-agent tier; team identity is
+        # supplied separately by the team blueprint.
         try:
-            from openjiuwen.agent_teams.observability.rail import ObservabilityRail
-            from jiuwenswarm.agents.harness.agent_observability import (
-                AgentTraceBindingRail,
-            )
+            from openjiuwen.harness.observability import AgentObservabilityRail
 
-            rails_list.append(AgentTraceBindingRail())
-            rails_list.append(ObservabilityRail())
+            rails_list.append(AgentObservabilityRail())
         except Exception as exc:
-            logger.warning("%s Failed to attach ObservabilityRail: %s", log_prefix, exc)
+            logger.warning("%s Failed to attach AgentObservabilityRail: %s", log_prefix, exc)
         stage_timer.mark("observability_rail")
 
         # Bind tenant checkpointer after rails exist (set_checkpoint runs earlier).
@@ -9450,15 +9578,18 @@ class JiuWenSwarmDeepAdapter:
         elif permission_config.get("enabled", False):
             self._permission_rail = build_permission_rail(
                 config=config_base or {},
-                llm=self._model,
-                model_name=config_base.get("models", {})
-                .get("default", {})
-                .get("model_client_config", {})
-                .get("model_name", "gpt-4")
-                if isinstance(config_base, dict)
-                else "gpt-4",
-                permission_config=self._agent_permissions_body,
-                resolve_workspace_dir=self._permission_workspace_dir,
+                options=PermissionRailBuildOptions(
+                    llm=self._model,
+                    model_name=config_base.get("models", {})
+                    .get("default", {})
+                    .get("model_client_config", {})
+                    .get("model_name", "gpt-4")
+                    if isinstance(config_base, dict)
+                    else "gpt-4",
+                    permission_config=self._agent_permissions_body,
+                    resolve_workspace_dir=self._permission_workspace_dir,
+                    persist_target_agent_id_provider=self._permissions_persist_target,
+                ),
             )
             if self._permission_rail is not None:
                 logger.info("[JiuWenSwarmDeepAdapter] _permission_rail newly created on hot-reload")
@@ -9544,11 +9675,52 @@ class JiuWenSwarmDeepAdapter:
         """冷启动构建 permission rail：注入 Agent 级模板 body。"""
         return build_permission_rail(
             config=config or {},
-            llm=llm if llm is not None else self._model,
-            model_name=model_name,
-            permission_config=self._agent_permissions_body,
-            resolve_workspace_dir=self._permission_workspace_dir,
+            options=PermissionRailBuildOptions(
+                llm=llm if llm is not None else self._model,
+                model_name=model_name,
+                permission_config=self._agent_permissions_body,
+                resolve_workspace_dir=self._permission_workspace_dir,
+                persist_target_agent_id_provider=self._permissions_persist_target,
+            ),
         )
+
+    def _permissions_persist_target(self) -> str | None:
+        return getattr(self, "_permissions_persist_agent_id", None)
+
+    def _lookup_permissions_agent_id(self, request: Any | None = None) -> str | None:
+        """标准版 permissions 查找键：request ``extract_ids`` 或 Manager ``_env_agent_id``。
+
+        不使用仅企业版赋值的 ``self._agent_id``。无明确 id 时返回 ``None``（回落全局），
+        避免合成 ``"default"`` 误命中 ``agents.default``。进池后若
+        ``resolve_control_rpc_tenant`` 重映射，与选中的 AgentManager 使用同一 key。
+        """
+        extracted = None
+        if request is not None:
+            try:
+                from jiuwenswarm.server.runtime.tenant_agent_pool import TenantAgentPool
+
+                agent_id, _service_id, _workspace_key = TenantAgentPool.extract_ids(request)
+                if agent_id:
+                    extracted = str(agent_id).strip() or None
+            except Exception:  # noqa: BLE001
+                raw = getattr(request, "agent_id", None)
+                if raw is not None and str(raw).strip():
+                    extracted = str(raw).strip()
+        env_id = getattr(self, "_env_agent_id", None)
+        return lookup_standard_permissions_agent_id(extracted, env_id)
+
+    def _refresh_standard_agent_permissions_body(self, request: Any | None = None) -> None:
+        """标准版：按 agent_id 绑定 yaml ``permissions.agents[id]``；未命中清空 Agent base。"""
+        if is_enterprise():
+            return
+        agent_id = self._lookup_permissions_agent_id(request)
+        body = resolve_yaml_agent_permissions_body(agent_id)
+        if body is not None:
+            self._agent_permissions_body = body
+            self._permissions_persist_agent_id = agent_id
+            return
+        self._agent_permissions_body = None
+        self._permissions_persist_agent_id = None
 
     def _bind_agent_permissions_base(self) -> Any:
         """将 Agent 模板 permissions body 绑定到当前 Task（供 snapshot/生效读路径）。"""
@@ -9664,8 +9836,16 @@ class JiuWenSwarmDeepAdapter:
                         ),
                         invocation_id=active_mcp.invocation_id or None,
                     )
+                _sync_context_assemble_tool_allowlist(
+                    self._context_assemble_rail,
+                    progressive_tool_rail,
+                )
             elif old_progressive_tool_rail is not None:
                 rails_to_unregister.append(old_progressive_tool_rail)
+                _sync_context_assemble_tool_allowlist(
+                    self._context_assemble_rail,
+                    None,
+                )
 
         # 统一工具开关热更新：重建式（与 ProgressiveToolRail 一致）。
         # 旧 rail uninit 时回滚它注销的工具（重新注册），新 rail init 再按新名单注销。
@@ -9870,6 +10050,20 @@ class JiuWenSwarmDeepAdapter:
         for wtool in [wiki_ingest, wiki_query, wiki_lint]:
             registered = self._register_shared_tool(wtool)
             tool_cards.append(registered.card)
+
+        if not is_enterprise():
+            try:
+                for lh_tool in get_long_horizon_tools(
+                    language=self._resolve_runtime_language()
+                ):
+                    registered = self._register_shared_tool(lh_tool)
+                    tool_cards.append(registered.card)
+                logger.info("[JiuWenSwarmDeepAdapter] long_horizon_task tool registered")
+            except Exception as exc:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] long_horizon_task tool registration failed: %s",
+                    exc,
+                )
 
         from jiuwenswarm.agents.harness.common.tools.web_search.content_cache import (
             get_agent_cache_registry,
@@ -10192,6 +10386,8 @@ class JiuWenSwarmDeepAdapter:
             bootstrap_request = self._instance_overrides.pop("request", None)
             if bootstrap_request is not None and is_enterprise():
                 await self._load_enterprise_config(bootstrap_request)
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(bootstrap_request)
             config_base = merge_memory_config_into_config(config_base)
             config_base = self._merge_enterprise_models_into_config(config_base)
             # 与模型槽位一致：Agent 级 permissions 模板在构建 rail 前绑定到 Task
@@ -10291,7 +10487,7 @@ class JiuWenSwarmDeepAdapter:
                 should_enable_general_agent = should_add_general_agent and (
                     sub_mode == "plan" or (isinstance(mode, str) and mode.startswith("agent"))
                 )
-                from jiuwenswarm.agents.harness.observability_runtime import (
+                from openjiuwen.extensions.observability.demand import (
                     get_trajectory_span_processor,
                 )
 
@@ -11256,14 +11452,22 @@ class JiuWenSwarmDeepAdapter:
                 )
             self._context_assemble_rail = _build_context_assemble_rail(
                 disabled_tools=disabled_list or None,
+                tool_name_allowlist=(
+                    list(self._progressive_tool_rail.eager_tools)
+                    if self._progressive_tool_rail is not None
+                    else None
+                ),
             )
             self._context_assemble_mode = "agent"
             if self._context_assemble_rail is not None:
                 await self._instance.register_rail(self._context_assemble_rail)
                 logger.info(
                     "[JiuWenSwarmDeepAdapter] ContextAssembleRail registered for agent mode "
-                    "(disabled_tools=%s)",
+                    "(disabled_tools=%s allowlist=%s)",
                     disabled_list,
+                    list(self._progressive_tool_rail.eager_tools)
+                    if self._progressive_tool_rail is not None
+                    else None,
                 )
             else:
                 logger.warning(
@@ -11967,21 +12171,24 @@ class JiuWenSwarmDeepAdapter:
             card=getattr(self._instance, "card", None),
         )
         await session.pre_run(inputs={})
-        # Bind env overlay so the DeepAgent supervisor task (created by
-        # start() via asyncio.create_task) inherits the correct namespace.
-        # Without this, the supervisor task's context copy lacks the overlay
-        # and reads env from the wrong namespace (default/default).
+        # Bind env overlay and session id so the DeepAgent supervisor task
+        # (created by start() via asyncio.create_task) copies them. One
+        # supervisor serves one session, so this value is not updated later.
+        from jiuwenswarm.common.log_context import bind_log_session, unbind_log_session
+
+        log_bind = bind_log_session(session_id)
         ns_token, overlay_token, wk_token = self._bind_request_env_overlay()
         try:
             await self._instance.start(session=session)
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
+                session_id,
+            )
         finally:
             self._reset_request_env_bindings(ns_token, overlay_token, wk_token)
+            unbind_log_session(*log_bind)
         if getattr(self._instance, "_interaction_started", True) is not True:
             raise RuntimeError(f"DeepAgent interaction did not become ready: {session_id}")
-        logger.info(
-            "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
-            session_id,
-        )
 
     async def prepare_session(
         self,
@@ -12254,7 +12461,7 @@ class JiuWenSwarmDeepAdapter:
 
         fallback_handler = self._create_skill_turbo_fallback_handler()
 
-        return {
+        cfg: dict[str, Any] = {
             "skill_codes_dir": "jiuwenswarm.server.runtime.skill_turbo.skill_codes",
             "tool_cards": tool_cards,
             "model_client": self._model,
@@ -12267,6 +12474,13 @@ class JiuWenSwarmDeepAdapter:
             "image_gen_enabled": bool(self._image_gen_model_config),
             "sys_operation": self._sys_operation,
         }
+        body = getattr(self, "_agent_permissions_body", None)
+        if isinstance(body, dict):
+            cfg["permissions"] = copy.deepcopy(body)
+            persist_target = getattr(self, "_permissions_persist_agent_id", None)
+            if persist_target:
+                cfg["permissions_persist_target_agent_id"] = str(persist_target)
+        return cfg
 
     def _create_skill_turbo_fallback_handler(self) -> Any:
         """创建 SkillTurbo 节点级 fallback handler。"""
@@ -13351,6 +13565,7 @@ class JiuWenSwarmDeepAdapter:
 
         async def _resume_impl() -> AsyncIterator[AgentResponseChunk]:
             token_trace_sid = _LLM_TRACE_SESSION_ID.set(request.session_id or "default")
+            token_log_sid = set_log_session_id(request.session_id)
             token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
             token_trace_iter = _LLM_TRACE_ITERATION.set(0)
             token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -13517,6 +13732,7 @@ class JiuWenSwarmDeepAdapter:
             finally:
                 await _skill_turbo_clear_resume_in_flight(session)
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -15218,7 +15434,12 @@ class JiuWenSwarmDeepAdapter:
             )
             logger.info("[JiuWenSwarmDeepAdapter] evolution approval accepted: request_id=%s", request_id)
             if skill_for_rebuild:
-                self._queue_auto_rebuild_skill(skill_for_rebuild)
+                self._queue_auto_rebuild_skill(
+                    skill_for_rebuild,
+                    source=AUTO_REBUILD_SOURCE_MANUAL,
+                    request_id=request_id,
+                    push_metrics=False,
+                )
                 self._schedule_pending_auto_rebuild(request_id)
         else:
             await reject_evolution_records(
@@ -15524,19 +15745,63 @@ class JiuWenSwarmDeepAdapter:
         )
         return action == "auto"
 
-    def _queue_auto_rebuild_skill(self, skill_name: str) -> None:
+    def _queue_auto_rebuild_skill(
+        self,
+        skill_name: str,
+        *,
+        source: str = AUTO_REBUILD_SOURCE_MANUAL,
+        session_id: str = "",
+        channel_id: str | None = None,
+        request_id: str = "",
+        push_metrics: bool | None = None,
+    ) -> None:
         name = str(skill_name or "").strip()
         if not name:
             return
         if not self._should_auto_merge_evolved_skill(name):
             return
-        if name not in self._pending_auto_rebuild_skills:
-            self._pending_auto_rebuild_skills.append(name)
+        # Keep the first queued delivery context; later sessions must not overwrite.
+        if name in self._pending_auto_rebuild_jobs:
+            return
+        self._pending_auto_rebuild_jobs[name] = auto_rebuild_job(
+            name,
+            source=source,
+            session_id=session_id,
+            channel_id=channel_id,
+            request_id=request_id,
+            push_metrics=push_metrics,
+        )
+
+    def _take_pending_auto_rebuild_jobs(self) -> list[AutoRebuildJob]:
+        pending = list(self._pending_auto_rebuild_jobs.values())
+        self._pending_auto_rebuild_jobs.clear()
+        return pending
 
     def _take_pending_auto_rebuild_skills(self) -> list[str]:
-        pending = list(self._pending_auto_rebuild_skills)
-        self._pending_auto_rebuild_skills.clear()
-        return pending
+        """Compatibility drain used by tests; prefer ``_take_pending_auto_rebuild_jobs``."""
+        return [job.skill_name for job in self._take_pending_auto_rebuild_jobs()]
+
+    @staticmethod
+    def _generated_metric_id_key(skill_name: str, entry_id: str) -> str:
+        return f"{skill_name}\0{entry_id}"
+
+    def _filter_unreported_generated_items(
+        self,
+        skill_name: str,
+        items: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """Drop entry ids already pushed from this adapter (full-snapshot guard)."""
+        fresh: list[dict[str, str]] = []
+        for item in items:
+            entry_id = str(item.get("id") or "").strip()
+            if not entry_id:
+                continue
+            key = self._generated_metric_id_key(skill_name, entry_id)
+            if key in self._auto_evolution_generated_ids:
+                continue
+            self._auto_evolution_generated_ids.add(key)
+            fresh.append(item)
+        return fresh
 
     async def handle_skills_evolution_archives(self, params: dict) -> dict[str, Any]:
         """RPC: skills.evolution.archives — list rollback archive versions."""
@@ -15870,7 +16135,7 @@ class JiuWenSwarmDeepAdapter:
 
     def _schedule_pending_auto_rebuild(self, request_id: str | None = None) -> None:
         """Fire-and-forget version merge for skills queued after experience persist."""
-        if not self._pending_auto_rebuild_skills:
+        if not self._pending_auto_rebuild_jobs:
             return
         existing = self._auto_rebuild_task
         if existing is not None and not existing.done():
@@ -15903,20 +16168,79 @@ class JiuWenSwarmDeepAdapter:
         entries = getattr(evo_log, "entries", None) or []
         return bool(entries)
 
+    async def _push_auto_rebuild_published_metric(
+        self,
+        job: AutoRebuildJob,
+        *,
+        version: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Best-effort AOM ``published`` push after auto rebuild SemVer bump."""
+        if not job.push_metrics:
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] skip published metrics push: "
+                "skill=%s version=%s source=%s reason=source_not_auto_watcher",
+                job.skill_name,
+                version,
+                job.source,
+            )
+            return
+        session_id = str(job.session_id or "").strip()
+        channel_id = str(job.channel_id or "").strip() or None
+        rid = str(
+            request_id or job.request_id or "auto-rebuild"
+        ).strip() or "auto-rebuild"
+        if not session_id:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] skip published metrics push: "
+                "skill=%s version=%s request_id=%s reason=no_session_context",
+                job.skill_name,
+                version,
+                rid,
+            )
+            return
+        try:
+            from jiuwenswarm.server.gateway_push import WebSocketGatewayPushTransport
+
+            push_context = EvolutionPushContext(
+                transport=WebSocketGatewayPushTransport(),
+                channel_id=channel_id,
+                session_id=session_id,
+            )
+            await push_evolution_published(
+                push_context,
+                request_id=rid,
+                skill_name=job.skill_name,
+                version=version,
+                build_push_message=build_server_push_message,
+                source="auto",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] auto published metrics push failed: "
+                "skill=%s version=%s request_id=%s error=%s",
+                job.skill_name,
+                version,
+                rid,
+                exc,
+            )
+
     async def _run_auto_rebuild_skills_detached(self, *, request_id: str | None = None) -> None:
         """Background auto version merge gated by per-skill selfEvolution=auto."""
         try:
             async with self._auto_rebuild_lock:
                 while True:
-                    skills = self._take_pending_auto_rebuild_skills()
-                    if not skills:
+                    jobs = self._take_pending_auto_rebuild_jobs()
+                    if not jobs:
                         break
-                    for skill_name in skills:
+                    for job in jobs:
+                        skill_name = job.skill_name
+                        job_request_id = job.request_id or request_id
                         if not self._should_auto_merge_evolved_skill(skill_name):
                             logger.info(
                                 "[JiuWenSwarmDeepAdapter] skip auto rebuild: request_id=%s "
                                 "skill=%s reason=selfEvolution_not_auto",
-                                request_id,
+                                job_request_id,
                                 skill_name,
                             )
                             continue
@@ -15924,26 +16248,37 @@ class JiuWenSwarmDeepAdapter:
                             logger.info(
                                 "[JiuWenSwarmDeepAdapter] skip auto rebuild: request_id=%s "
                                 "skill=%s reason=no_evolution_records",
-                                request_id,
+                                job_request_id,
                                 skill_name,
                             )
                             continue
                         try:
-                            await self.generate_evolution_merge_version(
+                            result = await self.generate_evolution_merge_version(
                                 skill_name=skill_name
                             )
+                            new_version = ""
+                            success = False
+                            if isinstance(result, dict):
+                                success = bool(result.get("success"))
+                                new_version = str(result.get("new_version") or "").strip()
+                            if success and new_version:
+                                await self._push_auto_rebuild_published_metric(
+                                    job,
+                                    version=new_version,
+                                    request_id=job_request_id,
+                                )
                         except Exception as exc:
                             logger.warning(
                                 "[JiuWenSwarmDeepAdapter] auto rebuild failed: "
                                 "request_id=%s skill=%s error=%s",
-                                request_id,
+                                job_request_id,
                                 skill_name,
                                 exc,
                             )
         finally:
             # Close race: skills queued after last empty take while this task was
             # still marked running (coalesced schedule). Re-arm if needed.
-            if self._pending_auto_rebuild_skills:
+            if self._pending_auto_rebuild_jobs:
                 self._schedule_pending_auto_rebuild(request_id)
 
     @staticmethod
@@ -17548,6 +17883,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -17586,6 +17922,7 @@ class JiuWenSwarmDeepAdapter:
                     return await session_adapter.process_message_impl(request, inputs)
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -17647,6 +17984,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -17780,6 +18118,8 @@ class JiuWenSwarmDeepAdapter:
             token_cid = TOOL_PERMISSION_CHANNEL_ID.set((request.channel_id or "").strip())
             token_perm = setup_permission_context(request)
             token_perm_sid = setup_permissions_session_scope(session_id)
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(request)
             token_perm_agent = self._bind_agent_permissions_base()
             try:
                 self._update_permission_rail(
@@ -17845,6 +18185,7 @@ class JiuWenSwarmDeepAdapter:
                     lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter),
                     lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid),
                     lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid),
+                    lambda: reset_log_session_id(token_log_sid),
                 )
             )
             for cleanup_step in cleanup_steps:
@@ -17920,17 +18261,18 @@ class JiuWenSwarmDeepAdapter:
             # Sync single-agent / coding-agent observability with current
             # config before running, and open a root span so OtelCallbackHandler
             # has a parent for LLM/tool spans (see streaming path for details).
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability()
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=request.request_id,
-                channel_id=request.channel_id,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             attach_goal = self._wants_attach_goal(request.params)
             dispatch_mode = self._resolve_input_dispatch_mode(request.params)
@@ -18129,6 +18471,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)
@@ -18302,6 +18645,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -18345,6 +18689,7 @@ class JiuWenSwarmDeepAdapter:
                 return
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -18438,6 +18783,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(rid or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -18557,6 +18903,7 @@ class JiuWenSwarmDeepAdapter:
                     suppress_errors=True,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -18638,6 +18985,7 @@ class JiuWenSwarmDeepAdapter:
                     request_id=request.request_id,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -18913,6 +19261,8 @@ class JiuWenSwarmDeepAdapter:
             token_cid = TOOL_PERMISSION_CHANNEL_ID.set((request.channel_id or "").strip())
             token_perm = setup_permission_context(request)
             token_perm_sid = setup_permissions_session_scope(session_id)
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(request)
             token_perm_agent = self._bind_agent_permissions_base()
             try:
                 self._update_permission_rail(
@@ -19081,17 +19431,18 @@ class JiuWenSwarmDeepAdapter:
             )
             # Sync single-agent / coding-agent observability with current config
             # before running.
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability(force=_dbg_settings.otel_enabled)
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=rid,
-                channel_id=cid,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             _otel_trace_id = ""
             _otel_span_id = ""
@@ -20011,6 +20362,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)
@@ -21770,7 +22122,52 @@ class JiuWenSwarmDeepAdapter:
                         payload.get("stage") or meta.get("stage") or ""
                     ).strip().lower()
                     if skill_name and raw_stage == "auto_approved":
-                        self._queue_auto_rebuild_skill(skill_name)
+                        try:
+                            store = self._get_disk_evolution_store()
+                            subject = evolution_version_ctl.resolve_subject(store, skill_name)
+                            items = await snapshot_auto_evolution_metric_items(
+                                store,
+                                skill_name,
+                                subject_kind=str(subject.get("kind") or "skill") or None,
+                                request_id=rid,
+                            )
+                            new_items = self._filter_unreported_generated_items(
+                                skill_name, items
+                            )
+                            if not new_items:
+                                logger.warning(
+                                    "[JiuWenSwarmDeepAdapter] skip generated metrics: "
+                                    "request_id=%s skill=%s reason=no_new_items "
+                                    "snapshot_count=%s",
+                                    rid,
+                                    skill_name,
+                                    len(items),
+                                )
+                            else:
+                                await push_evolution_generated(
+                                    push_context,
+                                    request_id=rid,
+                                    skill_name=skill_name,
+                                    items=new_items,
+                                    build_push_message=build_server_push_message,
+                                    source="auto",
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "[JiuWenSwarmDeepAdapter] auto generated metrics "
+                                "push failed: request_id=%s skill=%s error=%s",
+                                rid,
+                                skill_name,
+                                exc,
+                            )
+                        self._queue_auto_rebuild_skill(
+                            skill_name,
+                            source=AUTO_REBUILD_SOURCE_WATCHER,
+                            session_id=session_id,
+                            channel_id=cid,
+                            request_id=rid,
+                            push_metrics=True,
+                        )
                         self._schedule_pending_auto_rebuild(rid)
 
                 visible_progress_statuses = visible_evolution_progress_from_events(events)
