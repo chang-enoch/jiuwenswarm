@@ -623,6 +623,13 @@ def _is_ask_user_interrupt_value(value_obj: Any) -> bool:
         return True
     if isinstance(value_obj, dict) and "payload_schema" in value_obj and "questions" in value_obj:
         return True
+    # 只有「没有工具上下文（shell 形态）」的中断才允许用 tool_args.query 兜底。
+    # 被中断的工具如果不认识 `query`，那这个字段一定是 HITL 续跑注入的原始输入
+    # （ToolInterruptHandler._build_sub_agent_resume_tool_call 会把用户输入写进
+    # args["query"]），据此生成 ask_user 卡片会造出一张题干＝用户原话的幽灵卡，
+    # 并把用户后续输入全部引到这张卡上（无法作答 → 死循环）。
+    if tool_name and tool_name != "ask_user":
+        return False
     tool_args = _normalize_tool_args(_read_value_field(value_obj, "tool_args", None))
     if isinstance(tool_args, dict) and str(tool_args.get("query") or "").strip():
         if not tool_args.get("questions"):

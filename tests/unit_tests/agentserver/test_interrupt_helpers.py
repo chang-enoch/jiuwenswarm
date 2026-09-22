@@ -254,6 +254,56 @@ def test_build_multi_questions_ignores_string_options():
     assert questions[0]["options"] == []
 
 
+def test_task_tool_resume_interrupt_is_not_rendered_as_ask_user_question():
+    """回归：被中断的工具不认识 query 时，不能凭 tool_args.query 造 ask_user 卡片。
+
+    真实故障（2026-09-21）：并行 task_tool 里某个子代理永久挂起后，父会话把
+    后续每条普通消息都当成 HITL 续跑输入；ToolInterruptHandler 会把用户原话写进
+    被中断工具调用（task_tool）的 ``arguments["query"]``。旧实现把这个 query 当成
+    ask_user 的 plain query，于是前端一直弹出题干＝用户原话的「询问你」卡片，
+    用户输入全被引到这张卡上，形成死循环。
+    """
+    interaction = {
+        "id": "call_9f6a09682c80434dbcc01500aeb7e7ff",
+        "value": {
+            "message": "工具 `task_tool` 需要授权才能执行",
+            "tool_name": "task_tool",
+            "tool_call_id": "call_9f6a09682c80434dbcc01500aeb7e7ff",
+            "tool_args": {
+                "kind": "task_tool",
+                "keys": ["query", "subagent_type", "task_description"],
+                "query": "还没好吗",
+                "subagent_type": "general-purpose",
+            },
+        },
+    }
+
+    result = convert_interactions_to_ask_user_question([interaction])
+
+    assert result is not None
+    assert result["source"] != "ask_user_interrupt"
+    assert result["questions"][0]["question"] != "还没好吗"
+
+
+def test_ask_user_plain_query_without_tool_context_still_converts():
+    """没有工具上下文的 ask_user shell 仍走 query 兜底，别把合法卡片一起改坏。"""
+    result = convert_interactions_to_ask_user_question(
+        [
+            {
+                "id": "call_ask_shell",
+                "value": {
+                    "message": "",
+                    "tool_args": {"query": "请选择语言"},
+                },
+            }
+        ]
+    )
+
+    assert result is not None
+    assert result["source"] == "ask_user_interrupt"
+    assert result["questions"][0]["question"] == "请选择语言"
+
+
 def test_build_multi_questions_appends_other_for_valid_options():
     from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
         _build_multi_questions,
