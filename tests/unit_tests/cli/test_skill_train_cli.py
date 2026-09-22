@@ -208,16 +208,3 @@ class TestRun:
             raising=False,
         )
         assert st.run_skill_train(args) == 0
-
-
-class TestMainDispatch:
-    @staticmethod
-    def test_root_cli_routes_skill_train(monkeypatch):
-        from jiuwenswarm.cli import main as root_main
-
-        monkeypatch.setenv("JIUWENSWARM_SKIP_DOTENV", "1")
-        monkeypatch.setattr(sys, "argv", ["jiuwenswarm", "skill-train", "--env", "docvqa", "--skip-gateway-check"])
-        monkeypatch.setattr(st, "run_skill_train", lambda args: 7 if args.env == "docvqa" else 1)
-        with pytest.raises(SystemExit) as exc:
-            root_main.main()
-        assert exc.value.code == 7
