@@ -25,7 +25,7 @@ def test_json_includes_process_and_lineno():
 def test_json_field_order():
     with patch("os.getpid", return_value=12345):
         out = JsonUserVisibleFormatter().format(_make_record(lineno=125))
-        positions = [out.find(k) for k in ('"timestamp"', '"process"', '"level"', '"logger"', '"lineno"', '"message"')]
+        positions = [out.find(k) for k in ('"timestamp"', '"process"', '"session_id"', '"level"', '"logger"', '"lineno"', '"message"')]
         assert positions == sorted(positions)
 
 
@@ -35,6 +35,7 @@ def test_json_identity_fields_present_even_when_none():
     assert "user_id" in obj and obj["user_id"] is None
     assert "domain_id" in obj and obj["domain_id"] is None
     assert "app_id" in obj and obj["app_id"] is None
+    assert obj["session_id"] == "<nosid>"
 
 
 def test_json_component_derived():

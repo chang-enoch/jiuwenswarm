@@ -493,6 +493,25 @@ agent_observability:
   file_retention_days: 7            # file exporter 文件保留天数
 
 # ============================================================
+# 单 Agent 轨迹观测 Web 数据面
+# ============================================================
+# enabled=true 会作为 Agent / Team OTel provider 的额外 demand，但仍完整复用
+# agent_observability / team_observability 的 exporter、采样、脱敏、字段长度
+# 与 Langfuse 配置。Processor 后的数据由 AgentServer 有界队列写入 SQLite；
+# Gateway 只读查询。Agent 与 Team 会话均向 Web 暴露轨迹。
+# auto_harness 不向 Web 暴露轨迹。
+# ============================================================
+trajectory_ui:
+  enabled: false                     # 启用“对话 / 轨迹”数据链路
+  db_path: ""                       # Session database root; defaults to ~/.jiuwenswarm/.trace/sessions
+  retention_days: 7                 # SQLite 轨迹保留天数
+  queue_size: 4096                  # Agent 主线程非阻塞写入队列上限
+  batch_size: 64                    # writer 单事务最大记录数
+  flush_interval_ms: 200            # writer 最大合批等待时间
+  poll_interval_ms: 2000            # Web 端兜底轮询间隔
+  detail_max_bytes: 4194304          # 单次详情响应累计 raw 投影预算（超大 Span 仅返回索引）
+
+# ============================================================
 # Agent / Code 调试链路追踪（Debug Trace）配置
 # ============================================================
 # 控制非 team 模式（agent.* / code.*）的人类可读本地 dump。
@@ -1111,6 +1130,18 @@ channels:
 # 内置参数规则 > 用户 rules；整工具存在则不用 defaults；详见 tiered_policy 模块说明。
 #
 # 三种动作: allow / ask / deny
+#
+# 标准版保留键 agents：按 agent_id 精确分桶的完整 permissions body（不是工具名）。
+# 命中 permissions.agents[id] 时该 Agent 整段替换使用该 body，不与全局字段合并；
+# 未命中使用下方全局段。Gateway/UI 读写全局时会剥离并保留 agents 表。
+# 企业版忽略 yaml agents，只用 Agent template_ref.permissions。
+# 示例（Excel 插件 Agent office-excel 专属策略）：
+#   agents:
+#     office-excel:
+#       enabled: true
+#       schema: tiered_policy
+#       permission_mode: normal
+#       tools: { bash: ask }
 permissions:
   enabled: false
   schema: tiered_policy
@@ -1612,7 +1643,8 @@ modes:
 # ── flash 轻量模式开关 ──────────────────────────────────────────
 # flash 是独立 mode（单轮 ReAct、裁剪 rail 白名单、关闭 task loop 与技能自
 # 演进）。行为定义（rail 白名单 / react 覆盖）硬编码在 JiuwenSwarmFlashAdapter
-# 类常量，不在此配置——这里只控制「是否对普通 agent 对话注入 flash」。
+# 类常量，不在此配置。enabled 控制「是否对普通 agent 对话注入 flash」；
+# skill_selection 仅配置 Flash 内可选的已安装技能检索模块。
 # 触发点在 mode 解析层（resolve_agent_request_mode）：置 true 时，所有归一到
 # agent 的对话请求被改写为 flash mode（无需前端发 mode=flash，配置即触发）；
 # code / team 路径不受影响。置 false（默认）时维持原 agent 行为。
@@ -1620,3 +1652,16 @@ modes:
 #   enabled: true        — 普通对话注入 flash，走 FlashAdapter facade。
 flash:
   enabled: false
+  # 必须在模板声明：启动清理及配置合并会删除模板中不存在的字段。
+  # 模块可独立删除；这些默认值不启用功能，也不影响其他 Agent mode。
+  skill_selection:
+    enabled: false
+    catalog_check_interval_s: 5.0
+    candidate_k: 5
+    text_max_chars: 2000
+    max_query_chars: 1200
+    query_timeout_s: 10.0
+    startup_timeout_s: 60.0
+    k1: 0.9
+    b: 0.4
+    name_weight: 0.5

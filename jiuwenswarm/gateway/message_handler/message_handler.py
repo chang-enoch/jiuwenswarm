@@ -26,6 +26,7 @@ from jiuwenswarm.common.e2a.constants import (
 )
 from jiuwenswarm.gateway.message_handler.file_transfer_mixin import FileTransferMixin
 from jiuwenswarm.common.config import get_evolution_auto_save_enabled
+from jiuwenswarm.common.log_context import bind_log_session, unbind_log_session
 from jiuwenswarm.gateway.routing.session_map import SessionMap
 from jiuwenswarm.gateway.routing.agent_request_timeout import (
     send_agent_request_with_timeout,
@@ -2958,6 +2959,26 @@ class MessageHandler(FileTransferMixin, ABC):
                     exc_info=True,
                 )
             return
+        payload = chunk.payload
+        if isinstance(payload, dict) and payload.get("event_type") == "trace.updated":
+            from jiuwenswarm.observability.models import CommittedTraceUpdate
+
+            try:
+                update = CommittedTraceUpdate(
+                    session_id=str(payload["session_id"]),
+                    trace_id=str(payload["trace_id"]),
+                    revision=int(payload["revision"]),
+                    store_epoch=payload.get("store_epoch"),
+                    lifecycle=str(payload.get("lifecycle") or "final"),
+                )
+            except (KeyError, TypeError, ValueError):
+                logger.warning("[MessageHandler] ignored invalid trace update push")
+                return
+            web_channel = self._resolve_web_channel()
+            schedule = getattr(web_channel, "schedule_trajectory_updates", None)
+            if callable(schedule):
+                schedule((update,))
+            return
         rid = str(chunk.request_id or "")
         sid_raw = wire.get("session_id")
         if sid_raw is not None and str(sid_raw).strip():
@@ -4327,12 +4348,12 @@ class MessageHandler(FileTransferMixin, ABC):
             msg: Message | None = None
             external_cancel_handed_off = False
             external_cancel_error: BaseException | None = None
+            log_bind: tuple | None = None
             try:
                 msg = await self.consume_user_messages(timeout=None)
                 if msg is None:
                     continue
-                
-         
+
                 # 先处理受控通道的 Channel 控制指令（如 /new_session、/mode、/skills list）
                 if await self._handle_channel_control(msg):
                     # 该消息仅用于修改 session/mode，已给 Channel 回复提示，不再转发给 Agent
@@ -4358,6 +4379,9 @@ class MessageHandler(FileTransferMixin, ABC):
                 ):
                     state = self.get_or_create_channel_state(msg)
                     msg.session_id = await self._allocate_channel_session(msg, state)
+
+                # 会话已确定后再绑。create_task 会拷贝当前上下文，随后父循环处理下一条消息不会改掉子任务。
+                log_bind = bind_log_session(msg.session_id)
 
                 # V2: _apply_channel_state has resolved msg.session_id to the real team
                 # session_id and injected params.mode; register GodView now so it lands
@@ -4936,6 +4960,9 @@ class MessageHandler(FileTransferMixin, ABC):
                     continue
                 raise
             finally:
+                if log_bind is not None:
+                    unbind_log_session(*log_bind)
+                    log_bind = None
                 if self._is_external_channel_cancel(
                     msg
                 ) and not external_cancel_handed_off:

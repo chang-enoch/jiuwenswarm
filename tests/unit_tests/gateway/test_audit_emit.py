@@ -15,13 +15,16 @@ from jiuwenswarm.common.audit_emit import (
     emit_audit_evt,
     emit_audit_ua,
 )
+from jiuwenswarm.common.audit_gate import set_audit_config_enabled
 
 
 @pytest.fixture(autouse=True)
 def _audit_memory():
     mem = MemoryEmitter()
     reset_audit_manager(AuditManager(emitter=mem))
+    set_audit_config_enabled(True)
     yield mem
+    set_audit_config_enabled(False)
     reset_audit_manager()
 
 
@@ -62,6 +65,16 @@ def test_emit_audit_caller_is_business_site(_audit_memory: MemoryEmitter, monkey
     caller = _audit_memory.records[0]["attributes"]["caller"]
     assert caller.startswith("test_audit_emit.test_emit_audit_caller_is_business_site:")
     assert "audit_claw_log" not in caller
+
+
+def test_emit_audit_noop_when_config_disabled(
+    _audit_memory: MemoryEmitter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    set_audit_config_enabled(False)
+    emit_audit_ua(SUBMDL="gateway", PROC="http_agent_send", UA="ok")
+    assert _audit_memory.records == []
 
 
 def test_audit_timer_cost_ms() -> None:

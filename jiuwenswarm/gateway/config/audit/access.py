@@ -3,6 +3,9 @@
 
 Gateway 热更与 config_poll 使用 ``service=gateway``；
 AgentServer 启动冷加载使用 ``service=agentserver``。
+
+无有效库配置时关闭写出（``set_audit_config_enabled(False)``）；
+有 body 落盘并 apply 后打开写出。
 """
 
 from __future__ import annotations
@@ -40,12 +43,15 @@ def apply_audit_log_config_payload(
     validate: bool = True,
     service: str = SERVICE_GATEWAY,
 ) -> dict[str, Any]:
-    """热加载审计配置。``payload`` 为权威 body（§5.2）；None 表示恢复 SDK 默认。"""
+    """热加载审计配置。``payload`` 为权威 body；None 表示清除配置并关闭写出。"""
     mgr = get_audit_manager()
     process_service = str(service or SERVICE_GATEWAY).strip() or SERVICE_GATEWAY
     if payload is None:
         mgr.apply_config({"service": process_service})
-        return {"ok": True, "source": "default", "service": process_service}
+        from jiuwenswarm.common.audit_gate import set_audit_config_enabled
+
+        set_audit_config_enabled(False)
+        return {"ok": True, "source": "disabled", "service": process_service}
 
     data = _with_process_service(payload, service=process_service)
     if validate:
@@ -54,6 +60,9 @@ def apply_audit_log_config_payload(
         except SchemaValidationError as exc:
             raise ValueError(str(exc)) from exc
     mgr.apply_config(data)
+    from jiuwenswarm.common.audit_gate import set_audit_config_enabled
+
+    set_audit_config_enabled(True)
     return {"ok": True, "source": "db", "service": process_service}
 
 
@@ -115,7 +124,7 @@ async def reload_audit_log_config_from_db(
             apply_audit_log_config_payload(None, service=process_service)
         except Exception:  # noqa: BLE001
             pass
-        return {"ok": False, "source": "default", "service": process_service}
+        return {"ok": False, "source": "disabled", "service": process_service}
 
 
 __all__ = [

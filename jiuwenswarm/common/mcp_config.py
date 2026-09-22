@@ -1835,11 +1835,56 @@ async def _list_office_claw_mcp_tools_uncached(
         await stack.aclose()
 
 
+def _apply_tool_filter(
+    tool_defs: list[dict[str, Any]],
+    config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """按 config.tool_filter（启用工具名白名单）裁剪 tool defs。
+
+    缺省/非 list → 全量返回（兼容旧载荷）；空 list → 空列表（server 保留在册，
+    注入零工具）。工具名与 OA 侧 mcp_connector_tools.tool_name 同源（均来自
+    MCP tools/list 的 name），两侧天然一致。
+    """
+    raw = config.get("tool_filter")
+    if not isinstance(raw, list):
+        return tool_defs
+    allow = {str(name).strip() for name in raw if str(name).strip()}
+    if not allow:
+        return []
+    return [
+        tool for tool in tool_defs
+        if str(tool.get("name") or "").strip() in allow
+    ]
+
+
 async def list_request_mcp_server_tools(
     server_name: str,
     config: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """发现单个用户连接器的 tool schema。
+    """发现单个用户连接器的 tool schema，并按 config.tool_filter 裁剪。
+
+    本函数是所有工具发现的唯一入口（McpServerRegistry._discover / 周期扫描 /
+    旧路径 request-scoped 注册均调用），在入口统一过滤即可让三条消费路径
+    同时只暴露启用工具。过滤只影响工具列表，不影响 connect_params。
+
+    空名单（[] / 全空白项）短路：全关工具不依赖连接器可达性
+    （「全关工具 ≠ 断开连接器」）——不建立 MCP 连接、不调 tools/list，
+    返回最小 connect_params 供 registry 入册占位（零工具，不会被 acquire；
+    filter 变化触发 update 重扫时会走真实发现覆盖）。
+    """
+    raw = config.get("tool_filter")
+    if isinstance(raw, list) and not {str(name).strip() for name in raw if str(name).strip()}:
+        client_type = _normalize_mcp_client_type(config.get("type")) or "stdio"
+        return [], {"_mcp_client_type": client_type}
+    tool_defs, params = await _list_request_mcp_server_tools_inner(server_name, config)
+    return _apply_tool_filter(tool_defs, config), params
+
+
+async def _list_request_mcp_server_tools_inner(
+    server_name: str,
+    config: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """发现单个用户连接器的 tool schema（未过滤）。
 
     config 是 Relay 的启动载荷（无 tool schema），需起一次服务调 list_tools() 收集，
     对齐 _list_office_claw_mcp_tools_uncached。支持 stdio / sse / streamable-http。

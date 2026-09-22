@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -20,6 +21,11 @@ except ImportError:  # pragma: no cover - unavailable outside Windows
     ERROR_PRIVILEGE_NOT_HELD = 1314
 else:
     ERROR_PRIVILEGE_NOT_HELD = winerror.ERROR_PRIVILEGE_NOT_HELD
+
+try:
+    import _winapi
+except ImportError:  # pragma: no cover - Windows-only builtin module
+    _winapi = None
 
 
 def is_valid_skill_dir(path: Path) -> bool:
@@ -112,12 +118,16 @@ def link_skill_dir(source: Path, target: Path) -> None:
 
 
 def remove_skill_dir_link(target: Path) -> None:
-    """Remove a skill directory link without deleting ordinary directories."""
-    if target.is_symlink():
-        target.unlink()
-        return
-    if _is_windows_reparse_point(target):
-        os.rmdir(target)
+    try:
+        if target.is_symlink():
+            target.unlink()
+            return
+        if _is_windows_reparse_point(target):
+            os.rmdir(target)
+    except (FileNotFoundError, PermissionError):
+        if not os.path.lexists(target):
+            return
+        raise
 
 
 def _create_directory_link(target_path: Path, link_path: Path) -> None:
@@ -158,7 +168,34 @@ def _copy_skill_directory(target_path: Path, link_path: Path) -> None:
 
 
 def _create_windows_junction(target_path: Path, link_path: Path) -> None:
-    """Create a directory junction using ``mklink /J`` on Windows."""
+    """Create a directory junction on Windows.
+
+    Prefers the native ``_winapi.CreateJunction``: no subprocess, sub-millisecond
+    per link, and immune to localized ``cmd.exe`` output encoding. The 2026-09-18
+    incident stalled an event loop for 268s because 273 junctions were created
+    serially through ``cmd.exe`` (about 1s of process-creation overhead each on
+    that machine), and the same call crashed a subprocess reader thread with
+    ``UnicodeDecodeError`` on Chinese Windows (GBK output vs UTF-8 decoding).
+
+    The ``cmd.exe /c mklink /J`` fallback only runs when the private API is
+    unavailable or rejected the creation. Its piped output is encoded in the
+    OEM code page (not the ANSI ``mbcs`` page); decoding with ``oem`` keeps
+    localized output readable on Western locales, and ``errors="replace"``
+    can neither crash the reader thread nor raise while decoding.
+    """
+    create_junction = getattr(_winapi, "CreateJunction", None) if _winapi is not None else None
+    if create_junction is not None:
+        try:
+            create_junction(str(target_path), str(link_path))
+            return
+        except OSError:
+            if path_exists_or_link(link_path):
+                raise
+            # Fall through to cmd.exe. Note mklink /J does not validate the
+            # target: for a missing target it exits 0 and silently creates a
+            # dangling junction (the native error above was the descriptive
+            # one). Dangling links are removed by later prune_skill_dir_links
+            # runs because the source entry is not a valid skill directory.
     cmd_path = os.path.join(
         os.environ.get("SystemRoot", r"C:\Windows"),
         "System32",
@@ -167,10 +204,41 @@ def _create_windows_junction(target_path: Path, link_path: Path) -> None:
     result = subprocess.run(
         [cmd_path, "/c", "mklink", "/J", str(link_path), str(target_path)],
         capture_output=True,
-        text=True,
         check=False,
         shell=False,
+        encoding="oem" if sys.platform == "win32" else "utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         error_output = result.stderr.strip() or result.stdout.strip()
         raise OSError(f"Failed to create junction {link_path} -> {target_path}: {error_output}")
+
+
+def offload_link_sync(source: Path, target: Path) -> object | None:
+    """Sync skill links without blocking a running event loop.
+
+    Link sync is filesystem-heavy: one lstat per source entry plus one link
+    creation per new skill. Sync refresh callbacks (rail hooks, tool hooks)
+    are invoked on the event loop thread, where running inline would stall the
+    loop - the 2026-09-18 incident stalled one for 268s this way. When a loop
+    is running on the calling thread the sync is scheduled on the default
+    executor and the executor future is returned (callers may await it;
+    failures are logged via a done callback). On threads without a running
+    loop the sync runs inline and None is returned, preserving synchronous
+    completion semantics.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        sync_skill_dir_links(source, target)
+        return None
+
+    pending = loop.run_in_executor(None, sync_skill_dir_links, source, target)
+
+    def _log_failure(fut: object) -> None:
+        exc = getattr(fut, "exception", lambda: None)()
+        if exc is not None:
+            logger.error("[TeamSkillLinks] offloaded skill link sync failed: %s", exc)
+
+    pending.add_done_callback(_log_failure)
+    return pending

@@ -258,6 +258,7 @@ from jiuwenswarm.server.runtime.agent_adapter.llm_io_trace import (
 from jiuwenswarm.agents.harness.common.auto_harness import AutoHarnessService
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     SKILL_EVOLUTION_APPROVAL_SCHEMA,
+    PermissionRailBuildOptions,
     build_permission_rail,
     convert_interactions_to_ask_user_question,
 )
@@ -297,7 +298,14 @@ from jiuwenswarm.agents.harness.common.rails.concurrent_safe_rails import (
 )
 from jiuwenswarm.common.config import get_model_names
 from jiuwenswarm.common.hooks_config import load_hooks_config
+from jiuwenswarm.common.log_context import reset_log_session_id, set_log_session_id
 from jiuwenswarm.common.log_preview import preview_text
+from jiuwenswarm.common.mode_matrix import (
+    canonicalize_mode_text,
+    compose_web_mode,
+    deprecate_mode,
+    normalize_work_mode,
+)
 from jiuwenswarm.common.stage_timer import StageTimer
 from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unregister_tool
 from jiuwenswarm.server.hooks.user_hook_rail import UserHookRail
@@ -321,10 +329,12 @@ from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context
 from jiuwenswarm.agents.harness.common.rails.permissions.config_loader import (
     get_base_permissions_config,
     get_effective_permissions_config,
+    lookup_standard_permissions_agent_id,
     merge_session_permissions_overlay,
     reset_permissions_agent_base,
     reset_permissions_session_scope,
     resolve_permissions_body_from_enterprise,
+    resolve_yaml_agent_permissions_body,
     setup_permissions_agent_base,
     setup_permissions_session_scope,
 )
@@ -759,6 +769,18 @@ def get_runtime_tool_a2a_policy_id() -> str:
     return _RUNTIME_TOOL_A2A_POLICY_ID.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_observability_mode(params: dict[str, Any]) -> str:
+    """Return the canonical mode written into trajectory span attributes."""
+    raw_mode = params.get("mode", "agent")
+    normalized_mode = canonicalize_mode_text(raw_mode)
+    work_mode = normalize_work_mode(params.get("work_mode"))
+    if work_mode is not None:
+        composed_mode = compose_web_mode(normalized_mode, work_mode)
+        if composed_mode is not None:
+            return str(deprecate_mode(composed_mode[2]))
+    return str(deprecate_mode(raw_mode))
 
 _PERSISTENT_CHECKPOINTER_LOCK: asyncio.Lock | None = None
 _PERSISTENT_CHECKPOINTER_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
@@ -1673,28 +1695,95 @@ def _deep_agent_kv_cache_affinity_config(
 
 def _build_context_assemble_rail(
     disabled_tools: list[str] | None = None,
+    tool_name_allowlist: list[str] | None = None,
 ) -> ContextAssembleRail | None:
     """Build ContextAssembleRail.
 
     ``disabled_tools`` seeds the tools prompt hide-list. Product adapters own
     the blacklist data flow at construction time (and optional later
-    ``update_disabled_tools`` calls). Compatible with older openjiuwen / test
-    fakes whose constructor does not accept ``disabled_tools=``: fall back to
-    no-arg construction and ``update_disabled_tools`` when available.
+    ``update_disabled_tools`` calls).
+
+    ``tool_name_allowlist`` (typically ProgressiveToolRail.eager_tools) keeps the
+    system ``# 可用工具`` section aligned with the fixed eager schema so deferred
+    / OfficeClaw MCP registrations do not rewrite the prompt prefix mid-task.
+    Compatible with older openjiuwen / test fakes whose constructor does not
+    accept the newer kwargs.
+
+    Merge order: land agent-core !2840 (``tool_name_allowlist`` + tools-section
+    fingerprint ``has_section`` guard) before this change. Without !2840 the
+    modern kwargs raise ``TypeError`` and we silently fall back to the legacy
+    constructor / optional setter path.
     """
     try:
+        ctor_path = "modern"
+        effective_disabled: list[str] | None = disabled_tools
+        effective_allowlist: list[str] | None = tool_name_allowlist
         try:
-            context_assemble_rail = ContextAssembleRail(disabled_tools=disabled_tools)
+            context_assemble_rail = ContextAssembleRail(
+                disabled_tools=disabled_tools,
+                tool_name_allowlist=tool_name_allowlist,
+            )
         except TypeError:
-            context_assemble_rail = ContextAssembleRail()
-            update = getattr(context_assemble_rail, "update_disabled_tools", None)
-            if callable(update) and disabled_tools:
-                update(disabled_tools)
-        logger.info("[JiuWenSwarmDeepAdapter] ContextAssembleRail create success")
+            # Requested allowlist is not in effect until a setter applies it.
+            effective_allowlist = None
+            try:
+                context_assemble_rail = ContextAssembleRail(disabled_tools=disabled_tools)
+                ctor_path = "legacy_disabled_kw"
+            except TypeError:
+                context_assemble_rail = ContextAssembleRail()
+                ctor_path = "legacy_no_args"
+                effective_disabled = None
+                update = getattr(context_assemble_rail, "update_disabled_tools", None)
+                if callable(update) and disabled_tools:
+                    update(disabled_tools)
+                    effective_disabled = list(disabled_tools)
+            setter = getattr(context_assemble_rail, "set_tool_name_allowlist", None)
+            if callable(setter) and tool_name_allowlist is not None:
+                setter(tool_name_allowlist)
+                effective_allowlist = list(tool_name_allowlist)
+        # Prefer instance state when the rail exposes what actually stuck.
+        for attr in ("tool_name_allowlist", "_tool_name_allowlist"):
+            if hasattr(context_assemble_rail, attr):
+                effective_allowlist = getattr(context_assemble_rail, attr)
+                break
+        for attr in ("disabled_tools", "_disabled_tools"):
+            if hasattr(context_assemble_rail, attr):
+                value = getattr(context_assemble_rail, attr)
+                if isinstance(value, (set, frozenset)):
+                    effective_disabled = sorted(str(item) for item in value)
+                elif value is not None:
+                    effective_disabled = list(value)
+                else:
+                    effective_disabled = None
+                break
+        logger.info(
+            "[JiuWenSwarmDeepAdapter] ContextAssembleRail create success "
+            "(path=%s disabled_tools=%s allowlist=%s)",
+            ctor_path,
+            list(effective_disabled) if effective_disabled else None,
+            list(effective_allowlist) if effective_allowlist else None,
+        )
     except Exception as exc:
         logger.warning("[JiuWenSwarmDeepAdapter] ContextAssembleRail create failed: %s", exc)
         context_assemble_rail = None
     return context_assemble_rail
+
+
+def _sync_context_assemble_tool_allowlist(
+    assemble: ContextAssembleRail | None,
+    progressive: Any | None,
+) -> None:
+    """Keep ContextAssemble tools-section allowlist aligned with eager schema."""
+    if assemble is None:
+        return
+    setter = getattr(assemble, "set_tool_name_allowlist", None)
+    if not callable(setter):
+        return
+    if progressive is None:
+        setter(None)
+        return
+    eager = getattr(progressive, "eager_tools", None) or []
+    setter(list(eager))
 
 
 def _resolve_session_memory_config(context_engine_cfg: dict[str, Any]) -> dict[str, Any] | None:
@@ -2261,9 +2350,13 @@ class JiuWenSwarmDeepAdapter:
         apply_deepagent_task_plan_binding_patch()
         self._instance: DeepAgent | None = None
         self._project_dir: str | None = None
-        # 企业多租户：企业版下可用外部传入的隔离 workspace / 租户 ID
+        # 多租户：调用方（企业版 AgentManager / 个人版 TenantAgentPool）显式
+        # 传入的隔离 workspace 优先，均未传时才回退全局默认工作区。此前个人版
+        # 被企业门禁挡掉、强制落全局默认，导致 officeclaw 租户请求的记忆文件
+        # 与索引全写进 agent_default。agent_id / service_id 保持企业语义不变
+        # （个人版的租户身份经 env 命名空间传递，不走这两个字段）。
         enterprise = is_enterprise()
-        if workspace_dir and enterprise:
+        if workspace_dir:
             self._workspace_dir: str = str(
                 collapse_nested_agent_workspace_dir(workspace_dir)
             )
@@ -2360,6 +2453,7 @@ class JiuWenSwarmDeepAdapter:
         self._ask_user_rail: StructuredAskUserRail | None = None
         self._permission_rail: Any = None
         self._agent_permissions_body: dict[str, Any] | None = None
+        self._permissions_persist_agent_id: str | None = None
         self._skill_active_state_rail: SkillActiveStateRail | None = None
         self._skill_credential_injection_rail: SkillCredentialInjectionRail | None = None
         self._avatar_rail: Any = None
@@ -5487,6 +5581,7 @@ class JiuWenSwarmDeepAdapter:
                 len(getattr(loaded, "mcp", None) or []),
             )
         self._agent_permissions_body = resolve_permissions_body_from_enterprise(loaded)
+        self._permissions_persist_agent_id = None
         if loaded is not None and self._skill_manager is not None:
             try:
                 await self._skill_manager.apply_skill_source_configs(
@@ -7936,7 +8031,7 @@ class JiuWenSwarmDeepAdapter:
         """
         if not get_skill_evolution_enabled(config):
             return None
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -8048,7 +8143,7 @@ class JiuWenSwarmDeepAdapter:
                     base_url=emb_cfg["base_url"],
                     model=emb_cfg["model"],
                 )
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 
@@ -8181,7 +8276,7 @@ class JiuWenSwarmDeepAdapter:
             if self._skill_manager is not None
             else []
         )
-        from jiuwenswarm.agents.harness.observability_runtime import (
+        from openjiuwen.extensions.observability.demand import (
             get_trajectory_span_processor,
         )
 
@@ -8396,7 +8491,7 @@ class JiuWenSwarmDeepAdapter:
                 logger.debug("[JiuWenSwarmDeepAdapter] SkillCreateRail disabled by config")
                 return None
 
-            from jiuwenswarm.agents.harness.observability_runtime import (
+            from openjiuwen.extensions.observability.demand import (
                 get_trajectory_span_processor,
             )
 
@@ -9177,19 +9272,17 @@ class JiuWenSwarmDeepAdapter:
         # for task-loop runs, or agent.<name>.invoke for single-round) under the root
         # run span per iteration/round. It is the only thing that creates the
         # task_iteration / invoke spans that llm.call + tool.* nest under. It
-        # self-disables (before_* returns early when get_team_span() is None), so
+        # self-disables (before_* returns early when there is no run root span), so
         # attaching it unconditionally is safe and also adapts to runtime
         # enable/disable of agent_observability without rebuilding the agent.
+        # The harness rail owns the complete single-agent tier; team identity is
+        # supplied separately by the team blueprint.
         try:
-            from openjiuwen.agent_teams.observability.rail import ObservabilityRail
-            from jiuwenswarm.agents.harness.agent_observability import (
-                AgentTraceBindingRail,
-            )
+            from openjiuwen.harness.observability import AgentObservabilityRail
 
-            rails_list.append(AgentTraceBindingRail())
-            rails_list.append(ObservabilityRail())
+            rails_list.append(AgentObservabilityRail())
         except Exception as exc:
-            logger.warning("%s Failed to attach ObservabilityRail: %s", log_prefix, exc)
+            logger.warning("%s Failed to attach AgentObservabilityRail: %s", log_prefix, exc)
         stage_timer.mark("observability_rail")
 
         # Bind tenant checkpointer after rails exist (set_checkpoint runs earlier).
@@ -9500,15 +9593,18 @@ class JiuWenSwarmDeepAdapter:
         elif permission_config.get("enabled", False):
             self._permission_rail = build_permission_rail(
                 config=config_base or {},
-                llm=self._model,
-                model_name=config_base.get("models", {})
-                .get("default", {})
-                .get("model_client_config", {})
-                .get("model_name", "gpt-4")
-                if isinstance(config_base, dict)
-                else "gpt-4",
-                permission_config=self._agent_permissions_body,
-                resolve_workspace_dir=self._permission_workspace_dir,
+                options=PermissionRailBuildOptions(
+                    llm=self._model,
+                    model_name=config_base.get("models", {})
+                    .get("default", {})
+                    .get("model_client_config", {})
+                    .get("model_name", "gpt-4")
+                    if isinstance(config_base, dict)
+                    else "gpt-4",
+                    permission_config=self._agent_permissions_body,
+                    resolve_workspace_dir=self._permission_workspace_dir,
+                    persist_target_agent_id_provider=self._permissions_persist_target,
+                ),
             )
             if self._permission_rail is not None:
                 logger.info("[JiuWenSwarmDeepAdapter] _permission_rail newly created on hot-reload")
@@ -9594,11 +9690,52 @@ class JiuWenSwarmDeepAdapter:
         """冷启动构建 permission rail：注入 Agent 级模板 body。"""
         return build_permission_rail(
             config=config or {},
-            llm=llm if llm is not None else self._model,
-            model_name=model_name,
-            permission_config=self._agent_permissions_body,
-            resolve_workspace_dir=self._permission_workspace_dir,
+            options=PermissionRailBuildOptions(
+                llm=llm if llm is not None else self._model,
+                model_name=model_name,
+                permission_config=self._agent_permissions_body,
+                resolve_workspace_dir=self._permission_workspace_dir,
+                persist_target_agent_id_provider=self._permissions_persist_target,
+            ),
         )
+
+    def _permissions_persist_target(self) -> str | None:
+        return getattr(self, "_permissions_persist_agent_id", None)
+
+    def _lookup_permissions_agent_id(self, request: Any | None = None) -> str | None:
+        """标准版 permissions 查找键：request ``extract_ids`` 或 Manager ``_env_agent_id``。
+
+        不使用仅企业版赋值的 ``self._agent_id``。无明确 id 时返回 ``None``（回落全局），
+        避免合成 ``"default"`` 误命中 ``agents.default``。进池后若
+        ``resolve_control_rpc_tenant`` 重映射，与选中的 AgentManager 使用同一 key。
+        """
+        extracted = None
+        if request is not None:
+            try:
+                from jiuwenswarm.server.runtime.tenant_agent_pool import TenantAgentPool
+
+                agent_id, _service_id, _workspace_key = TenantAgentPool.extract_ids(request)
+                if agent_id:
+                    extracted = str(agent_id).strip() or None
+            except Exception:  # noqa: BLE001
+                raw = getattr(request, "agent_id", None)
+                if raw is not None and str(raw).strip():
+                    extracted = str(raw).strip()
+        env_id = getattr(self, "_env_agent_id", None)
+        return lookup_standard_permissions_agent_id(extracted, env_id)
+
+    def _refresh_standard_agent_permissions_body(self, request: Any | None = None) -> None:
+        """标准版：按 agent_id 绑定 yaml ``permissions.agents[id]``；未命中清空 Agent base。"""
+        if is_enterprise():
+            return
+        agent_id = self._lookup_permissions_agent_id(request)
+        body = resolve_yaml_agent_permissions_body(agent_id)
+        if body is not None:
+            self._agent_permissions_body = body
+            self._permissions_persist_agent_id = agent_id
+            return
+        self._agent_permissions_body = None
+        self._permissions_persist_agent_id = None
 
     def _bind_agent_permissions_base(self) -> Any:
         """将 Agent 模板 permissions body 绑定到当前 Task（供 snapshot/生效读路径）。"""
@@ -9714,8 +9851,16 @@ class JiuWenSwarmDeepAdapter:
                         ),
                         invocation_id=active_mcp.invocation_id or None,
                     )
+                _sync_context_assemble_tool_allowlist(
+                    self._context_assemble_rail,
+                    progressive_tool_rail,
+                )
             elif old_progressive_tool_rail is not None:
                 rails_to_unregister.append(old_progressive_tool_rail)
+                _sync_context_assemble_tool_allowlist(
+                    self._context_assemble_rail,
+                    None,
+                )
 
         # 统一工具开关热更新：重建式（与 ProgressiveToolRail 一致）。
         # 旧 rail uninit 时回滚它注销的工具（重新注册），新 rail init 再按新名单注销。
@@ -10254,8 +10399,13 @@ class JiuWenSwarmDeepAdapter:
             )
             # 企业版：create_instance 时可带 request，按 params 加载企业配置并合并模型
             bootstrap_request = self._instance_overrides.pop("request", None)
-            result = await self._load_enterprise_config(bootstrap_request, base=config_base)
+            result = await self._load_enterprise_config(
+                bootstrap_request,
+                base=config_base,
+            )
             config_base = result.config
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(bootstrap_request)
             # 与模型槽位一致：Agent 级 permissions 模板在构建 rail 前绑定到 Task
             token_perm_agent = self._bind_agent_permissions_base()
             try:
@@ -10353,7 +10503,7 @@ class JiuWenSwarmDeepAdapter:
                 should_enable_general_agent = should_add_general_agent and (
                     sub_mode == "plan" or (isinstance(mode, str) and mode.startswith("agent"))
                 )
-                from jiuwenswarm.agents.harness.observability_runtime import (
+                from openjiuwen.extensions.observability.demand import (
                     get_trajectory_span_processor,
                 )
 
@@ -11320,14 +11470,22 @@ class JiuWenSwarmDeepAdapter:
                 )
             self._context_assemble_rail = _build_context_assemble_rail(
                 disabled_tools=disabled_list or None,
+                tool_name_allowlist=(
+                    list(self._progressive_tool_rail.eager_tools)
+                    if self._progressive_tool_rail is not None
+                    else None
+                ),
             )
             self._context_assemble_mode = "agent"
             if self._context_assemble_rail is not None:
                 await self._instance.register_rail(self._context_assemble_rail)
                 logger.info(
                     "[JiuWenSwarmDeepAdapter] ContextAssembleRail registered for agent mode "
-                    "(disabled_tools=%s)",
+                    "(disabled_tools=%s allowlist=%s)",
                     disabled_list,
+                    list(self._progressive_tool_rail.eager_tools)
+                    if self._progressive_tool_rail is not None
+                    else None,
                 )
             else:
                 logger.warning(
@@ -12038,21 +12196,24 @@ class JiuWenSwarmDeepAdapter:
             card=getattr(self._instance, "card", None),
         )
         await session.pre_run(inputs={})
-        # Bind env overlay so the DeepAgent supervisor task (created by
-        # start() via asyncio.create_task) inherits the correct namespace.
-        # Without this, the supervisor task's context copy lacks the overlay
-        # and reads env from the wrong namespace (default/default).
+        # Bind env overlay and session id so the DeepAgent supervisor task
+        # (created by start() via asyncio.create_task) copies them. One
+        # supervisor serves one session, so this value is not updated later.
+        from jiuwenswarm.common.log_context import bind_log_session, unbind_log_session
+
+        log_bind = bind_log_session(session_id)
         ns_token, overlay_token, wk_token = self._bind_request_env_overlay()
         try:
             await self._instance.start(session=session)
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
+                session_id,
+            )
         finally:
             self._reset_request_env_bindings(ns_token, overlay_token, wk_token)
+            unbind_log_session(*log_bind)
         if getattr(self._instance, "_interaction_started", True) is not True:
             raise RuntimeError(f"DeepAgent interaction did not become ready: {session_id}")
-        logger.info(
-            "[JiuWenSwarmDeepAdapter] start completed: session_id=%s",
-            session_id,
-        )
 
     async def prepare_session(
         self,
@@ -12325,7 +12486,7 @@ class JiuWenSwarmDeepAdapter:
 
         fallback_handler = self._create_skill_turbo_fallback_handler()
 
-        return {
+        cfg: dict[str, Any] = {
             "skill_codes_dir": "jiuwenswarm.server.runtime.skill_turbo.skill_codes",
             "tool_cards": tool_cards,
             "model_client": self._model,
@@ -12338,6 +12499,13 @@ class JiuWenSwarmDeepAdapter:
             "image_gen_enabled": bool(self._image_gen_model_config),
             "sys_operation": self._sys_operation,
         }
+        body = getattr(self, "_agent_permissions_body", None)
+        if isinstance(body, dict):
+            cfg["permissions"] = copy.deepcopy(body)
+            persist_target = getattr(self, "_permissions_persist_agent_id", None)
+            if persist_target:
+                cfg["permissions_persist_target_agent_id"] = str(persist_target)
+        return cfg
 
     def _create_skill_turbo_fallback_handler(self) -> Any:
         """创建 SkillTurbo 节点级 fallback handler。"""
@@ -13422,6 +13590,7 @@ class JiuWenSwarmDeepAdapter:
 
         async def _resume_impl() -> AsyncIterator[AgentResponseChunk]:
             token_trace_sid = _LLM_TRACE_SESSION_ID.set(request.session_id or "default")
+            token_log_sid = set_log_session_id(request.session_id)
             token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
             token_trace_iter = _LLM_TRACE_ITERATION.set(0)
             token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -13588,6 +13757,7 @@ class JiuWenSwarmDeepAdapter:
             finally:
                 await _skill_turbo_clear_resume_in_flight(session)
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -17738,6 +17908,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -17776,6 +17947,7 @@ class JiuWenSwarmDeepAdapter:
                     return await session_adapter.process_message_impl(request, inputs)
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -17837,6 +18009,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(request.request_id or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -17970,6 +18143,8 @@ class JiuWenSwarmDeepAdapter:
             token_cid = TOOL_PERMISSION_CHANNEL_ID.set((request.channel_id or "").strip())
             token_perm = setup_permission_context(request)
             token_perm_sid = setup_permissions_session_scope(session_id)
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(request)
             token_perm_agent = self._bind_agent_permissions_base()
             try:
                 self._update_permission_rail(
@@ -18035,6 +18210,7 @@ class JiuWenSwarmDeepAdapter:
                     lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter),
                     lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid),
                     lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid),
+                    lambda: reset_log_session_id(token_log_sid),
                 )
             )
             for cleanup_step in cleanup_steps:
@@ -18110,17 +18286,18 @@ class JiuWenSwarmDeepAdapter:
             # Sync single-agent / coding-agent observability with current
             # config before running, and open a root span so OtelCallbackHandler
             # has a parent for LLM/tool spans (see streaming path for details).
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability()
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=request.request_id,
-                channel_id=request.channel_id,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             attach_goal = self._wants_attach_goal(request.params)
             dispatch_mode = self._resolve_input_dispatch_mode(request.params)
@@ -18319,6 +18496,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)
@@ -18444,6 +18622,7 @@ class JiuWenSwarmDeepAdapter:
             _early_trace_sid = _LLM_TRACE_SESSION_ID.set(
                 request.session_id or "default"
             )
+            _early_log_sid = set_log_session_id(request.session_id)
             _early_trace_rid = _LLM_TRACE_REQUEST_ID.set(
                 request.request_id or ""
             )
@@ -18487,6 +18666,7 @@ class JiuWenSwarmDeepAdapter:
                 return
             finally:
                 _LLM_TRACE_SESSION_ID.reset(_early_trace_sid)
+                reset_log_session_id(_early_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(_early_trace_rid)
                 _LLM_TRACE_ITERATION.reset(_early_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(_early_trace_model)
@@ -18580,6 +18760,7 @@ class JiuWenSwarmDeepAdapter:
                     )
 
         token_trace_sid = _LLM_TRACE_SESSION_ID.set(session_id)
+        token_log_sid = set_log_session_id(request.session_id)
         token_trace_rid = _LLM_TRACE_REQUEST_ID.set(rid or "")
         token_trace_iter = _LLM_TRACE_ITERATION.set(0)
         token_trace_model = _LLM_TRACE_MODEL_NAME.set(
@@ -18699,6 +18880,7 @@ class JiuWenSwarmDeepAdapter:
                     suppress_errors=True,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -18780,6 +18962,7 @@ class JiuWenSwarmDeepAdapter:
                     request_id=request.request_id,
                 )
                 _LLM_TRACE_SESSION_ID.reset(token_trace_sid)
+                reset_log_session_id(token_log_sid)
                 _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)
                 _LLM_TRACE_ITERATION.reset(token_trace_iter)
                 _LLM_TRACE_MODEL_NAME.reset(token_trace_model)
@@ -19055,6 +19238,8 @@ class JiuWenSwarmDeepAdapter:
             token_cid = TOOL_PERMISSION_CHANNEL_ID.set((request.channel_id or "").strip())
             token_perm = setup_permission_context(request)
             token_perm_sid = setup_permissions_session_scope(session_id)
+            if not is_enterprise():
+                self._refresh_standard_agent_permissions_body(request)
             token_perm_agent = self._bind_agent_permissions_base()
             try:
                 self._update_permission_rail(
@@ -19223,17 +19408,18 @@ class JiuWenSwarmDeepAdapter:
             )
             # Sync single-agent / coding-agent observability with current config
             # before running.
-            from jiuwenswarm.agents.harness.agent_observability import (
+            from openjiuwen.harness.observability import (
                 close_agent_run_span,
                 open_agent_run_span,
+            )
+            from jiuwenswarm.agents.harness.agent_observability import (
                 sync_agent_observability,
             )
             sync_agent_observability(force=_dbg_settings.otel_enabled)
             _run_span = open_agent_run_span(
                 session_id=session_id,
                 request_id=rid,
-                channel_id=cid,
-                mode=mode,
+                mode=_resolve_observability_mode(request.params),
             )
             _otel_trace_id = ""
             _otel_span_id = ""
@@ -20153,6 +20339,7 @@ class JiuWenSwarmDeepAdapter:
                     ("trace_iteration", lambda: _LLM_TRACE_ITERATION.reset(token_trace_iter)),
                     ("trace_request", lambda: _LLM_TRACE_REQUEST_ID.reset(token_trace_rid)),
                     ("trace_session", lambda: _LLM_TRACE_SESSION_ID.reset(token_trace_sid)),
+                    ("log_session", lambda: reset_log_session_id(token_log_sid)),
                 )
             )
             step_error = self._run_cleanup_steps(cleanup_steps)

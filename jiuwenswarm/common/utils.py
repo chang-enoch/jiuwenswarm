@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional
 import logging
 import queue as _queue
+from jiuwenswarm.common.log_context import NO_SESSION_ID, current_log_session_id
 from logging.handlers import BaseRotatingHandler, QueueHandler, QueueListener
 from collections import OrderedDict
 import yaml
@@ -366,7 +367,11 @@ def _deep_merge(
         if key not in override:
             result[key] = copy.deepcopy(tmpl_val)
         elif isinstance(tmpl_val, dict) and isinstance(override.get(key), dict):
-            result[key] = _deep_merge(tmpl_val, override[key], depth + 1)
+            # 模板空表（如 permissions.agents: {}）表示开放分桶，保留用户键。
+            if not tmpl_val:
+                result[key] = copy.deepcopy(override[key])
+            else:
+                result[key] = _deep_merge(tmpl_val, override[key], depth + 1)
         else:
             result[key] = override[key]
 
@@ -2116,6 +2121,60 @@ def get_tenant_agent_workspace_dir(workspace_key: str | None = None) -> Path:
     return get_multi_tenant_user_workspace_dir(wk) / get_agent_workspace_relative_dir()
 
 
+def seed_tenant_agent_workspace(tenant_root: Path) -> None:
+    """为租户工作区补种 DeepAgent 标准模板文件（幂等，已存在一律跳过）。
+ 
+    ``prepare_workspace`` 只初始化默认租户（个人版 ``service_default/agent_default``），
+    其余租户目录（个人版 ``service_{sid}/agent_{aid}``，如 officeclaw 渠道的
+    agent_office）由 TenantAgentPool 懒创建，此前从未播种 AGENT/SOUL/IDENTITY/
+    HEARTBEAT/USER/MEMORY.md 等模板。首次进入某租户请求时调用本函数补齐，
+    使 write_memory/read_memory 等记忆工具有完整的工作区骨架。
+    """
+    workspace = Path(tenant_root) / get_agent_workspace_relative_dir()
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+ 
+    package_root = _find_package_root()
+    if package_root is None:
+        logger.warning("seed_tenant_agent_workspace: package root not found, skip seeding")
+        return
+    template_workspace = package_root / "resources" / "agent" / "workspace"
+    if not template_workspace.is_dir():
+        logger.warning(
+            "seed_tenant_agent_workspace: template missing: %s, skip seeding", template_workspace,
+        )
+        return
+ 
+    resolved_lang = _resolve_preferred_language(get_config_file(), None)
+    suffix = "_ZH" if resolved_lang == "zh" else "_EN"
+    # (模板内相对路径, 落盘相对路径)，多语言文件去掉 _ZH/_EN 后缀
+    entries: list[tuple[str, str]] = [
+        (f"AGENT{suffix}.md", "AGENT.md"),
+        (f"HEARTBEAT{suffix}.md", "HEARTBEAT.md"),
+        (f"IDENTITY{suffix}.md", "IDENTITY.md"),
+        (f"SOUL{suffix}.md", "SOUL.md"),
+        ("USER.md", "USER.md"),
+        (f"memory/MEMORY{suffix}.md", "memory/MEMORY.md"),
+    ]
+    added: list[str] = []
+    for src_rel, dst_rel in entries:
+        src = template_workspace / src_rel
+        if not src.is_file():
+            continue
+        dst = workspace / dst_rel
+        if dst.exists():
+            continue
+        try:
+            shutil.copy2(src, dst)
+            added.append(dst_rel)
+        except OSError as e:
+            logger.warning("seed_tenant_agent_workspace: copy %s failed: %s", dst_rel, e)
+    if added:
+        logger.info(
+            "seed_tenant_agent_workspace: %s -> %s", ", ".join(added), workspace,
+        )
+
+
 def get_tenant_agent_skills_dirs(workspace_key: str | None = None) -> list[Path]:
     """多租户 skills 目录（与 ``JiuWenSwarm`` / ``SkillManager`` 落盘路径一致）."""
     return [get_tenant_agent_workspace_dir(workspace_key) / "skills"]
@@ -2870,8 +2929,8 @@ class JsonUserVisibleFormatter(jsonlogger.JsonFormatter if jsonlogger else loggi
     """JSON 格式化日志输出。
 
     继承 pythonjsonlogger.JsonFormatter（缺失时降级为 logging.Formatter）。
-    字段顺序：timestamp → process → level → user_tag → user_id/domain_id/app_id →
-    logger → lineno → message → component → user_visible。
+    字段顺序：timestamp → process → session_id → level → user_tag →
+    user_id/domain_id/app_id → logger → lineno → message → component → user_visible。
     身份字段始终输出（null 便于聚合）。复用 dev-stable 的 _log_component_from_logger_name 与 _sanitize_log_text。
     """
 
@@ -2914,6 +2973,7 @@ class JsonUserVisibleFormatter(jsonlogger.JsonFormatter if jsonlogger else loggi
         if "timestamp" in log_record:
             ordered["timestamp"] = log_record["timestamp"]
         ordered["process"] = record.process
+        ordered["session_id"] = getattr(record, "session_id", None) or NO_SESSION_ID
         if "level" in log_record:
             ordered["level"] = log_record["level"]
         user_tag = getattr(record, "user_tag", None)
@@ -3028,6 +3088,18 @@ class UserVisibleTagFilter(logging.Filter):
         return True
 
 
+class SessionIdFilter(logging.Filter):
+    """从 ``log_session_id`` ContextVar 写入 ``record.session_id``。始终放行。
+
+    须挂在 ``QueueHandler``（emit 调用线程）。挂到 ``QueueListener`` 目标
+    handler 会在独立线程读到空上下文，全部变成 ``<nosid>``。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.session_id = current_log_session_id()
+        return True
+
+
 class IdentityFieldFilter(logging.Filter):
     """从 IdentityStore 读身份，写入字段并预先拼好 ``record.identity``。始终放行。
 
@@ -3057,13 +3129,15 @@ class IdentityFieldFilter(logging.Filter):
 class IdentityTextFormatter(logging.Formatter):
     """文本 Formatter：使用 Filter 阶段已写好的 ``record.identity`` 排版。
 
-    若上游未挂 IdentityFieldFilter（单测直调 Formatter），则按字段现场拼一份
-    兜底 identity，不再在此处做脱敏。
+    若上游未挂 IdentityFieldFilter / SessionIdFilter（单测直调 Formatter），
+    则按字段现场拼一份兜底 identity / session_id，不再在此处做脱敏。
     """
 
     def format(self, record: logging.LogRecord) -> str:
         if not isinstance(getattr(record, "identity", None), str):
             record.identity = build_log_identity(record)
+        if not isinstance(getattr(record, "session_id", None), str):
+            record.session_id = current_log_session_id()
         return super().format(record)
 
 
@@ -3182,7 +3256,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     json_config = _resolve_json_config() if log_format in ("json", "dual") else {}
     # 文本格式串（含 process/identity/user_tag/lineno）
     text_fmt = (
-        "%(asctime)s.%(msecs)03d [%(process)d] %(levelname)s "
+        "%(asctime)s.%(msecs)03d [%(process)d] [%(session_id)s] %(levelname)s "
         "%(identity)s%(user_tag)s%(name)s:%(lineno)d: %(message)s"
     )
 
@@ -3201,6 +3275,7 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     privacy_filter = SensitiveDataFilter()
     tag_config = LoggingTagConfig() if log_format in ("text", "dual", "json") else None
     identity_filter = IdentityFieldFilter()
+    session_id_filter = SessionIdFilter()
 
     def _add_rotating(
         filename: str,
@@ -3267,8 +3342,10 @@ def setup_logger(log_level: Optional[str] = None) -> logging.Logger:
     if listener_targets:
         queue_handler = QueueHandler(_log_queue)
         queue_handler.setLevel(logging.NOTSET)
-        # 必须在 emit 线程执行：IdentityStore 基于 contextvars，listener 线程读不到。
+        # 必须在 emit 线程执行：IdentityStore / log_session_id 基于 contextvars，
+        # listener 线程读不到。
         queue_handler.addFilter(identity_filter)
+        queue_handler.addFilter(session_id_filter)
         queue_handler.addFilter(privacy_filter)
         root.addHandler(queue_handler)
         if _SUPPORTS_RESPECT_HANDLER_LEVEL:

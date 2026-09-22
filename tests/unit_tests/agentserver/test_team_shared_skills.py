@@ -25,7 +25,24 @@ def _assert_link_points_to(path: Path, target: Path) -> None:
     assert path.resolve() == target.resolve()
 
 
-def test_ensure_team_shared_skills_initialized_links_global_skills(tmp_path, monkeypatch):
+@pytest.fixture
+def inline_link_sync(monkeypatch):
+    """Run link sync inline even inside a running loop, for deterministic tests.
+
+    Production offloads the sync to a worker thread when called on the event
+    loop (BUG20260918365771); asserting immediately after a refresh call would
+    then race the executor thread.
+    """
+    from jiuwenswarm.agents.harness.team import team_skill_links
+
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.offload_link_sync",
+        lambda source, target: team_skill_links.sync_skill_dir_links(source, target),
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_team_shared_skills_initialized_links_global_skills(tmp_path, monkeypatch):
     """Global skills should be linked to team shared directory via the public helper."""
     # Create global skills directory
     global_skills_dir = tmp_path / "global_skills"
@@ -58,7 +75,7 @@ def test_ensure_team_shared_skills_initialized_links_global_skills(tmp_path, mon
     )
 
     manager = TeamManager()
-    manager.ensure_team_shared_skills_initialized(spec)
+    await manager.ensure_team_shared_skills_initialized(spec)
 
     # The skills root stays a normal directory; individual skills are linked.
     assert team_shared_skills.is_dir()
@@ -68,7 +85,8 @@ def test_ensure_team_shared_skills_initialized_links_global_skills(tmp_path, mon
     assert not (team_shared_skills / "skills_state.json").exists()
 
 
-def test_existing_skill_entry_is_not_replaced(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_existing_skill_entry_is_not_replaced(tmp_path, monkeypatch):
     """Existing skill entries should be left untouched."""
     global_skills_dir = tmp_path / "global_skills"
     global_skills_dir.mkdir(parents=True)
@@ -97,7 +115,7 @@ def test_existing_skill_entry_is_not_replaced(tmp_path, monkeypatch):
     )
 
     manager = TeamManager()
-    manager.ensure_team_shared_skills_initialized(spec)
+    await manager.ensure_team_shared_skills_initialized(spec)
 
     assert (team_shared_skills / "skill-a").resolve() == existing_skill.resolve()
     assert "existing-skill-a" in (team_shared_skills / "skill-a" / "SKILL.md").read_text(encoding="utf-8")
@@ -131,7 +149,8 @@ def test_refresh_team_shared_skill_links_adds_new_global_skill(tmp_path, monkeyp
     _assert_link_points_to(team_shared_skills / "skill-b", skill_b)
 
 
-def test_ensure_team_shared_skills_ready_for_session_registers_refresh_target(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_ensure_team_shared_skills_ready_for_session_registers_refresh_target(tmp_path, monkeypatch, inline_link_sync):
     """Session readiness should initialize links and register the refresh target."""
     global_skills_dir = tmp_path / "global_skills"
     global_skills_dir.mkdir(parents=True)
@@ -154,7 +173,7 @@ def test_ensure_team_shared_skills_ready_for_session_registers_refresh_target(tm
     )
     manager = TeamManager()
 
-    manager.ensure_team_shared_skills_ready_for_session("sess-1", spec)
+    await manager.ensure_team_shared_skills_ready_for_session("sess-1", spec)
 
     team_shared_skills = team_workspace / "skills"
     _assert_link_points_to(team_shared_skills / "skill-a", skill_a)
