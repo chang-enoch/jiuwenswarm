@@ -361,7 +361,11 @@ def _deep_merge(
         if key not in override:
             result[key] = copy.deepcopy(tmpl_val)
         elif isinstance(tmpl_val, dict) and isinstance(override.get(key), dict):
-            result[key] = _deep_merge(tmpl_val, override[key], depth + 1)
+            # 模板空表（如 permissions.agents: {}）表示开放分桶，保留用户键。
+            if not tmpl_val:
+                result[key] = copy.deepcopy(override[key])
+            else:
+                result[key] = _deep_merge(tmpl_val, override[key], depth + 1)
         else:
             result[key] = override[key]
 

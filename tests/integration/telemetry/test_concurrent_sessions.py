@@ -38,6 +38,26 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 
+def _release_asyncio_default_executor() -> None:
+    """Drop the loop default executor so pytest-asyncio Runner.close() cannot hang.
+
+    OTel provider shutdown / callback unregister may leave work on the default
+    ThreadPoolExecutor; ``asyncio.Runner.close`` then blocks in
+    ``shutdown_default_executor`` until pytest-timeout kills the teardown.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    executor = getattr(loop, "_default_executor", None)
+    if executor is None:
+        return
+    # Python 3.11 rejects set_default_executor(None); clear the private slot
+    # so Runner.close() skips shutdown_default_executor on a hung pool.
+    loop._default_executor = None
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
 @pytest.fixture
 async def concurrent_env() -> AsyncIterator[SimpleNamespace]:
     shutdown_observability()
@@ -83,11 +103,13 @@ async def concurrent_env() -> AsyncIterator[SimpleNamespace]:
         try:
             await callbacks.unregister(Runner.callback_framework)
             shutdown_observability()
-            provider.force_flush()
-            meter_provider.shutdown()
+            provider.force_flush(timeout_millis=5_000)
+            meter_provider.force_flush(timeout_millis=5_000)
+            meter_provider.shutdown(timeout_millis=5_000)
             provider.shutdown()
         finally:
             IdentityStore.clear(identity_token)
+            _release_asyncio_default_executor()
             await asyncio.sleep(0)
 
 

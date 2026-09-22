@@ -258,14 +258,17 @@ def build_permission_interrupt(params: dict[str, Any], ctx: SwarmBuildContext) -
     """Build PermissionInterruptRail (None unless ``permissions.enabled`` in config)."""
     try:
         from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+            PermissionRailBuildOptions,
             build_permission_rail,
         )
 
         inp = PermissionInterruptInput.resolve(params, ctx)
         rail = build_permission_rail(
             config={"permissions": inp.permissions_config},
-            llm=None,
-            model_name=inp.model_name,
+            options=PermissionRailBuildOptions(
+                llm=None,
+                model_name=inp.model_name,
+            ),
         )
         if rail is not None and _is_team_plan_leader(ctx):
             return _TeamPlanPermissionInterruptRail(rail)
