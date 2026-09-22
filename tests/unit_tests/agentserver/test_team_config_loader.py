@@ -17,6 +17,7 @@ from jiuwenswarm.agents.harness.team.config_loader import (
     load_team_spec_dict,
     resolve_team_sqlite_db_path,
 )
+from jiuwenswarm.agents.harness.team import config_loader as team_config_loader
 
 
 def _wrap_modes_team(team_mapping: dict[str, dict]) -> dict:
@@ -163,7 +164,7 @@ def test_load_team_spec_dict_uses_first_models_defaults_entry_for_team(monkeypat
     assert model["model_request_config"]["temperature"] == 0.1
 
 
-def test_requested_model_overrides_every_team_agent_model_and_preserves_other_fields():
+def test_requested_model_ref_overrides_every_team_agent_model_and_preserves_other_fields():
     config = {
         "models": {
             "defaults": [
@@ -212,7 +213,14 @@ def test_requested_model_overrides_every_team_agent_model_and_preserves_other_fi
         ),
     }
 
-    spec = load_team_spec_dict(config_base=config, requested_model_name="selected-model")
+    selected_ref = _model_identity_ref(
+        model_name="selected-model",
+        provider="OpenAI",
+        api_base="https://selected.example.test/v1",
+    )
+    spec = load_team_spec_dict(
+        config_base=config, requested_model_name="selected-model", requested_model_ref=selected_ref
+    )
 
     for agent in spec["agents"].values():
         assert agent["model"]["model_client_config"]["model_name"] == "selected-model"
@@ -220,6 +228,40 @@ def test_requested_model_overrides_every_team_agent_model_and_preserves_other_fi
         assert agent["model"]["model_request_config"]["model"] == "selected-model"
     assert spec["agents"]["leader"]["skills"] == ["planning"]
     assert spec["agents"]["teammate"]["max_iterations"] == 7
+
+
+def test_requested_model_name_only_preserves_explicit_member_models():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {"model_name": "selected-model"},
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {
+                        "leader": {
+                            "model": {
+                                "model_client_config": {"model_name": "leader-default"},
+                                "model_request_config": {"model": "leader-default"},
+                            }
+                        },
+                        "teammate": {},
+                    },
+                }
+            }
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="selected-model")
+
+    assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "leader-default"
+    assert spec["agents"]["teammate"]["model"]["model_client_config"]["model_name"] == "selected-model"
 
 
 def test_requested_model_name_falls_back_to_first_default_when_missing():
@@ -242,7 +284,7 @@ def test_requested_model_name_falls_back_to_first_default_when_missing():
     assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "configured-model"
 
 
-def test_requested_model_name_uses_first_match_when_ambiguous():
+def test_requested_model_name_fails_closed_when_ambiguous():
     config = {
         "models": {
             "defaults": [
@@ -267,12 +309,8 @@ def test_requested_model_name_uses_first_match_when_ambiguous():
         ),
     }
 
-    spec = load_team_spec_dict(config_base=config, requested_model_name="duplicate-model")
-
-    assert (
-        spec["agents"]["leader"]["model"]["model_client_config"]["api_base"]
-        == "https://first.example.test/v1"
-    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        load_team_spec_dict(config_base=config, requested_model_name="duplicate-model")
 
 
 def _model_identity_ref(*, model_name: str, provider: str, api_base: str) -> str:
@@ -1326,6 +1364,37 @@ def test_load_team_spec_dict_preserves_arbitrary_team_top_level_fields(monkeypat
     # this test only covers JiuwenSwarm's config preservation contract.
     assert spec["max_debate_rounds"] == 2
 
+
+def test_requested_model_ref_in_legacy_model_config_fails_closed():
+    ref = _model_identity_ref(
+        model_name="selected-model",
+        provider="OpenAI",
+        api_base="https://selected.example.test/v1",
+    )
+    config = {
+        "models": {
+            "default": {
+                "model_client_config": {
+                    "model_name": "selected-model",
+                    "api_base": "https://selected.example.test/v1",
+                    "client_provider": "OpenAI",
+                },
+                "model_config_obj": {},
+            }
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    with pytest.raises(ValueError, match="owner is unavailable"):
+        load_team_spec_dict(
+            config_base=config,
+            requested_model_name="selected-model",
+            requested_model_ref=ref,
+        )
+
+
 def _duplicate_request_model_config() -> dict:
     return {
         "models": {
@@ -1373,6 +1442,32 @@ def test_requested_model_ref_selects_owner_after_defaults_reorder():
         assert agent["model"]["model_client_config"]["api_base"] == "https://third-party.example/v1/"
 
 
+def test_load_team_spec_dict_logs_final_member_model_identity(monkeypatch):
+    config = _duplicate_request_model_config()
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1",
+    )
+
+    messages = []
+    monkeypatch.setattr(
+        team_config_loader.logger,
+        "info",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+    load_team_spec_dict(
+        config_base=config,
+        requested_model_name="glm-5.3",
+        requested_model_ref=ref,
+    )
+
+    model_logs = [message for message in messages if "member model resolved" in message]
+    assert len(model_logs) == 2
+    assert all(ref in message for message in model_logs)
+    assert all("sk-third-party" not in message for message in model_logs)
+
+
 def test_requested_model_ref_name_mismatch_fails_closed():
     ref = _model_identity_ref(
         model_name="glm-5.3",
@@ -1414,3 +1509,32 @@ def test_requested_model_ref_unknown_and_ambiguous_fail_closed():
             requested_model_name="glm-5.3",
             requested_model_ref=shared_ref,
         )
+
+
+def test_member_model_refs_allow_auto_assignment_across_same_name_providers():
+    config = _duplicate_request_model_config()
+    first_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://builtin.example/v1",
+    )
+    second_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1",
+    )
+    config["modes"]["team"]["demo_team"]["agents"] = {
+        "leader": {"model": {"ref": first_ref}},
+        "teammate": {"model": {"ref": second_ref}},
+    }
+
+    spec = load_team_spec_dict(config_base=config)
+
+    assert (
+        spec["agents"]["leader"]["model"]["model_client_config"]["api_base"]
+        == "https://builtin.example/v1/"
+    )
+    assert (
+        spec["agents"]["teammate"]["model"]["model_client_config"]["api_base"]
+        == "https://third-party.example/v1/"
+    )

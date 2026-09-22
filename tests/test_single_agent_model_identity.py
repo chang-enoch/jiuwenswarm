@@ -10,8 +10,14 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmD
 def _adapter(*models):
     adapter = object.__new__(JiuWenSwarmDeepAdapter)
     adapter._model = models[0] if models else None
-    adapter._model_cache = {f"glm-5.3#{i}": model for i, model in enumerate(models)}
-    adapter._model_name_to_keys = {"glm-5.3": [f"glm-5.3#{i}" for i in range(len(models))]}
+    adapter._model_cache = {
+        f"{model.model_config.model_name}#{i}": model for i, model in enumerate(models)
+    }
+    adapter._model_name_to_keys = {}
+    for i, model in enumerate(models):
+        adapter._model_name_to_keys.setdefault(model.model_config.model_name, []).append(
+            f"{model.model_config.model_name}#{i}"
+        )
     adapter._model_identity_to_keys = {}
     for i, model in enumerate(models):
         config = model.model_client_config
@@ -66,9 +72,22 @@ def test_name_mismatch_fails_closed():
 
 
 def test_without_model_ref_preserves_name_lookup():
-    first, second = _model("https://one.example"), _model("https://two.example")
+    first = _model("https://one.example")
+    second = _model("https://two.example", name="qwen3-32b")
     adapter = _adapter(first, second)
     assert adapter._resolve_model_for_request(_request(model_name="glm-5.3")) is first
+
+
+def test_name_only_resolution_fails_closed_for_duplicate_model_names():
+    adapter = _adapter(_model("https://one.example"), _model("https://two.example"))
+    with pytest.raises(ValueError, match="ambiguous"):
+        adapter._resolve_model_for_request(_request(model_name="glm-5.3"))
+
+
+def test_subagent_name_only_resolution_fails_closed_for_duplicate_model_names():
+    adapter = _adapter(_model("https://one.example"), _model("https://two.example"))
+    with pytest.raises(ValueError, match="ambiguous"):
+        adapter._resolve_model(model_name="glm-5.3")
 
 
 def test_legacy_cache_build_populates_identity_index(monkeypatch):

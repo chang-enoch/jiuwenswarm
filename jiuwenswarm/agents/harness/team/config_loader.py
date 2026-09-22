@@ -221,19 +221,19 @@ def _resolve_default_model_config(
         return {}
 
     defaults_raw = models_raw.get("defaults")
-    if isinstance(defaults_raw, list):
-        requested_ref = (requested_model_ref or "").strip()
-        if requested_ref:
-            selected = resolve_model_identity_reference(requested_ref, config_base)
-            selected_name = str((selected.get("model_client_config") or {}).get("model_name") or "").strip()
-            requested_name = (requested_model_name or "").strip()
-            if requested_name and selected_name != requested_name:
-                raise ValueError(
-                    "team model reference name mismatch: "
-                    f"expected {requested_name!r}, found {selected_name!r}"
-                )
-            return selected
+    requested_ref = (requested_model_ref or "").strip()
+    if requested_ref:
+        selected = resolve_model_identity_reference(requested_ref, config_base)
+        selected_name = str((selected.get("model_client_config") or {}).get("model_name") or "").strip()
+        requested_name = (requested_model_name or "").strip()
+        if requested_name and selected_name != requested_name:
+            raise ValueError(
+                "team model reference name mismatch: "
+                f"expected {requested_name!r}, found {selected_name!r}"
+            )
+        return selected
 
+    if isinstance(defaults_raw, list):
         # When the caller (chat page) provides a requested model name, prefer
         # the entry whose ``model_client_config.model_name`` matches it so
         # team members without an explicit ``modes.team.agents.*.model`` fall
@@ -250,9 +250,9 @@ def _resolve_default_model_config(
             if len(matches) == 1:
                 return matches[0]
             if len(matches) > 1:
-                logger.warning(
-                    "[TeamConfigLoader] requested model name is ambiguous; using first match: %s",
-                    requested,
+                raise ValueError(
+                    "requested team model name is ambiguous; provide model_ref: "
+                    f"{requested!r}"
                 )
             else:
                 logger.warning(
@@ -342,6 +342,32 @@ def _build_agent_spec_dict(
     merged.setdefault("max_iterations", max_iterations)
     merged.setdefault("completion_timeout", completion_timeout)
     return merged
+
+
+def _log_resolved_agent_models(agents: dict[str, Any]) -> None:
+    """Log final model identities without exposing credentials."""
+    for agent_key, agent_spec in agents.items():
+        model_spec = agent_spec.get("model") if isinstance(agent_spec, dict) else None
+        if not isinstance(model_spec, dict):
+            continue
+        client_config = model_spec.get("model_client_config")
+        if not isinstance(client_config, dict):
+            client_config = {}
+        request_config = model_spec.get("model_request_config")
+        if not isinstance(request_config, dict):
+            request_config = {}
+        model_name = str(
+            client_config.get("model_name") or request_config.get("model") or ""
+        ).strip()
+        model_ref = str(model_spec.get("ref") or "").strip()
+        if not model_ref and model_name:
+            model_ref = build_model_identity_reference(model_name, client_config)
+        logger.info(
+            "[TeamConfigLoader] member model resolved: member=%s model_name=%s model_ref=%s",
+            agent_key,
+            model_name or "<none>",
+            model_ref or "<none>",
+        )
 
 
 def resolve_model_identity_reference(
@@ -488,13 +514,10 @@ def _build_agents_config(
                 agent_config = {}
         else:
             agent_config = dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
-        has_requested_model = bool(
-            requested_model_name and requested_model_name.strip()
-        )
         has_requested_model_ref = bool(
             requested_model_ref and requested_model_ref.strip()
         )
-        if has_requested_model or has_requested_model_ref:
+        if has_requested_model_ref:
             agent_config["model"] = deepcopy(default_model)
         else:
             referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
@@ -534,6 +557,7 @@ def _build_agents_config(
             completion_timeout=completion_timeout,
         )
 
+    _log_resolved_agent_models(agents)
     return agents
 
 
@@ -703,10 +727,9 @@ def load_team_spec_dict(
 ) -> dict[str, Any]:
     """Load team config and build a TeamAgentSpec-compatible dict.
 
-    When ``requested_model_name`` is provided (e.g. from the chat page model
-    selector), team members without an explicit ``modes.team.agents.*.model``
-    fall back to the matching entry in ``models.defaults`` instead of the
-    first list item.
+    ``requested_model_ref`` is authoritative and applies the resolved model to
+    every member. A name-only request remains a compatibility fallback for
+    members without an explicit model.
     """
     if config_base is None:
         config_base = get_config()

@@ -6534,6 +6534,10 @@ class JiuWenSwarmDeepAdapter:
         # （旧代码在此处写重了，导致非默认模型永远查不到，静默 fallback 回默认模型）。
         keys = self._model_name_to_keys.get(requested)
         if keys:
+            if len(keys) != 1:
+                raise ValueError(
+                    f"model name is ambiguous; provide model_ref: {requested!r}"
+                )
             resolved = self._model_cache.get(keys[0])
             if resolved is not None:
                 return resolved
@@ -6551,6 +6555,10 @@ class JiuWenSwarmDeepAdapter:
             return self._model_cache[requested]
         keys = self._model_name_to_keys.get(requested)
         if keys:
+            if len(keys) != 1:
+                raise ValueError(
+                    f"model name is ambiguous; provide model_ref: {requested!r}"
+                )
             return self._model_cache.get(keys[0])
         return None
 

@@ -1979,10 +1979,9 @@ async def process_team_message_stream(
                 request.params.get("supports_user_interaction") is not False,
             )
         resolved_mode = str(request_metadata.get("mode") or "").strip()
-        # Page-selected model name (from chat page model selector). Used as a
-        # fallback for team members whose ``modes.team.agents.*.model`` is not
-        # explicitly configured, so cluster mode honors the page model when no
-        # per-agent model is set in config.yaml.
+        # Relay-provided model_ref is authoritative for a uniform selection or
+        # a member-level auto assignment. A name-only request remains a
+        # compatibility fallback for members without explicit model config.
         params_obj = getattr(request, "params", None)
         requested_model_name = (
             str(params_obj.get("model_name") or "").strip()
