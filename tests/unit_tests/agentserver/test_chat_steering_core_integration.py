@@ -115,9 +115,8 @@ def _isolate_configuration(monkeypatch, adapter, model):
     monkeypatch.setattr(
         adapter, "_try_skill_turbo_resume", AsyncMock(return_value=None)
     )
-    monkeypatch.setattr(
-        adapter, "_arm_skill_turbo_interrupt_recovery_hint", AsyncMock()
-    )
+    # _arm_skill_turbo_interrupt_recovery_hint 已随三层产物恢复兜底物理移除，
+    # 无需再 patch 压制其副作用。
     monkeypatch.setattr(
         adapter, "_inject_extension_config_into_inputs", lambda *_: None
     )

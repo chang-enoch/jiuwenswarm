@@ -33,8 +33,13 @@ _ensure_attr(
     gc_models, "RepositoryGitCodeTemplate", type("RepositoryGitCodeTemplate", (), {})
 )
 
-# 仅 stub image_tools，避免 google.genai 链路
-if "jiuwenswarm.agents.harness.common.tools.image_tools" not in sys.modules:
+# 优先真实导入 image_tools；仅当精简环境缺可选依赖（google.genai 链路）时
+# 才注入最小 stub。stub 只有 generate_image 属性，会污染同进程后续测试
+# （test_tool_env_tip_reads 需要真实的 _get_vision_api_credentials），
+# 因此必须真实导入优先、失败兜底。
+try:
+    from jiuwenswarm.agents.harness.common.tools import image_tools  # noqa: F401
+except ImportError:
     image_tools = types.ModuleType(
         "jiuwenswarm.agents.harness.common.tools.image_tools"
     )
