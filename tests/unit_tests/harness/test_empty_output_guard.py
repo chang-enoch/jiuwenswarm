@@ -314,7 +314,10 @@ def test_prepend_does_not_prepend_workspace_paths(
     monkeypatch.setattr(
         "os.access", _force_readonly(workspace_skill)
     )
-    system_dirs = ["C:\\system1", "C:\\system2"]
+    # System PATH tokens must contain no os.pathsep (";" / ":") so this test
+    # runs on both Windows and POSIX (where os.pathsep is ":", splitting
+    # "C:\\system1" into ["C", "\\system1"]).
+    system_dirs = ["sentinel1", "sentinel2"]
     initial_path = os.pathsep.join(system_dirs)
     with patch("os.getcwd", return_value=str(workspace_skill.parent.parent.parent)):
         env = {"PATH": initial_path}
@@ -377,6 +380,7 @@ def test_prepend_is_noop_without_tool_dirs(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only PATH hardening")
 @pytest.mark.parametrize(
     "stderr, exit_code, expect_hint",
     [
@@ -690,6 +694,7 @@ def test_xlsx_size_warning_5999_vs_6000_boundary(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only PATH hardening")
 def test_windows_not_found_hint_marker_text_paths() -> None:
     """All three marker families trigger the hint."""
     assert (
@@ -706,6 +711,7 @@ def test_windows_not_found_hint_marker_text_paths() -> None:
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only PATH hardening")
 def test_windows_not_found_hint_exit_code_9009_path() -> None:
     """exit_code=9009 path triggers regardless of stderr text."""
     assert (
