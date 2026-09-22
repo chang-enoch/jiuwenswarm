@@ -142,7 +142,10 @@ def test_instance_config_base_falls_back_to_native_config(monkeypatch: pytest.Mo
     disk_config = {"models": {"defaults": [{"model": "disk-model"}]}}
     monkeypatch.setattr(interface_deep_module, "get_config", lambda: disk_config)
 
-    assert interface_deep_module._resolve_instance_config_base(None) is disk_config
+    resolved = interface_deep_module._resolve_instance_config_base(None)
+    assert resolved == disk_config
+    assert resolved is not disk_config
+    assert resolved["models"] is not disk_config["models"]
 
 
 @pytest.mark.asyncio
