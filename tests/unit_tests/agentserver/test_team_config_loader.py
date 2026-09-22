@@ -164,6 +164,52 @@ def test_load_team_spec_dict_uses_first_models_defaults_entry_for_team(monkeypat
     assert model["model_request_config"]["temperature"] == 0.1
 
 
+def test_load_team_spec_dict_merges_tip_default_headers_into_member_model(monkeypatch):
+    """Team members must carry MaaS tip Authorization into custom_headers."""
+    monkeypatch.setattr(
+        team_config_loader,
+        "read_default_headers",
+        lambda: {"Authorization": "Basic tip-auth", "X-Tenant": "tenant-a"},
+        raising=False,
+    )
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://maas.example/v2",
+                        "api_key": "huawei-maas-session",
+                        "model_name": "glm-5.2",
+                        "client_provider": "OpenAI",
+                        "custom_headers": {
+                            "Authorization": "Bearer stale",
+                            "X-Existing": "keep",
+                        },
+                    },
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {"leader": {}, "teammate": {}},
+                }
+            }
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config)
+
+    headers = spec["agents"]["leader"]["model"]["model_client_config"]["custom_headers"]
+    assert headers == {
+        "Authorization": "Basic tip-auth",
+        "X-Tenant": "tenant-a",
+        "X-Existing": "keep",
+    }
+
+
 def test_requested_model_ref_overrides_every_team_agent_model_and_preserves_other_fields():
     config = {
         "models": {

@@ -12,6 +12,7 @@ from typing import Any
 from openjiuwen.agent_teams.paths import get_agent_teams_home
 
 from jiuwenswarm.common.config import get_config
+from jiuwenswarm.common.local_env_config import read_default_headers
 from jiuwenswarm.common.model_identity import (
     MODEL_IDENTITY_REFERENCE_PREFIX,
     build_model_identity_reference,
@@ -29,6 +30,45 @@ _DEFAULT_TRANSPORT = {"type": "inprocess"}
 
 class TeamTemplateNotFoundError(ValueError):
     """Raised when a bound team references a template that no longer exists."""
+
+
+def merge_tip_default_headers(model_client_config: dict[str, Any]) -> dict[str, Any]:
+    """Merge trusted tip headers into a model client config without mutating it.
+
+    Huawei MaaS uses ``api_key=huawei-maas-session`` as a placeholder while the
+    real Basic Authorization is supplied by the tip ``default_headers``.  The
+    tip Authorization therefore takes precedence; unrelated tip headers only
+    fill keys that are not explicitly configured on the model.
+    """
+    merged_config = deepcopy(model_client_config)
+    try:
+        tip_headers = read_default_headers()
+    except Exception:  # noqa: BLE001 - malformed tip data must not break teams
+        logger.warning(
+            "[TeamConfigLoader] failed to read tip default_headers",
+            exc_info=True,
+        )
+        return merged_config
+
+    if not tip_headers:
+        return merged_config
+
+    existing_headers = merged_config.get("custom_headers")
+    merged_headers = dict(existing_headers) if isinstance(existing_headers, dict) else {}
+    for header_name, header_value in tip_headers.items():
+        key = str(header_name)
+        if key.lower() == "authorization":
+            merged_headers[key] = str(header_value)
+        else:
+            merged_headers.setdefault(key, str(header_value))
+    merged_config["custom_headers"] = merged_headers
+    logger.info(
+        "[TeamConfigLoader] merged tip default_headers into custom_headers: "
+        "keys=%s has_authorization=%s",
+        sorted(str(key) for key in merged_headers),
+        any(str(key).lower() == "authorization" for key in merged_headers),
+    )
+    return merged_config
 
 
 def _get_modes_team(config_base: dict[str, Any]) -> dict[str, Any]:
@@ -282,7 +322,9 @@ def _build_default_model_dict(
         requested_model_name=requested_model_name,
         requested_model_ref=requested_model_ref,
     )
-    model_client_config = dict(model_config.get("model_client_config", {}))
+    model_client_config = merge_tip_default_headers(
+        dict(model_config.get("model_client_config", {}))
+    )
     model_request_config = dict(model_config.get("model_config_obj", {}))
 
     model_name = model_client_config.get("model_name", "")
@@ -457,7 +499,9 @@ def _resolve_agent_model_reference(
 
     entry = resolve_team_model_reference(model_raw.get("ref"), config_base)
 
-    model_client_config = deepcopy(entry.get("model_client_config") or {})
+    model_client_config = merge_tip_default_headers(
+        deepcopy(entry.get("model_client_config") or {})
+    )
     actual_name = str(model_client_config.get("model_name") or "").strip()
     model_request_config = deepcopy(entry.get("model_config_obj") or {})
     request_overrides = model_raw.get("model_request_config")
