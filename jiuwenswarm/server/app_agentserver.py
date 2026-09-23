@@ -176,6 +176,14 @@ from jiuwenswarm.common.tool_prompt_patches import apply_tool_prompt_patches
 
 apply_tool_prompt_patches()
 
+# 专家团交付物落盘治理：worker cwd 回填 + 团队模板/身份块
+# 文案收窄，幂等且失配降级为 warning，不打断启动。
+from jiuwenswarm.agents.harness.team.team_deliverable_patch import (
+    apply_team_deliverable_patches,
+)
+
+apply_team_deliverable_patches()
+
 # /debug 模式下捕获 builtin TaskTool 分发的 subagent 流（reasoning/tool_call/usage），
 # 内联写入主 dump。非 debug 或 include_subagent_flow 关闭时走原始 invoke，零回归。
 from jiuwenswarm.server.runtime.debug_trace.task_tool_patch import (

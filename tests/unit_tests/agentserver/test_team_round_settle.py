@@ -224,8 +224,10 @@ async def test_final_emits_terminal_when_round_settled(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_final_no_terminal_when_round_not_settled(monkeypatch) -> None:
-    """团队未落定（成员在途/有未读）→ 不补终态，维持等 team.completed 的旧行为。"""
+async def test_final_forced_terminal_with_error_when_not_settled_at_stream_end(monkeypatch) -> None:
+    """团队未落定（成员在途/有未读）→ 轮内不补终态（维持等 team.completed）；
+    但流末仍零终态时 finally 强制补带 error 的终态帧（design/team/21 规则 2：
+    状态不明不粉饰，防前端永挂）。"""
     events = await _run_final_round(monkeypatch, settled=False)
     finals = [e for e in events if e.get("event_type") == "chat.final"]
     assert len(finals) == 1
@@ -234,7 +236,8 @@ async def test_final_no_terminal_when_round_not_settled(monkeypatch) -> None:
         for e in events
         if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
     ]
-    assert terminals == []
+    assert len(terminals) == 1
+    assert terminals[0].get("error")
 
 
 async def _run_scripted_round(
@@ -309,14 +312,17 @@ async def test_settle_terminal_delayed_and_fired_when_idle(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_settle_terminal_cancelled_by_new_activity(monkeypatch) -> None:
-    """长流协作防误杀：final 后窗口内又有流帧（leader 说完继续干活）→ 终态作废。"""
+    """长流协作防误杀：final 后窗口内又有流帧（leader 说完继续干活）→ 静默窗
+    终态作废（轮内不误收）；流末仍零终态 → finally 强制补带 error 终态
+    （design/team/21 规则 2：流尽=本流视角回合已了，复核 False 不粉饰）。"""
     events = await _run_scripted_round(monkeypatch, {"v": True}, script="churn")
     terminals = [
         e
         for e in events
         if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
     ]
-    assert terminals == []
+    assert len(terminals) == 1
+    assert terminals[0].get("error")
 
 
 async def _run_retry_round(monkeypatch: pytest.MonkeyPatch, settle_seq: list, trailing: str) -> list[dict]:
@@ -397,10 +403,223 @@ async def test_usage_trailing_frame_does_not_cancel_window(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_forever_abandons_after_max_attempts(monkeypatch) -> None:
-    """读数持续未就绪超过重试上限 → 放弃（维持旧行为等 team.completed）。"""
+    """读数持续未就绪超过重试上限 → 静默窗放弃；流末零终态 → finally 强制补
+    带 error 终态（design/team/21 规则 2：放弃重试≠放弃收尾）。"""
     events = await _run_retry_round(monkeypatch, [None, None, None], trailing="usage")
     terminals = [
         e for e in events
         if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
     ]
+    assert len(terminals) == 1
+    assert terminals[0].get("error")
+
+
+# ------------------------------------------------------------------
+# design/team/21：终态族治理（问题 3 重复去重 + 问题 2 流末强制补终态）
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_duplicate_terminal_when_team_completed_follows_final(monkeypatch) -> None:
+    """问题 3 回归钉：final 挂起 settle 静默窗 → team.completed 转换已发终态 →
+    流末 finally 兜底不得重复补发（_emit_settle_terminal 入口查 completion_signals）。
+    修复前此场景必现 2 条终态帧（第二条无计数）。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+
+    async def _settled(_cid, _sid):
+        return True
+
+    monkeypatch.setattr(team_helpers, "_team_round_settled", _settled)
+
+    def _fake_parse(chunk):
+        ctype = getattr(chunk, "type", None)
+        if ctype == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        if ctype == "answer":
+            return {"event_type": "chat.final", "content": chunk.payload}
+        if ctype == "completed":
+            return {"event_type": "team.completed", "member_count": 3, "task_count": 2}
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+        yield SimpleNamespace(
+            type="controller_output",
+            payload=SimpleNamespace(
+                type="task_completion",
+                data=[SimpleNamespace(data={"output": "总结", "result_type": "answer"})],
+            ),
+            role=None,
+        )
+        yield SimpleNamespace(type="completed", payload={}, role=None)
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+    await team_helpers._consume_stream_with_query(
+        "web", "sess-dup", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+    )
+    terminals = [
+        e for e in manager.events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert len(terminals) == 1
+    # 唯一终态 = team.completed 转换帧（带计数），settle/finally 均未重复补发
+    assert terminals[0].get("member_count") == 3
+    assert terminals[0].get("task_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_forced_clean_terminal_when_stream_ends_without_any_terminal(monkeypatch) -> None:
+    """问题 2：流结束仍零终态（无 final、无 team.completed，settle 从未挂窗）
+    且复核落定 → finally 强制补干净终态帧（不带 error）。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+
+    async def _settled(_cid, _sid):
+        return True
+
+    monkeypatch.setattr(team_helpers, "_team_round_settled", _settled)
+
+    def _fake_parse(chunk):
+        if getattr(chunk, "type", None) == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+    await team_helpers._consume_stream_with_query(
+        "web", "sess-force", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+    )
+    terminals = [
+        e for e in manager.events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert len(terminals) == 1
+    assert "error" not in terminals[0]
+
+
+@pytest.mark.asyncio
+async def test_no_forced_terminal_when_interaction_pending(monkeypatch) -> None:
+    """挂起交互守卫：leader 发出 ask_user_question 后流结束（回合挂起等用户输入）→
+    不强制补终态（暂停待恢复，不是终结）。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+
+    def _fake_parse(chunk):
+        ctype = getattr(chunk, "type", None)
+        if ctype == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        if ctype == "ask":
+            return {
+                "event_type": "chat.ask_user_question",
+                "request_id": "ask-1",
+                "questions": [{"question": "确认继续吗？"}],
+            }
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+        yield SimpleNamespace(type="ask", payload={}, role=TeamRole.LEADER)
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+    await team_helpers._consume_stream_with_query(
+        "web", "sess-hitl", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+    )
+    terminals = [
+        e for e in manager.events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
     assert terminals == []
+
+
+@pytest.mark.asyncio
+async def test_no_forced_terminal_when_stream_cancelled(monkeypatch) -> None:
+    """取消守卫：流被取消（用户停止/级联收流）→ 不强制补终态。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+
+    def _fake_parse(chunk):
+        if getattr(chunk, "type", None) == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+    with pytest.raises(asyncio.CancelledError):
+        await team_helpers._consume_stream_with_query(
+            "web", "sess-cancel", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+        )
+    terminals = [
+        e for e in manager.events
+        if e.get("event_type") == "chat.processing_status" and e.get("is_complete") is True
+    ]
+    assert terminals == []
+
+
+@pytest.mark.asyncio
+async def test_forced_terminal_failure_does_not_block_team_completed(monkeypatch) -> None:
+    """finally 内补终态自身失败（广播异常）→ 仅记日志不传播：不遮蔽原异常、
+    不跳过后续 raw team.completed 广播（cron watcher 收尾依赖）。"""
+    manager = _SettleRecordingManager()
+    monkeypatch.setattr(team_helpers, "get_team_manager", lambda _cid: manager)
+
+    async def _settled(_cid, _sid):
+        return True
+
+    monkeypatch.setattr(team_helpers, "_team_round_settled", _settled)
+
+    def _fake_parse(chunk):
+        if getattr(chunk, "type", None) == "team.member":
+            return {
+                "event_type": "team.member",
+                "event": {"type": "team.member.status_changed", "member_id": "m1"},
+            }
+        return None
+
+    monkeypatch.setattr(team_helpers, "parse_stream_chunk", _fake_parse)
+
+    async def _fake_stream(**kwargs):
+        yield SimpleNamespace(type="team.member", payload={}, role=TeamRole.LEADER)
+
+    monkeypatch.setattr(team_helpers.Runner, "run_agent_team_streaming", _fake_stream)
+
+    real_broadcast = team_helpers._broadcast_event
+
+    async def _flaky_broadcast(cid, sid, event):
+        # 只在强制终态帧上炸（终态帧特征：processing_status 且 is_complete）
+        if event.get("event_type") == "chat.processing_status" and event.get("is_complete") is True:
+            raise RuntimeError("waiter queue exploded")
+        await real_broadcast(cid, sid, event)
+
+    monkeypatch.setattr(team_helpers, "_broadcast_event", _flaky_broadcast)
+
+    await team_helpers._consume_stream_with_query(
+        "web", "sess-flaky", SimpleNamespace(team_name="spec-team"), "问", round_id=1,
+    )
+    # 补终态失败后：raw team.completed 兜底广播仍须到达
+    assert any(e.get("event_type") == "team.completed" for e in manager.events)

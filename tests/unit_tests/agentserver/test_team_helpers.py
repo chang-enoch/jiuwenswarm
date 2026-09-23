@@ -3120,6 +3120,7 @@ async def test_consume_stream_with_query_broadcasts_leader_task_failed_detail_an
         "chat.processing_status",
         "chat.error",
         "chat.final",
+        "chat.processing_status",
         "team.completed",
     ]
     assert "deepseek-v4-X" in broadcasted[1]["error"]
@@ -3131,10 +3132,14 @@ async def test_consume_stream_with_query_broadcasts_leader_task_failed_detail_an
         "session_id": "sess-leader-error",
         "rid": 1,
     }
-    assert not any(
-        event.get("event_type") == "chat.processing_status" and event.get("is_processing") is False
-        for event in broadcasted
-    )
+    # （旧契约为"此路径不发终态帧"，已反转）：
+    # leader task_failed 后流结束仍零终态 → finally 强制补带 error 的终态帧，
+    # error 复用本轮未恢复错误史（round_unrecovered_error），前端即时记失败，
+    # 不再等 45s 自愈对账
+    terminal = broadcasted[3]
+    assert terminal["is_processing"] is False
+    assert terminal["is_complete"] is True
+    assert "deepseek-v4-X" in str(terminal.get("error") or "")
 
 
 @pytest.mark.anyio
@@ -3456,11 +3461,18 @@ async def test_consume_stream_with_query_does_not_final_teammate_task_failed(mon
     assert [event["event_type"] for event in broadcasted] == [
         "chat.processing_status",
         "chat.error",
+        "chat.processing_status",
         "team.completed",
     ]
     assert "deepseek-v4-X" in broadcasted[1]["error"]
     assert broadcasted[1]["role"] == TeamRole.TEAMMATE.value
     assert broadcasted[1]["member_name"] == "analyst"
+    # 规则 2：成员失败且流末零终态 → finally 强制补带 error 的
+    # 终态帧（成员错误不入 round_unrecovered_error，用通用不明状态文案）
+    terminal = broadcasted[2]
+    assert terminal["is_processing"] is False
+    assert terminal["is_complete"] is True
+    assert terminal.get("error")
 
 
 def test_extract_query_directives_strips_hide_dm_prefix_and_flags():

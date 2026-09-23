@@ -453,11 +453,17 @@ def _team_common_rail_names(role: str) -> tuple[str, ...]:
 
 
 def _code_base_rail_names(role: str) -> tuple[str, ...]:
-    """Code-profile rails minus permission interrupt; leaders omit code todo planning.
+    """Code-profile rails minus user-facing interrupts; leaders omit code todo planning.
 
     ``PERMISSION_INTERRUPT`` is excluded for all team members: it relies on a
     frontend user response that headless teammates cannot provide, and even the
     leader's interrupt path is unreliable in a team context.
+
+    ``STRUCTURED_ASK_USER`` is leader-only for the same reason: the rail's
+    ``init()`` registers the ``ask_user`` tool, and a headless teammate calling
+    it would park on an interrupt nobody can answer. Asking the user is the
+    leader's job (it owns the user-facing channel); teammates escalate via
+    ``send_message`` instead.
     """
     names = tuple(
         name for name in _CODE_RAIL_NAMES
@@ -465,7 +471,7 @@ def _code_base_rail_names(role: str) -> tuple[str, ...]:
     )
     if role == "leader":
         return tuple(name for name in names if name != registry.CODE_TASK_PLANNING)
-    return names
+    return tuple(name for name in names if name != registry.STRUCTURED_ASK_USER)
 
 
 def _role_evolution_rails(config: dict[str, Any], role: str) -> list[RailSpec]:
