@@ -483,6 +483,30 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
         return None
 
 
+def _history_tail_lagged(
+        synced_tail: str | None,
+        session_id: str,
+        exclude_request_id: str | None = None,
+) -> bool:
+    """同步指纹是否落后于磁盘尾。
+
+    落后（True）时轮末不得把指纹推进到本轮 rid——会把未同步的历史段
+    （典型：团队期记录不经默认 agent）永久跳过。读盘失败按未落后处理
+    （保持旧行为，不冤枉正常轮次）。
+    """
+    try:
+        from jiuwenswarm.server.runtime.session.session_history import (
+            load_history_tail_request_id,
+        )
+
+        disk_tail = load_history_tail_request_id(
+            session_id, exclude_request_id=exclude_request_id
+        )
+    except Exception:
+        return False
+    return bool(disk_tail) and synced_tail != disk_tail
+
+
 async def _get_persistent_checkpointer_lock() -> asyncio.Lock:
     """Lazy-init or rebind the process-wide checkpointer lock to the running loop.
 
@@ -1436,11 +1460,25 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         self._is_session_scoped_adapter = True
         self._parent_session_id = session_id
         self._synced_history_tail_request_id = None
+        self._history_sync_lagged = False
 
     def _mark_history_tail_synced(self, request_id: str | None) -> None:
         rid = str(request_id or "").strip()
-        if rid:
-            self._synced_history_tail_request_id = rid
+        if not rid:
+            return
+        if getattr(self, "_history_sync_lagged", False):
+            # 起跑前指纹落后于磁盘尾（warmup 命中旧快照且当轮 refresh 没补上/
+            # refresh 失败）：本轮是在旧上下文上跑的，推进指纹会把未同步的
+            # 历史段（典型：团队期记录）永久跳过——保持旧指纹，下轮 refresh
+            # 继续补。标记由 _get_or_create_session_adapter 每轮起跑时重估。
+            logger.info(
+                "[JiuWenSwarmDeepAdapter] 指纹落后，轮末不推进: session=%s rid=%s synced=%s",
+                getattr(self, "_parent_session_id", None),
+                rid,
+                self._synced_history_tail_request_id,
+            )
+            return
+        self._synced_history_tail_request_id = rid
 
     def _get_cached_session_adapter(self, session_id: str | None) -> "JiuWenSwarmDeepAdapter | None":
         sid = self._session_adapter_key(session_id)
@@ -1695,6 +1733,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                             ),
                         )
                     )
+                    existing._history_sync_lagged = _history_tail_lagged(
+                        existing._synced_history_tail_request_id,
+                        sid,
+                        warmup_exclude_request_id,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "[JiuWenSwarmDeepAdapter] session context refresh failed: "
@@ -1740,18 +1783,32 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # （全新会话磁盘无历史，warmup 内部会静默跳过）。
             try:
                 from jiuwenswarm.agents.harness.common.session_ops_service import (
-                    load_history_tail_request_id,
+                    refresh_session_context_if_stale,
                     warmup_session_context,
                 )
 
-                await warmup_session_context(
+                # warmup 返回本次恢复实际覆盖到的 history 尾：快照恢复时是
+                # 快照尾指纹（可能早于磁盘尾，如团队期不经默认 agent、快照
+                # 停在装团前）。落后时立刻补一轮增量同步，让本轮就带上快照后
+                # 的历史——否则本轮失忆，且轮末指纹无条件推进会把这段缺口
+                # 永久跳过（后续 refresh 指纹相等静默不补）。
+                adapter._synced_history_tail_request_id = await warmup_session_context(
                     deep_agent=getattr(adapter, "_instance", None),
                     session_id=sid,
                     exclude_request_id=warmup_exclude_request_id,
                 )
-                adapter._synced_history_tail_request_id = load_history_tail_request_id(
+                adapter._synced_history_tail_request_id = (
+                    await refresh_session_context_if_stale(
+                        deep_agent=getattr(adapter, "_instance", None),
+                        session_id=sid,
+                        exclude_request_id=warmup_exclude_request_id,
+                        synced_tail_request_id=adapter._synced_history_tail_request_id,
+                    )
+                )
+                adapter._history_sync_lagged = _history_tail_lagged(
+                    adapter._synced_history_tail_request_id,
                     sid,
-                    exclude_request_id=warmup_exclude_request_id,
+                    warmup_exclude_request_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1893,13 +1950,28 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         session_id: str | None,
         *,
         require_pure_ask_user: bool = True,
+        force: bool = False,
     ) -> bool:
-        """Drop an abandoned interaction round without leaving open tool calls."""
+        """Drop an abandoned interaction round without leaving open tool calls.
+
+        ``force=True`` 时不再要求「上下文最后一条消息正好是被中断的 ai_message」：
+        并行子代理场景下父会话的上下文尾部往往是其它子代理的 tool 结果，
+        但残留的 ``interrupted_tools`` 仍会把后续每条普通消息都当成续跑输入
+        （见 :meth:`_discard_stale_interrupt_for_fresh_turn`）。
+        """
         instance = getattr(self, "_instance", None)
         loop_session = getattr(instance, "_loop_session", None)
         loop_sid = self._deep_agent_loop_session_id()
         target_sid = self._resolve_interrupt_session_id(session_id)
         if loop_session is None or loop_sid != target_sid:
+            if force:
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] interrupt: cannot drop stale "
+                    "interaction state, loop session mismatch loop_sid=%s "
+                    "target_sid=%s",
+                    loop_sid,
+                    target_sid,
+                )
             return False
 
         try:
@@ -1939,10 +2011,24 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 (getattr(tool_call, "id", None), getattr(tool_call, "name", None))
                 for tool_call in last_calls
             ]
-            if last_signature != pending_signature:
+            signature_matches = last_signature == pending_signature
+            if not signature_matches and not force:
                 return False
 
-            context.pop_messages(1, with_history=True)
+            if signature_matches:
+                context.pop_messages(1, with_history=True)
+            else:
+                # 尾部已经不是那条 ai_message：历史里留着未配对的 tool_call，
+                # 但它不影响后续轮的模型调用（同轮其它子代理已回结果），
+                # 比继续让旧中断吃掉用户输入安全得多。
+                logger.warning(
+                    "[JiuWenSwarmDeepAdapter] interrupt: dropping stale "
+                    "interaction state without context tail session=%s "
+                    "pending=%s last=%s",
+                    target_sid,
+                    pending_signature,
+                    last_signature,
+                )
             loop_session.update_state({INTERRUPTION_KEY: None})
             await context_engine.save_contexts(loop_session)
             # save_contexts() only copies the updated context into the session
@@ -4947,6 +5033,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             return None
 
     def _build_cspl_sentinel_rail(self) -> CsplSentinelRail | None:
+        from jiuwenswarm.common.behavior_security import BehaviorSecurityBridge, desktop_security_active
+        if desktop_security_active():
+            from jiuwenswarm.agents.harness.common.rails.behavior_security_rail import BehaviorSecurityRail
+            from jiuwenswarm.common.config import get_config
+            return BehaviorSecurityRail(BehaviorSecurityBridge(get_config()))
         try:
             cspl_cfg = CsplConfig.load()
             if not cspl_cfg.enabled:
@@ -7952,6 +8043,46 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             params
         )
 
+    def _is_fresh_turn_request(self, params: Any) -> bool:
+        """Whether this ``chat.send`` opens a brand-new user turn.
+
+        HITL 作答走 ``answers`` + ``source``（见 :meth:`_is_interrupt_resume_dispatch`），
+        steer / follow_up 是喂给在跑轮次的插入语，两者都不算新一轮。其余带非空
+        query 的消息就是用户新开的一轮，必须先把残留的中断状态清掉，否则会被
+        旧中断当成续跑输入吞掉。
+        """
+        if not isinstance(params, dict):
+            return False
+        if self._is_ack_only_dispatch(params) or self._is_interrupt_resume_dispatch(params):
+            return False
+        query = params.get("query")
+        return isinstance(query, str) and bool(query.strip())
+
+    async def _discard_stale_interrupt_for_fresh_turn(self, request: AgentRequest) -> None:
+        """Drop a leftover HITL interrupt so a new user turn is never swallowed."""
+        try:
+            dropped = await self._clear_pending_interaction_interrupt(
+                request.session_id,
+                require_pure_ask_user=False,
+                force=True,
+            )
+        except Exception:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] fresh turn: failed to drop stale "
+                "interaction state session=%s request_id=%s",
+                request.session_id,
+                request.request_id,
+                exc_info=True,
+            )
+            return
+        if dropped:
+            logger.warning(
+                "[JiuWenSwarmDeepAdapter] fresh turn: dropped stale interaction "
+                "state before handling new message session=%s request_id=%s",
+                request.session_id,
+                request.request_id,
+            )
+
     @staticmethod
     def _structured_goal_op_from_request(
         request: AgentRequest,
@@ -9544,6 +9675,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise RuntimeError("JiuWenSwarmDeepAdapter 未初始化，请先调用 create_instance()")
 
         self._bind_invoke_workspace_context()
+        # 新一轮普通消息不能被上一轮残留的 HITL 中断状态吃掉：并行子代理里只要有
+        # 一个子代理永久挂起（子会话提前结束、答案 id 匹配不上等），父会话的
+        # interrupted_tools 就会一直留着，之后每条普通消息都会被 handle_resume
+        # 当成对旧中断的回答消费（症状：不管说什么都弹「询问你」且消息被吞）。
+        # E2A 语义上只有带 answers/source 的 chat.send 才是作答，其余都是新一轮。
+        if self._is_fresh_turn_request(request.params):
+            await self._discard_stale_interrupt_for_fresh_turn(request)
 
         _req_model = (request.params.get("model_name") or "") if isinstance(request.params, dict) else ""
         if not self._has_valid_model_config(_req_model):
@@ -9925,6 +10063,13 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise RuntimeError("JiuWenSwarmDeepAdapter 未初始化，请先调用 create_instance()")
 
         self._bind_invoke_workspace_context()
+        # 新一轮普通消息不能被上一轮残留的 HITL 中断状态吃掉：并行子代理里只要有
+        # 一个子代理永久挂起（子会话提前结束、答案 id 匹配不上等），父会话的
+        # interrupted_tools 就会一直留着，之后每条普通消息都会被 handle_resume
+        # 当成对旧中断的回答消费（症状：不管说什么都弹「询问你」且消息被吞）。
+        # E2A 语义上只有带 answers/source 的 chat.send 才是作答，其余都是新一轮。
+        if self._is_fresh_turn_request(request.params):
+            await self._discard_stale_interrupt_for_fresh_turn(request)
 
         _req_model = (request.params.get("model_name") or "") if isinstance(request.params, dict) else ""
         if not self._has_valid_model_config(_req_model):
