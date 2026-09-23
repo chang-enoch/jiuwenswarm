@@ -7,7 +7,11 @@ export type ChatRoute =
   | { kind: 'not-found'; pathname: string };
 
 function basePath(): string {
-  const base = (import.meta.env.BASE_URL || '/').replace(/\/+$/, '');
+  const raw = import.meta.env.BASE_URL || '/';
+  // Vite 相对 base 的 BASE_URL 是 './'，等价于无前缀（对齐 base:'./' 的既有部署形态），
+  // 否则 withBasePath 会产出 './chat/new' 这类相对路径，replaceState 逐次解析叠加出 /chat/chat/...。
+  if (raw === './' || raw === '.') return '';
+  const base = raw.replace(/\/+$/, '');
   return base === '/' ? '' : base;
 }
 

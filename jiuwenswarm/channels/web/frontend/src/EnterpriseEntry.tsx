@@ -73,7 +73,9 @@ function entryPath(): string {
   if (chatIndex !== -1) {
     return `${pathname.slice(0, chatIndex)}/chat/`;
   }
-  const base = (import.meta.env.BASE_URL || '/').replace(/\/+$/, '');
+  const rawBase = import.meta.env.BASE_URL || '/';
+  // Vite 相对 base 的 BASE_URL 是 './'，等价于无前缀，避免 entryPath 写出相对路径被 replaceState 按当前目录解析。
+  const base = rawBase === './' || rawBase === '.' ? '' : rawBase.replace(/\/+$/, '');
   if (base && !pathname.startsWith(base)) {
     return `${base}/`;
   }
