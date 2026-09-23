@@ -470,16 +470,23 @@ async def test_team_shared_skill_link_refresh_rail_resolves_and_refreshes(
     assert calls == [("web", "session-1")]
 
 
-def test_unknown_swarm_rail_type_raises() -> None:
-    """An unregistered ``swarm.*`` rail type surfaces a clear ``ValueError``."""
+def test_unknown_swarm_rail_type_is_skipped() -> None:
+    """Unregistered ``swarm.*`` rails are skipped (forward-compat soft fail)."""
+    from jiuwenswarm.common.openjiuwen_rail_compat import (
+        install_unknown_rail_skip_compat,
+    )
+
     register_swarm_providers()
+    install_unknown_rail_skip_compat()
     fake_ctx = SwarmBuildContext(language="cn", channel="web")
 
-    with pytest.raises(ValueError):
+    assert (
         RailSpec(type="swarm.__does_not_exist__").build(
             language="cn",
             context=fake_ctx,
         )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

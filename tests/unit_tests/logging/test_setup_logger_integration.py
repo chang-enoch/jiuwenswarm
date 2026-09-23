@@ -4,6 +4,8 @@ import logging
 import os
 from pathlib import Path
 
+import pytest
+
 from jiuwenswarm.common import utils
 from jiuwenswarm.common.utils import (
     IdentityFieldFilter,
@@ -11,6 +13,12 @@ from jiuwenswarm.common.utils import (
     setup_logger,
     update_log_levels,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_log_root(monkeypatch, tmp_path):
+    """Avoid sharing ~/.jiuwenswarm/.../.logs across xdist workers."""
+    monkeypatch.setenv("LOG_ROOT_PATH", str(tmp_path / "logs"))
 
 
 def _file_handler_names():
@@ -106,6 +114,7 @@ def test_end_to_end_text_log_has_identity_and_user_tag(monkeypatch, tmp_path):
     覆盖 filter→formatter→handler→文件写入 的完整链路，捕获格式串拼写错误等接线 bug。
     """
     monkeypatch.setenv("JIUWENSWARM_LOG_FORMAT", "text")
+    # Fixture already isolates LOG_ROOT_PATH; keep explicit override for clarity.
     monkeypatch.setenv("LOG_ROOT_PATH", str(tmp_path))
     setup_logger()
     gw_logger = logging.getLogger("jiuwenswarm.gateway.routing")
