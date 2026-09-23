@@ -12,13 +12,15 @@ from openjiuwen.core.single_agent.rail.base import (
     ToolCallInputs,
 )
 
+from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+    is_interrupt_resume_source,
+)
 from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
     _DEFAULT_SESSION_ID,
     _SESSION_ID_EXTRA_KEY,
     SkillActiveStateRail,
     clear_session_skill_state,
     get_session_active_skill,
-    is_interrupt_resume_source,
     resolve_skill_session_id,
 )
 from jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail import (

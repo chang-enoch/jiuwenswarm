@@ -12,10 +12,6 @@ from typing import Any, Optional
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.rails.base import DeepAgentRail
 
-from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
-    is_interrupt_resume_source,
-)
-
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SESSION_ID = "default"
@@ -386,6 +382,5 @@ __all__ = [
     "adopt_default_active_skill",
     "clear_session_skill_state",
     "get_session_active_skill",
-    "is_interrupt_resume_source",
     "resolve_skill_session_id",
 ]
