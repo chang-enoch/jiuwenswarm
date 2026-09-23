@@ -12,7 +12,7 @@ from openjiuwen.core.single_agent.interrupt.state import RESUME_USER_INPUT_KEY
 from openjiuwen.harness.rails.interrupt.interrupt_base import ApproveResult
 from openjiuwen.harness.security import PermissionLevel, PermissionResult
 from jiuwenswarm.common.behavior_security import (
-    BehaviorSecurityBridge, check_agent_skill_install, raw_event,
+    BehaviorSecurityBridge, check_agent_skill_install, cloud_authorization_enabled, raw_event,
 )
 from jiuwenswarm.agents.harness.common.rails.behavior_security_rail import BehaviorSecurityRail
 
@@ -66,13 +66,39 @@ async def test_unknown_one_waited_request_and_no_second_report(decision, expecte
     assert 'businessId' not in events[0]
 
 
+@pytest.mark.parametrize('enabled,expected', [
+    (True, True), (False, False), (None, False), ('false', False), ('flase', False), (1, False),
+])
+def test_cloud_switch_requires_a_boolean(enabled, expected):
+    assert cloud_authorization_enabled({
+        'xiaoyi_work_security': {'cloud_authorization': {'enabled': enabled}},
+    }) is expected
+
+
 @pytest.mark.asyncio
-async def test_cloud_switch_off_reports_and_asks():
+@pytest.mark.parametrize('stage', ['tool.before', 'skill.before_install'])
+@pytest.mark.parametrize('default,expected', [
+    ('allow', PermissionLevel.ALLOW), ('deny', PermissionLevel.DENY),
+    ('ask', PermissionLevel.ASK), (None, PermissionLevel.ASK), ('invalid', PermissionLevel.ASK),
+])
+async def test_cloud_switch_off_reports_and_uses_core_defaults(stage, default, expected):
     b, events = bridge(enabled=False)
-    result = await b.decide(raw_event(context(), 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
-    assert result.needs_approval
-    await asyncio.gather(*b.tasks)
-    assert events[0]['mode'] == 'report'
+    b.config['permissions']['defaults'] = {} if default is None else {'*': default}
+    wait = asyncio.Event()
+    async def delayed(event):
+        events.append(event)
+        await wait.wait()
+        return {'decision': 'deny'}
+    b._send = AsyncMock(side_effect=delayed)
+    result = await asyncio.wait_for(
+        b.decide(raw_event(context(), stage), PermissionResult(PermissionLevel.UNDETERMINED)), .2,
+    )
+    assert result.permission == expected
+    assert result.matched_rule == ('tiered_policy:defaults.*' if default in {'allow', 'deny', 'ask'}
+                                   else 'tiered_policy:fallback(no_config)')
+    await asyncio.sleep(0)
+    assert len(events) == 1 and events[0]['mode'] == 'report'
+    await b.close()
 
 
 @pytest.mark.asyncio
@@ -187,7 +213,7 @@ async def test_desktop_permission_factory_falls_back_to_real_interrupt(monkeypat
     await rail.before_tool_call(ctx)
     channel = CURRENT_CHANNEL_ID.set('desktop')
     try:
-        permission = build_permission_rail({'permissions': cfg})
+        permission = build_permission_rail({**b.config, 'permissions': cfg})
         assert permission is not None
         result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
         assert isinstance(result, InterruptResult)
@@ -255,3 +281,52 @@ async def test_skillnet_worker_stops_before_force_replace(tmp_path, monkeypatch,
             await rail.after_tool_call(ctx)
     else:
         await rail.after_tool_call(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('enabled,default,explicit,expected,mode,matched', [
+    (False, 'allow', None, 'allow', 'report', 'tiered_policy:defaults.*'),
+    (False, 'deny', None, 'deny', 'report', 'tiered_policy:defaults.*'),
+    (False, 'ask', None, 'ask', 'report', 'tiered_policy:defaults.*'),
+    (False, None, None, 'ask', 'report', 'default'),
+    (False, 'allow', 'deny', 'deny', 'report', 'tools.install_skill'),
+    (False, 'allow', 'ask', 'ask', 'report', 'tools.install_skill'),
+    (False, 'deny', 'allow', 'allow', 'report', 'tools.install_skill'),
+    (True, 'allow', None, 'deny', 'authorize', 'tiered_policy:unmatched'),
+    (True, 'allow', 'ask', 'ask', 'report', 'tools.install_skill'),
+    (True, 'deny', 'allow', 'allow', 'report', 'tools.install_skill'),
+])
+async def test_permission_factory_uses_defaults_only_when_cloud_is_off(
+        monkeypatch, enabled, default, explicit, expected, mode, matched):
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
+    from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_CHANNEL_ID
+    from openjiuwen.harness.rails.interrupt.interrupt_base import InterruptResult, RejectResult
+    monkeypatch.setenv('CLAW_BEHAVIOR_SECURITY', '1')
+    monkeypatch.setenv('CLAW_SKILL_TOKEN', 'test-token')
+    cfg = {'enabled': True, 'schema': 'tiered_policy', 'package_builtin_rules': False,
+           'defaults': {} if default is None else {'*': default},
+           'tools': {} if explicit is None else {'install_skill': explicit}}
+    monkeypatch.setattr(
+        'jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist.get_permissions_with_session_overlay',
+        lambda **_: cfg.copy(),
+    )
+    b, events = bridge(enabled=enabled, decision='deny')
+    b.config['permissions'] = cfg
+    ctx = context()
+    rail = BehaviorSecurityRail(b)
+    await rail.before_tool_call(ctx)
+    channel = CURRENT_CHANNEL_ID.set('desktop')
+    try:
+        permission = build_permission_rail(b.config)
+        assert permission is not None
+        # The refreshed snapshot must preserve the switch as well as the initial config.
+        assert permission._host.get_permissions_snapshot()['defer_unmatched'] is enabled
+        result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
+        assert isinstance(result, {'allow': ApproveResult, 'deny': RejectResult, 'ask': InterruptResult}[expected])
+        assert ctx.extra['behavior.local_permission'].matched_rule == matched
+        await asyncio.gather(*b.tasks)
+        assert len(events) == 1 and events[0]['mode'] == mode
+    finally:
+        CURRENT_CHANNEL_ID.reset(channel)
+        await rail.after_tool_call(ctx)
+        await b.close()

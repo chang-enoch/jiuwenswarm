@@ -291,12 +291,13 @@ def build_permission_rail(
     from jiuwenswarm.common.utils import get_config_file, get_workspace_dir
 
     from jiuwenswarm.common.behavior_security import (
-        ACTIVE_BEHAVIOR, desktop_security_active, skill_confirmation_pending,
+        ACTIVE_BEHAVIOR, cloud_authorization_enabled, desktop_security_active, skill_confirmation_pending,
     )
     behavior_enabled = desktop_security_active()
+    defer_unmatched = cloud_authorization_enabled(config)
     permission_config = dict(config.get("permissions", {}))
     if behavior_enabled:
-        permission_config["defer_unmatched"] = True
+        permission_config["defer_unmatched"] = defer_unmatched
     tools_config = permission_config.setdefault("tools", {})
     if isinstance(tools_config, dict):
         tools_config.setdefault("configure_channel", "allow")
@@ -552,7 +553,7 @@ def build_permission_rail(
 
             snapshot = get_permissions_with_session_overlay(session_id=session_id)
             if behavior_enabled:
-                snapshot = {**snapshot, "defer_unmatched": True}
+                snapshot = {**snapshot, "defer_unmatched": defer_unmatched}
             return build_trusted_dirs_permission_config(
                 snapshot,
                 runtime_trusted_dirs_state,
