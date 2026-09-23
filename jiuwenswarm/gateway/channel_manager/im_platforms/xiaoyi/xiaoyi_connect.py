@@ -466,6 +466,9 @@ class XiaoyiChannel(BaseChannel):
         # Task timeout management
         self._session_active: set[str] = set()  # Active sessions (concurrent request detection)
         self._active_tasks: set[tuple[str, str]] = set()
+        # Keep recently stopped task IDs so queued outbound frames cannot
+        # revive an A2A task after its canceled response has been sent.
+        self._canceled_platform_tasks: dict[tuple[str, str], float] = {}
         self._task_timeout_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._session_timeout_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._sessions_waiting_for_push: dict[str, str] = {}  # {session: task} waiting for push
@@ -624,6 +627,7 @@ class XiaoyiChannel(BaseChannel):
         self._ws_connections.clear()
         self._session_active.clear()
         self._active_tasks.clear()
+        self._canceled_platform_tasks.clear()
         self._latest_platform_tasks.clear()
         self._sessions_waiting_for_push.clear()
         self._team_sessions.clear()
@@ -700,6 +704,12 @@ class XiaoyiChannel(BaseChannel):
                 kept = 0
                 for aid, entry in snapshot:
                     sid, tid, _, ts = entry
+                    logical_session_id = self._session_task_map.get(tid, sid)
+                    if (
+                        (logical_session_id, tid) not in self._active_tasks
+                        or (logical_session_id, tid) in self._canceled_platform_tasks
+                    ):
+                        continue
                     # 仅对窗口内的 agent_id 保活（ws 大概率还开着）。
                     # 保活成功后刷新 last_seen，使 ws_active 持续为 True（防超窗后误走 push）。
                     if (now - ts) >= self._team_ws_alive_window:
@@ -710,9 +720,14 @@ class XiaoyiChannel(BaseChannel):
                                 await self._send_status_update_with_state(
                                     tid, sid, "", "working", url_key,
                                 )
-                        # 保活发出即视为链路仍活，刷新 last_seen 维持 ws_active
-                        self._active_push_sessions[aid] = (sid, tid, entry[2], time.time())
-                        kept += 1
+                        # 发送期间可能收到取消；不能把已清理的旧任务重新登记为活跃。
+                        if (
+                            (logical_session_id, tid) in self._active_tasks
+                            and (logical_session_id, tid) not in self._canceled_platform_tasks
+                            and self._active_push_sessions.get(aid) == entry
+                        ):
+                            self._active_push_sessions[aid] = (sid, tid, entry[2], time.time())
+                            kept += 1
                     except Exception as e:
                         logger.debug("[XiaoyiChannel] ws keepalive 失败 agent_id=%s: %s", (aid or "")[:8], e)
                 if kept:
@@ -809,6 +824,7 @@ class XiaoyiChannel(BaseChannel):
         reset_team_session = bool(metadata.get("reset_team_session"))
         terminal_notice = bool(metadata.get("terminal_notice"))
         session_id, task_id = self._extract_platform_receive_info(msg)
+        source_task_id = task_id
         from jiuwenswarm.common.mode_matrix import is_team_mode as _is_team_canonical
 
         is_team_mode = _is_team_canonical(mode)
@@ -835,6 +851,10 @@ class XiaoyiChannel(BaseChannel):
             return
         if is_team_event:
             task_id = latest_task_id or task_id
+        if event_name != "team.completed" and self._should_drop_canceled_output(
+            msg, session_id, source_task_id, task_id
+        ):
+            return
         team_task_key = (session_id, task_id)
 
         # Team control/state events are not user-visible.  They identify a
@@ -1639,6 +1659,15 @@ class XiaoyiChannel(BaseChannel):
         content = self._extract_team_content(msg)
         # 预解析活跃映射，供诊断日志与通道判定共用
         ws_session, ws_task, last_seen = self._resolve_active_ws(agent_id, delivery)
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        source_task_id = str(metadata.get("xiaoyi_task_id") or msg.id or "")
+        platform_session_id = str(
+            delivery.conversation_id or metadata.get("xiaoyi_session_id") or ""
+        )
+        if self._should_drop_canceled_output(
+            msg, platform_session_id, source_task_id, ws_task or source_task_id
+        ):
+            return
         # 手机端在线判定：最近 _team_ws_alive_window 秒内有该 agent_id 的 inbound。
         # 手机端收到 final 或长时间无消息会主动关 ws（网关无法直接感知手机 ws 状态），
         # 只能靠 inbound 活跃度间接判断：最近发过消息 → ws 大概率还开着 → 走 ws；否则走 push。
@@ -2893,7 +2922,10 @@ class XiaoyiChannel(BaseChannel):
             try:
                 while (session_id, task_id) in self._active_tasks:
                     await asyncio.sleep(self._status_update_interval)
-                    if (session_id, task_id) not in self._active_tasks:
+                    if (
+                        (session_id, task_id) not in self._active_tasks
+                        or (session_id, task_id) in self._canceled_platform_tasks
+                    ):
                         break
                     # Skip if already waiting for push (1-hour timeout triggered)
                     if self._is_session_waiting_for_push(session_id, task_id):
@@ -3268,6 +3300,21 @@ class XiaoyiChannel(BaseChannel):
         if session_id and task_id:
             self._latest_platform_tasks[session_id] = task_id
 
+    def _should_drop_canceled_output(
+        self, msg: Message, session_id: str, source_task_id: str, delivery_task_id: str
+    ) -> bool:
+        """Drop old queued frames, including Team frames remapped to a new turn."""
+        canceled_at = self._canceled_platform_tasks.get((session_id, source_task_id))
+        if canceled_at is None:
+            return False
+        if msg.timestamp > canceled_at and self._is_session_active(session_id, delivery_task_id):
+            return False
+        logger.info(
+            "[XiaoyiChannel] 丢弃已取消任务的出站帧: session=%s source_task=%s delivery_task=%s event=%s",
+            session_id, source_task_id, delivery_task_id, msg.event_type,
+        )
+        return True
+
     async def _retire_superseded_team_task(
         self, session_id: str, task_id: str
     ) -> None:
@@ -3434,14 +3481,81 @@ class XiaoyiChannel(BaseChannel):
         params = message.get("params")
         if not isinstance(params, dict):
             params = {}
-        session_id = params.get("sessionId") or message.get("sessionId", "")
-        task_id = params.get("id") or message.get("taskId", "")
+        task_id = str(params.get("id") or message.get("taskId") or message.get("id") or "")
+        session_id = str(
+            params.get("sessionId")
+            or message.get("conversationId")
+            or self._session_task_map.get(task_id)
+            or message.get("sessionId")
+            or ""
+        )
         logger.info(f"XiaoyiChannel 取消任务: {session_id} {task_id}")
+        if not session_id or not task_id:
+            logger.warning("XiaoyiChannel 取消任务缺少会话或任务 ID")
+            response = {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {"code": -32602, "message": "Missing session or task ID"},
+            }
+            for url_key in list(self._ws_connections.keys()):
+                await self._send_agent_response(session_id, task_id, response, url_key)
+            return
+        was_active = (session_id, task_id) in self._active_tasks
+        if was_active:
+            self._canceled_platform_tasks[(session_id, task_id)] = time.time()
+            if len(self._canceled_platform_tasks) > 1024:
+                self._canceled_platform_tasks.pop(next(iter(self._canceled_platform_tasks)))
+            # 与桌面端停止按钮走同一条 chat.interrupt 链路。Team 的
+            # pause/cancel 选择在 MessageHandler 完成会话映射后决定。
+            stop_message = Message(
+                id=f"{task_id}:stop",
+                type="req",
+                channel_id=self.channel_id,
+                session_id=session_id,
+                params={
+                    "desktop_stop": True,
+                    "intent": "cancel",
+                    "session_id": session_id,
+                    "request_id": task_id,
+                },
+                timestamp=time.time(),
+                ok=True,
+                req_method=ReqMethod.CHAT_CANCEL,
+                user_id=str(message.get("agentId") or self.config.agent_id or ""),
+                bot_id=self.config.agent_id,
+                app_id=self.app_id,
+                metadata={"xiaoyi_session_id": session_id, "xiaoyi_task_id": task_id},
+            )
+            try:
+                if self._on_message_cb is not None:
+                    result = self._on_message_cb(stop_message)
+                    if inspect.isawaitable(result):
+                        await result
+                else:
+                    await self.bus.route_user_message(stop_message)
+            except BaseException:
+                self._canceled_platform_tasks.pop((session_id, task_id), None)
+                raise
         # 取消即放弃待答复审批（两个会话键都兜底清理）
-        self._pending_approvals.pop(session_id, None)
-        cancel_conversation_id = message.get("conversationId") or message.get("params", {}).get("sessionId", "") or ""
-        if cancel_conversation_id:
-            self._pending_approvals.pop(cancel_conversation_id, None)
+        if was_active:
+            self._pending_approvals.pop(session_id, None)
+        # 先同步撤销活跃状态和保活映射，避免取消回执发送期间的协程
+        # 将旧任务重新登记并持续上报 working。
+        if was_active:
+            self._clear_session_waiting_for_push(session_id, task_id)
+            self._clear_task_timeout(session_id, task_id)
+            self._clear_session_timeout(session_id, task_id)
+            self._mark_session_completed(session_id, task_id)
+            self._team_tasks.discard((session_id, task_id))
+            self._team_last_leader_finals.pop((session_id, task_id), None)
+            for agent_id, entry in list(self._active_push_sessions.items()):
+                if entry[1] == task_id:
+                    self._active_push_sessions.pop(agent_id, None)
+            self._ws_flush_buffers.pop(task_id, None)
+            flush_task = self._ws_flush_tasks.pop(task_id, None)
+            if flush_task is not None:
+                flush_task.cancel()
+
         response = {
             "jsonrpc": "2.0",
             "id": message.get("id", ""),
@@ -3451,11 +3565,14 @@ class XiaoyiChannel(BaseChannel):
         for url_key in list(self._ws_connections.keys()):
             await self._send_agent_response(session_id, task_id, response, url_key)
 
-        # 清理超时任务和推送状态
-        self._clear_session_waiting_for_push(session_id, task_id)
-        self._clear_task_timeout(session_id, task_id)
-        self._clear_session_timeout(session_id, task_id)
-        self._mark_session_completed(session_id, task_id)
+        # 回执是 RPC 结果；桌面镜像按 A2A 终态帧收口运行状态。
+        # 因此还要为本次任务发送 final=true 的 canceled 状态。
+        if not was_active:
+            return
+        for url_key in list(self._ws_connections.keys()):
+            await self._send_status_update_with_state(
+                task_id, session_id, "", "canceled", url_key,
+            )
         if not self._is_session_active(session_id):
             if session_id:
                 await self._stop_session_heartbeat(session_id)
@@ -3463,8 +3580,6 @@ class XiaoyiChannel(BaseChannel):
             self._clear_session_timeout(session_id)
         # Cancelling one platform task must not stop a long-running Team
         # runtime. A later user turn will replace the latest task mapping.
-        self._team_tasks.discard((session_id, task_id))
-        self._team_last_leader_finals.pop((session_id, task_id), None)
 
     async def _flush_text_stream_segment(
         self,
