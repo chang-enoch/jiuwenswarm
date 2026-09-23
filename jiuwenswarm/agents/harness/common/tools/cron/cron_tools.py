@@ -156,7 +156,10 @@ class CronTools:
         return r if r is not None else CronToolRoute()
 
     async def _send_split(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
-        from jiuwenswarm.common.e2a.constants import E2A_RESPONSE_KIND_CRON
+        from jiuwenswarm.common.e2a.constants import (
+            E2A_RESPONSE_KIND_CRON,
+            E2A_RESPONSE_STATUS_IN_PROGRESS,
+        )
 
         r = self._route()
         payload = {
@@ -164,6 +167,10 @@ class CronTools:
             "channel_id": r.channel_id,
             "session_id": r.session_id,
             "response_kind": E2A_RESPONSE_KIND_CRON,
+            # 旁路同步帧：显式非终态，避免 wire 默认 succeeded → is_final=true
+            # 被桌面当成 chat.send 收口。
+            "is_final": False,
+            "status": E2A_RESPONSE_STATUS_IN_PROGRESS,
             "body": {
                 "action": action,
                 "status": "ok",
