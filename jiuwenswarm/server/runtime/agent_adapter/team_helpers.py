@@ -2367,6 +2367,43 @@ async def _team_round_settled(channel_id: str | None, session_id: str) -> bool |
         return None
 
 
+async def _emit_forced_terminal_at_stream_end(
+        channel_id: str | None,
+        session_id: str,
+        round_id: Any,
+        *,
+        unrecovered_error: str | None,
+) -> None:
+    """流末零终态强制补发。
+
+    调用方负责判定"该补"（零终态信号 + 无挂起交互 + 非取消）；本函数负责
+    "怎么补"：settle 复核 True（确证落定只是帧丢了）补干净终态；False/None
+    （回合真实状态不明）补带 error 终态，不粉饰——error 优先复用本轮
+    未恢复的 leader 模型错误史，其次通用不明状态文案。
+    """
+    settle_verdict = await _team_round_settled(channel_id, session_id)
+    forced_terminal: dict[str, Any] = {
+        "event_type": "chat.processing_status",
+        "session_id": session_id,
+        "rid": round_id,
+        "is_processing": False,
+        "is_complete": True,
+    }
+    if settle_verdict is not True:
+        forced_terminal["error"] = (
+                unrecovered_error or "Team round ended with unconfirmed final state"
+        )
+    await _broadcast_event(channel_id, session_id, forced_terminal)
+    logger.info(
+        "[TeamHelpers] forced terminal emitted at stream end: "
+        "channel_id=%s session_id=%s round_id=%s settle=%s",
+        _resolve_channel_id(channel_id),
+        session_id,
+        round_id,
+        settle_verdict,
+    )
+
+
 async def _team_has_unread_messages(channel_id: str | None, session_id: str) -> bool | None:
     """team.db 未读消息真值（直读 DAO；与 is_team_completed 条件③同口径）。
 
@@ -2549,6 +2586,8 @@ async def _consume_stream_with_query(
     finish_after_final = False
     saw_tool_call = False
     saw_teammate_output = False
+    # 每帧循环开头重置；提前声明供 _is_clean_text_round 闭包引用
+    final_from_completion = False
     # leader 模型错误后的回合死亡探针任务（chat.error 非终态化的配套：
     # leader 重试耗尽转 IDLE 时回合实际死亡但无任何终态帧——探针在错误后
     # 零产出的情况下补发 processing_status 终态，防前端 run 永远 running）
@@ -2562,6 +2601,10 @@ async def _consume_stream_with_query(
     # 新内容帧即作废；读数未就绪（None）续窗重试；流先结束则 finally 立即补发
     settle_terminal_task: asyncio.Task | None = None
     settle_terminal_fired = False
+    # 挂起交互守卫：本流广播过 leader 的
+    # chat.ask_user_question（HITL 等用户输入）时，流末不强制补终态——
+    # 回合是"暂停待恢复"而非"终结"。
+    saw_pending_interaction = False
     # 内容帧计数（delta/reasoning/tool_call）：静默窗作废判据——不用
     # received_chunks（usage/状态尾随帧会把窗口误作废）
     content_chunks = 0
@@ -2586,6 +2629,110 @@ async def _consume_stream_with_query(
     tm_.reset_workflow_completed(session_id)
     lg: TeamStreamLogger | None = None
     stream_cancelled = False
+
+    async def _emit_settle_terminal() -> bool:
+        """补发 settle 终态（带复核与去重）：静默窗到点与流末兜底共用。"""
+        nonlocal completion_signals, settle_terminal_fired
+        if settle_terminal_fired or not tm_.has_stream_task(session_id):
+            return False
+        # 统一去重：本流已发过任何回合终态（team.completed 转换/即时收尾/探针）即跳过——settle
+        # 补发的定位是"零终态时才补"。_delayed 的 baseline 对账只能盖住
+        # 窗口路径，盖不住流末 finally 兜底路径，必须在入口拦截。
+        if completion_signals > 0:
+            logger.info(
+                "[TeamHelpers] settle terminal skipped (terminal already emitted): "
+                "channel_id=%s session_id=%s round_id=%s",
+                _resolve_channel_id(channel_id),
+                session_id,
+                round_id,
+            )
+            return False
+        # 仅"确证落定"才发；False（确未落定）与 None（未知）都不发。
+        # 三态必须用 not（True 才通过）
+        if not await _team_round_settled(channel_id, session_id):
+            return False
+        await _broadcast_event(
+            channel_id,
+            session_id,
+            {
+                "event_type": "chat.processing_status",
+                "session_id": session_id,
+                "rid": round_id,
+                "is_processing": False,
+                "is_complete": True,
+            },
+        )
+        completion_signals += 1
+        settle_terminal_fired = True
+        tm_.mark_stream_round_terminal(session_id)
+        logger.info(
+            "[TeamHelpers] settle terminal emitted: channel_id=%s session_id=%s round_id=%s",
+            _resolve_channel_id(channel_id),
+            session_id,
+            round_id,
+        )
+        return True
+
+    def _schedule_settle_terminal() -> None:
+        """settle 终态延迟静默窗确认：窗口内有新内容帧（团队还在干活）即作废；
+        读数未就绪（None）续窗重试 _SETTLE_TERMINAL_MAX_ATTEMPTS 次。"""
+        nonlocal settle_terminal_task
+        if settle_terminal_task is not None and not settle_terminal_task.done():
+            settle_terminal_task.cancel()
+        baseline_content = content_chunks
+        baseline_signals = completion_signals
+
+        async def _delayed() -> None:
+            for _attempt in range(_SETTLE_TERMINAL_MAX_ATTEMPTS):
+                try:
+                    await asyncio.sleep(_SETTLE_TERMINAL_QUIET_SEC)
+                except asyncio.CancelledError:
+                    return
+                if content_chunks != baseline_content:
+                    return
+                if completion_signals != baseline_signals:
+                    return
+                if not tm_.has_stream_task(session_id):
+                    return
+                result = await _team_round_settled(channel_id, session_id)
+                logger.info(
+                    "[TeamHelpers] settle window attempt %s/%s: session_id=%s "
+                    "round_id=%s result=%s",
+                    _attempt + 1,
+                    _SETTLE_TERMINAL_MAX_ATTEMPTS,
+                    session_id,
+                    round_id,
+                    result,
+                )
+                if result is False:
+                    return  # 确未落定：放弃，等 team.completed
+                # 三态守卫：此处必须 is False/is True 显式判断（None=续窗重试），
+                if result is True:
+                    await _emit_settle_terminal()
+                    return
+                # None（读数未就绪）→ 续窗重试
+            logger.info(
+                "[TeamHelpers] settle terminal abandoned after retries: "
+                "session_id=%s round_id=%s",
+                session_id,
+                round_id,
+            )
+
+        settle_terminal_task = asyncio.create_task(
+            _delayed(), name=f"settle-terminal-{session_id}"
+        )
+
+    def _is_clean_text_round() -> bool:
+        """本地可证的干净纯文本轮：本轮无团队事件、无工具调用、无成员产出，
+        且收尾信号来自 task_completion（leader 任务真实完成）。
+        should_finish_round 判定与 finish_after_final 即时收尾判定共用。"""
+        return (
+            final_from_completion
+            and not tm_.has_seen_team_events(session_id)
+            and not saw_tool_call
+            and not saw_teammate_output
+        )
+
     try:
         logger.info(
             "[TeamHelpers] stream started: channel_id=%s session_id=%s round_id=%s",
@@ -2640,86 +2787,6 @@ async def _consume_stream_with_query(
             round_id,
             _safe_query_preview(initial_query),
         )
-        async def _emit_settle_terminal() -> bool:
-            """补发 settle 终态（带复核与去重）：静默窗到点与流末兜底共用。"""
-            nonlocal completion_signals, settle_terminal_fired
-            if settle_terminal_fired or not tm_.has_stream_task(session_id):
-                return False
-            # 仅"确证落定"才发；False（确未落定）与 None（未知）都不发。
-            # 三态必须用 not（True 才通过）
-            if not await _team_round_settled(channel_id, session_id):
-                return False
-            await _broadcast_event(
-                channel_id,
-                session_id,
-                {
-                    "event_type": "chat.processing_status",
-                    "session_id": session_id,
-                    "rid": round_id,
-                    "is_processing": False,
-                    "is_complete": True,
-                },
-            )
-            completion_signals += 1
-            settle_terminal_fired = True
-            tm_.mark_stream_round_terminal(session_id)
-            logger.info(
-                "[TeamHelpers] settle terminal emitted: channel_id=%s session_id=%s round_id=%s",
-                _resolve_channel_id(channel_id),
-                session_id,
-                round_id,
-            )
-            return True
-
-        def _schedule_settle_terminal() -> None:
-            """settle 终态延迟静默窗确认：窗口内有新内容帧（团队还在干活）即作废；
-            读数未就绪（None）续窗重试 _SETTLE_TERMINAL_MAX_ATTEMPTS 次。"""
-            nonlocal settle_terminal_task
-            if settle_terminal_task is not None and not settle_terminal_task.done():
-                settle_terminal_task.cancel()
-            baseline_content = content_chunks
-            baseline_signals = completion_signals
-
-            async def _delayed() -> None:
-                for _attempt in range(_SETTLE_TERMINAL_MAX_ATTEMPTS):
-                    try:
-                        await asyncio.sleep(_SETTLE_TERMINAL_QUIET_SEC)
-                    except asyncio.CancelledError:
-                        return
-                    if content_chunks != baseline_content:
-                        return
-                    if completion_signals != baseline_signals:
-                        return
-                    if not tm_.has_stream_task(session_id):
-                        return
-                    result = await _team_round_settled(channel_id, session_id)
-                    logger.info(
-                        "[TeamHelpers] settle window attempt %s/%s: session_id=%s "
-                        "round_id=%s result=%s",
-                        _attempt + 1,
-                        _SETTLE_TERMINAL_MAX_ATTEMPTS,
-                        session_id,
-                        round_id,
-                        result,
-                    )
-                    if result is False:
-                        return  # 确未落定：放弃，等 team.completed
-                    # 三态守卫：此处必须 is False/is True 显式判断（None=续窗重试），
-                    if result is True:
-                        await _emit_settle_terminal()
-                        return
-                    # None（读数未就绪）→ 续窗重试
-                logger.info(
-                    "[TeamHelpers] settle terminal abandoned after retries: "
-                    "session_id=%s round_id=%s",
-                    session_id,
-                    round_id,
-                )
-
-            settle_terminal_task = asyncio.create_task(
-                _delayed(), name=f"settle-terminal-{session_id}"
-            )
-
         runner_entered_at = time.monotonic()
         async for chunk in Runner.run_agent_team_streaming(
             agent_team=team_spec,
@@ -2864,6 +2931,17 @@ async def _consume_stream_with_query(
                 # interactions are forwarded to the frontend.
                 if not is_leader and parsed.get("event_type") == "chat.ask_user_question":
                     continue
+                if parsed.get("event_type") == "chat.ask_user_question":
+                    # leader 向用户发问 = 回合挂起等输入（HITL），
+                    # 流末零终态兜底不得补终态（暂停待恢复，不是终结）
+                    saw_pending_interaction = True
+                    logger.info(
+                        "[TeamHelpers] pending interaction flagged: "
+                        "channel_id=%s session_id=%s round_id=%s",
+                        _resolve_channel_id(channel_id),
+                        session_id,
+                        round_id,
+                    )
                 parsed["rid"] = round_id
                 if is_teammate:
                     saw_teammate_output = True
@@ -3075,11 +3153,8 @@ async def _consume_stream_with_query(
                 # 且收尾来自 task_completion）；其余一律 settle 三件套 + 静默窗。
                 if parsed.get("event_type") == "chat.final":
                     tm_ = get_team_manager(channel_id)
-                    should_finish_round = tm_.is_workflow_completed(session_id) or (
-                        final_from_completion
-                        and not tm_.has_seen_team_events(session_id)
-                        and not saw_tool_call
-                        and not saw_teammate_output
+                    should_finish_round = (
+                        tm_.is_workflow_completed(session_id) or _is_clean_text_round()
                     )
                     # 多气泡：leader 每次发言各打一卡序号——
                     # 客户端同 seq 覆盖（重试去重）、新 seq 封段开新卡；
@@ -3155,12 +3230,7 @@ async def _consume_stream_with_query(
                         # 完成）——运行时暂停，下次发送 resume_from_pause 热恢复，不再
                         # 空转等 idle 超时。其余回合不断流：leader 先答、
                         # 成员后报的回合里成员收尾消息晚于主理人总结到达。
-                        if (
-                            final_from_completion
-                            and not tm_.has_seen_team_events(session_id)
-                            and not saw_tool_call
-                            and not saw_teammate_output
-                        ):
+                        if _is_clean_text_round():
                             finish_after_final = True
                         # saw_tool_call/saw_teammate_output 原为
                         # 流级标记、跨轮不重置——某轮用过工具后，该流上后续所有
@@ -3247,7 +3317,49 @@ async def _consume_stream_with_query(
                 #（仅限 settle 补判已命中的回合；从未评估过 settle 的流不在此列。
                 #  _emit 内部复核三件套 + 去重，已发过则幂等跳过）
                 if settle_terminal_task is not None and not settle_terminal_fired:
-                    await _emit_settle_terminal()
+                    try:
+                        await _emit_settle_terminal()
+                    except Exception:
+                        # finally 内的补发失败不得遮蔽原异常、不得跳过后续
+                        # 快照/team.completed 广播（cron watcher 收尾依赖）
+                        logger.warning(
+                            "[TeamHelpers] settle terminal fallback failed: "
+                            "channel_id=%s session_id=%s round_id=%s",
+                            _resolve_channel_id(channel_id),
+                            session_id,
+                            round_id,
+                            exc_info=True,
+                        )
+                # 流末零终态兜底：team.completed 门禁未达标 + settle 放弃时回合可能没有任何
+                # 终态帧，流尽是最后机会。流被取消（stream_cancelled）不补——外层 if 已拦；
+                # 有挂起交互时回合是暂停待恢复，不补。
+                if completion_signals == 0 and not saw_pending_interaction:
+                    try:
+                        await _emit_forced_terminal_at_stream_end(
+                            channel_id, session_id, round_id,
+                            unrecovered_error=round_unrecovered_error,
+                        )
+                        completion_signals += 1
+                        tm_.mark_stream_round_terminal(session_id)
+                    except Exception:
+                        # 同上：补发失败仅记日志不传播（CancelledError 不捕，
+                        # 取消语义不吞）
+                        logger.warning(
+                            "[TeamHelpers] forced terminal emission failed: "
+                            "channel_id=%s session_id=%s round_id=%s",
+                            _resolve_channel_id(channel_id),
+                            session_id,
+                            round_id,
+                            exc_info=True,
+                        )
+                elif completion_signals == 0:
+                    logger.info(
+                        "[TeamHelpers] forced terminal skipped (pending interaction): "
+                        "channel_id=%s session_id=%s round_id=%s",
+                        _resolve_channel_id(channel_id),
+                        session_id,
+                        round_id,
+                    )
                 # Broadcast team.completed so cron round watchers (both the
                 # agent adapter's _wait_for_cron_team_round_events and the cron
                 # scheduler's own round_state) can finalise when the stream

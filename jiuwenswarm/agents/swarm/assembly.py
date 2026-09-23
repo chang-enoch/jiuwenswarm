@@ -426,7 +426,9 @@ def enrich_team_spec_for_swarm(
         request_metadata=request_metadata,
         mode=mode,
         project_dir=project_dir,
-        disable_teammate_worktree=str(channel_id or "").strip().lower() == "web",
+        # web/desktop 渠道禁用成员 worktree：worktree 产物对用户不可见且随
+        # 检出回收，禁用后成员统一在共享 cwd（任务工作区）作业。
+        disable_teammate_worktree=str(channel_id or "").strip().lower() in ("web", "desktop"),
         team_id=spec.team_name,
         team_ws_root=team_ws_root,
         team_skills_dir=team_skills_dir,

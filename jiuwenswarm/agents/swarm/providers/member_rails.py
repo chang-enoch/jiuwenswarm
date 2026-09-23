@@ -387,7 +387,11 @@ class TeamDeliverableLocationInput(ConstructionInput):
 
     project_dir: str | None = context_field(
         attr="project_dir",
-        description="Resolved user project directory (gate; skipped when absent).",
+        description="Resolved user project directory (primary deliverable target).",
+    )
+    team_ws_root: str | None = context_field(
+        attr="team_ws_root",
+        description="Team shared workspace root (fallback target when no project).",
     )
     member_workspace_root: str | None = context_field(
         resolver=_workspace_root,
@@ -404,30 +408,33 @@ class TeamDeliverableLocationInput(ConstructionInput):
     kind=ElementKind.RAIL,
     name=TEAM_DELIVERABLE_LOCATION,
     description="Guides team members to write user-facing deliverables into "
-                "the task working directory instead of the private workspace (skipped "
-                "when the session has no project directory).",
+                "the task working directory instead of the private workspace "
+                "(falls back to the team shared workspace when the session has "
+                "no project directory; skipped when neither exists).",
     input_model=TeamDeliverableLocationInput,
 )
 def _build_team_deliverable_location_rail(
         params: dict[str, Any],
         context: SwarmBuildContext,
 ) -> TeamDeliverableLocationRail | None:
-    """Build the deliverable location rail when a project directory exists.
+    """Build the deliverable location rail when a deliverable target exists.
 
     Args:
         params: Spec params (unused; kept for the provider contract).
         context: Per-member build context.
 
     Returns:
-        A ``TeamDeliverableLocationRail`` or ``None`` when the session has no
-        resolved project directory (behavior stays unchanged there).
+        A ``TeamDeliverableLocationRail`` rooted at the project directory, or
+        in fallback mode rooted at the team shared workspace when the session
+        has no project directory, or ``None`` when neither is configured.
     """
     inp = TeamDeliverableLocationInput.resolve(params, context)
-    if not inp.project_dir:
+    if not inp.project_dir and not inp.team_ws_root:
         return None
     return TeamDeliverableLocationRail(
-        project_dir=inp.project_dir,
+        project_dir=inp.project_dir or "",
         member_workspace_root=inp.member_workspace_root,
+        team_ws_root=inp.team_ws_root,
         language=inp.language,
     )
 

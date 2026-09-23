@@ -1595,6 +1595,27 @@ def test_leader_omits_harness_todo_planning_rails() -> None:
     assert registry.CODE_TASK_PLANNING in code_teammate_types
 
 
+def test_structured_ask_user_only_mounts_on_leader() -> None:
+    """ask_user is leader-only: headless teammates cannot serve user interrupts.
+
+    The rail's init() registers the ask_user tool, so mounting it on a teammate
+    would let a headless member park on an interrupt nobody can answer (same
+    rationale as excluding PERMISSION_INTERRUPT for all members).
+    """
+    register_swarm_providers()
+    chat_leader, _ = build_member_capability_specs({}, "team", "leader")
+    chat_teammate, _ = build_member_capability_specs({}, "team", "teammate")
+    code_leader, _ = build_member_capability_specs({}, "code.team", "leader")
+    code_teammate, _ = build_member_capability_specs({}, "code.team", "teammate")
+    plan_teammate, _ = build_member_capability_specs({}, "team.plan", "teammate")
+
+    assert registry.STRUCTURED_ASK_USER in {spec.type for spec in chat_leader}
+    assert registry.STRUCTURED_ASK_USER not in {spec.type for spec in chat_teammate}
+    assert registry.STRUCTURED_ASK_USER in {spec.type for spec in code_leader}
+    assert registry.STRUCTURED_ASK_USER not in {spec.type for spec in code_teammate}
+    assert registry.STRUCTURED_ASK_USER not in {spec.type for spec in plan_teammate}
+
+
 @pytest.mark.parametrize("mode", ["team", "code.team", "team.plan"])
 def test_leader_deep_agent_spec_forces_enable_task_planning_off(mode: str) -> None:
     """Leader must not rely on agent-core auto-inject when YAML enables the flag."""

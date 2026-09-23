@@ -33,10 +33,22 @@ def _build_agent(builder: _FakePromptBuilder):
 
 
 def test_provider_returns_none_without_project_dir() -> None:
-    """The rail is skipped when the session has no resolved project directory."""
-    ctx = SwarmBuildContext(project_dir=None)
+    """The rail is skipped only when neither project dir nor team ws root exists."""
+    ctx = SwarmBuildContext(project_dir=None, team_ws_root=None)
 
     assert member_rails._build_team_deliverable_location_rail({}, ctx) is None
+
+
+def test_provider_falls_back_to_team_ws_root_without_project_dir() -> None:
+    """No project dir + team ws root -> fallback-mode rail (design/team/20 §4.4)."""
+    ctx = SwarmBuildContext(
+        project_dir=None,
+        team_ws_root="C:/runtime-data/.agent_teams/t/team-workspace",
+    )
+
+    rail = member_rails._build_team_deliverable_location_rail({}, ctx)
+
+    assert isinstance(rail, TeamDeliverableLocationRail)
 
 
 def test_provider_builds_rail_with_project_dir() -> None:
@@ -69,8 +81,10 @@ async def test_rail_injects_section_with_paths() -> None:
     assert "D:/task-workspace" in cn
     assert "C:/runtime-data/.agent_teams/t/workspaces/m_workspace" in cn
     assert "以本节为准" in cn  # explicit override of the .team/ default
+    assert "只用于成员间交接" in cn  # handoff-only principle
     assert "D:/task-workspace" in en
     assert "this section wins" in en
+    assert "member-to-member handoffs" in en
 
 
 @pytest.mark.asyncio
@@ -84,6 +98,30 @@ async def test_rail_works_without_member_workspace() -> None:
 
     section = builder.sections[TeamDeliverableLocationRail.SECTION_NAME]
     assert "D:/task-workspace" in section.content["cn"]
+
+
+@pytest.mark.asyncio
+async def test_rail_fallback_content_without_project_dir() -> None:
+    """Fallback mode directs deliverables to the team shared workspace."""
+    rail = TeamDeliverableLocationRail(
+        project_dir="",
+        team_ws_root="C:/runtime-data/.agent_teams/t/team-workspace",
+        member_workspace_root="C:/runtime-data/.agent_teams/t/workspaces/m_workspace",
+        language="cn",
+    )
+    builder = _FakePromptBuilder()
+    rail.init(_build_agent(builder))
+
+    await rail.before_model_call(SimpleNamespace(inputs={}))
+
+    section = builder.sections[TeamDeliverableLocationRail.SECTION_NAME]
+    cn = section.content["cn"]
+    en = section.content["en"]
+    assert "未绑定任务工作区" in cn
+    assert "C:/runtime-data/.agent_teams/t/team-workspace" in cn
+    assert "私有工作区" in cn  # private-workspace contrast line kept
+    assert "no bound task workspace" in en
+    assert "send_file_to_user" in en
 
 
 @pytest.mark.asyncio
