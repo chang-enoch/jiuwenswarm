@@ -55,11 +55,21 @@ class _FakePeer:
 
 @pytest.fixture
 def app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
-    # Stub dispatch module before loading web_http_app
+    # Stub dispatch module before loading web_http_app.
+    # Use monkeypatch.setitem so xdist workers restore the real module after
+    # this fixture (otherwise later file-api tests ImportError on
+    # ``_trust_client_tenant_headers`` from a leftover bare ModuleType stub).
     dispatch_mod = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_dispatch")
     dispatch_mock = AsyncMock()
     dispatch_mod.dispatch_http_request = dispatch_mock  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_dispatch"] = dispatch_mod
+    dispatch_mod._trust_client_tenant_headers = (  # type: ignore[attr-defined]
+        lambda client_host=None: True
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_dispatch",
+        dispatch_mod,
+    )
 
     # Minimal package parents so relative imports in web_http_app resolve if any
     for pkg in (
@@ -71,7 +81,7 @@ def app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
         if pkg not in sys.modules:
             m = ModuleType(pkg)
             m.__path__ = []  # type: ignore[attr-defined]
-            sys.modules[pkg] = m
+            monkeypatch.setitem(sys.modules, pkg, m)
 
     # Real route table (no Gateway imports) so create_web_http_app can register workspace routes.
     _load_module(
@@ -83,12 +93,20 @@ def app_with_mock(monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, AsyncMock]:
     sessions_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat")
     sessions_compat.register_sessions_compat_routes = lambda app: None  # type: ignore[attr-defined]
     sessions_compat.catalog_sessions_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat"] = sessions_compat
+    monkeypatch.setitem(
+        sys.modules,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_sessions_compat",
+        sessions_compat,
+    )
 
     file_compat = ModuleType("jiuwenswarm.gateway.channel_manager.web.web_http_file_compat")
     file_compat.register_file_compat_routes = lambda app: None  # type: ignore[attr-defined]
     file_compat.catalog_file_compat_entries = lambda: []  # type: ignore[attr-defined]
-    sys.modules["jiuwenswarm.gateway.channel_manager.web.web_http_file_compat"] = file_compat
+    monkeypatch.setitem(
+        sys.modules,
+        "jiuwenswarm.gateway.channel_manager.web.web_http_file_compat",
+        file_compat,
+    )
 
     # web_http_app imports timeout helpers from web_http_server (stdlib-only).
     _load_module(

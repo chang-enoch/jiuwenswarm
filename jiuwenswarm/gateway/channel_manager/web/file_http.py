@@ -409,6 +409,7 @@ def save_pushed_file(
     file_bytes: bytes,
     filename: str,
     session_id: str,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist upload and return download metadata (3-A: no Web Pod push)."""
     from jiuwenswarm.agents.harness.common.tools.web_file_download import (
@@ -417,6 +418,8 @@ def save_pushed_file(
 
     from jiuwenswarm.common.audit_emit import emit_audit_evt, emit_audit_ua
 
+    uid = str(user_id or "").strip()
+    audit_uid = {"UID": uid} if uid else {}
     clean_name = safe_filename(filename)
     safe_name = f"{int(time.time())}_{clean_name}"
     local_path = resolve_path_under_directory(received_files_dir(), safe_name)
@@ -427,6 +430,7 @@ def save_pushed_file(
             MSG="invalid_filename",
             EVT="invalid_filename",
             session_id=session_id,
+            **audit_uid,
         )
         raise ValueError("invalid_filename")
     local_path.write_bytes(file_bytes)
@@ -440,6 +444,7 @@ def save_pushed_file(
         PROC="file_upload",
         session_id=session_id,
         filename=clean_name,
+        **audit_uid,
     )
     return {
         "success": True,
@@ -450,9 +455,15 @@ def save_pushed_file(
     }
 
 
-def process_obs_upload_body(raw: bytes) -> tuple[int, dict[str, Any]]:
+def process_obs_upload_body(
+    raw: bytes,
+    *,
+    user_id: str | None = None,
+) -> tuple[int, dict[str, Any]]:
     from jiuwenswarm.common.audit_emit import emit_audit_evt, emit_audit_ua
 
+    uid = str(user_id or "").strip()
+    audit_uid = {"UID": uid} if uid else {}
     try:
         payload = json.loads(raw.decode("utf-8") if raw else "{}")
     except json.JSONDecodeError:
@@ -461,6 +472,7 @@ def process_obs_upload_body(raw: bytes) -> tuple[int, dict[str, Any]]:
             PROC="file_upload",
             MSG="invalid_json",
             EVT="invalid_json",
+            **audit_uid,
         )
         return 400, {"ok": False, "error": "invalid_json"}
     if not isinstance(payload, dict):
@@ -469,6 +481,7 @@ def process_obs_upload_body(raw: bytes) -> tuple[int, dict[str, Any]]:
             PROC="file_upload",
             MSG="invalid_payload",
             EVT="invalid_payload",
+            **audit_uid,
         )
         return 400, {"ok": False, "error": "invalid_payload"}
     filename = str(payload.get("filename") or "upload.bin")
@@ -480,6 +493,7 @@ def process_obs_upload_body(raw: bytes) -> tuple[int, dict[str, Any]]:
             SUBMDL="file",
             PROC="file_upload",
             filename=str(result.get("name") or filename),
+            **audit_uid,
         )
         return 200, result
     except Exception as exc:
@@ -490,6 +504,7 @@ def process_obs_upload_body(raw: bytes) -> tuple[int, dict[str, Any]]:
             MSG=str(exc)[:512],
             EVT="file_upload_failed",
             filename=filename,
+            **audit_uid,
         )
         return 500, {"ok": False, "error": str(exc)}
 

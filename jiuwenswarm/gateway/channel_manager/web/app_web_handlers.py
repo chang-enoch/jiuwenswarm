@@ -7572,7 +7572,9 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("permissions.owner_scopes.get", _permissions_owner_scopes_get)
     channel.register_method("permissions.owner_scopes.set", _permissions_owner_scopes_set)
 
-    async def _forward_permissions_to_agent(ws, req_id, params, session_id, *, req_method):
+    async def _forward_permissions_to_agent(
+        ws, req_id, params, session_id, *, req_method, user_id=None
+    ):
         """permissions.*：优先经 E2A 转发到 AgentServer；Agent 未就绪时本地执行（与 config_rpc 同源）。"""
         from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
         from jiuwenswarm.common.schema.agent import AgentRequest
@@ -7581,6 +7583,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         if not isinstance(req_method, ReqMethod):
             await channel.send_response(ws, req_id, ok=False, error="invalid req_method", code="INTERNAL_ERROR")
             return
+
+        authenticated_user_id = str(user_id or "").strip() or None
 
         synthetic = AgentRequest(
             request_id=str(req_id) if req_id else "",
@@ -7628,6 +7632,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             session_id=session_id,
             req_method=req_method,
             params=dict(params) if isinstance(params, dict) else {},
+            user_id=authenticated_user_id,
         )
         try:
             resp = await ac.send_request(env)
@@ -7651,8 +7656,10 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     from jiuwenswarm.common.schema.message import ReqMethod as _PermReq
 
     def _register_perm(method_name: str, rm: Any) -> None:
-        async def _handler(ws, req_id, params, session_id):
-            await _forward_permissions_to_agent(ws, req_id, params, session_id, req_method=rm)
+        async def _handler(ws, req_id, params, session_id, user_id=None):
+            await _forward_permissions_to_agent(
+                ws, req_id, params, session_id, req_method=rm, user_id=user_id
+            )
 
         channel.register_method(method_name, _handler)
 
@@ -7690,7 +7697,9 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("memory.forbidden.get", _memory_forbidden_get)
     channel.register_method("memory.forbidden.set", _memory_forbidden_set)
 
-    async def _forward_harness_to_agent(ws, req_id, params, session_id, *, req_method):
+    async def _forward_harness_to_agent(
+        ws, req_id, params, session_id, *, req_method, user_id=None
+    ):
         """harness.*：优先经 E2A 转发到 AgentServer；Agent 未就绪时本地执行（无 agent 实例）。"""
         from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
         from jiuwenswarm.common.schema.message import ReqMethod
@@ -7698,6 +7707,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         if not isinstance(req_method, ReqMethod):
             await channel.send_response(ws, req_id, ok=False, error="invalid req_method", code="INTERNAL_ERROR")
             return
+
+        authenticated_user_id = str(user_id or "").strip() or None
 
         ac = _resolve(agent_client)
         if ac is None or not getattr(ac, "server_ready", False):
@@ -7757,6 +7768,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             session_id=session_id,
             req_method=req_method,
             params=dict(params) if isinstance(params, dict) else {},
+            user_id=authenticated_user_id,
         )
         try:
             resp = await ac.send_request(env)
@@ -7780,8 +7792,10 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     from jiuwenswarm.common.schema.message import ReqMethod as _HarnessReq
 
     def _register_harness(method_name: str, rm: Any) -> None:
-        async def _handler(ws, req_id, params, session_id):
-            await _forward_harness_to_agent(ws, req_id, params, session_id, req_method=rm)
+        async def _handler(ws, req_id, params, session_id, user_id=None):
+            await _forward_harness_to_agent(
+                ws, req_id, params, session_id, req_method=rm, user_id=user_id
+            )
 
         channel.register_method(method_name, _handler)
 

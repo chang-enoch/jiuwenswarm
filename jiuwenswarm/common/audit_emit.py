@@ -74,16 +74,26 @@ def emit_audit(
         keyword = str(event_type or "").strip().upper()
         success = keyword != "EVT"
         desc = fields.get("UA") or fields.get("EVT") or fields.get("MSG")
+        # UID/uid 必须进 audit_claw_log(uid=)，不能只塞 extra（否则无 ContextVar
+        # 时顶层 UID/user_id 仍为空，仅靠 extra 覆盖占位符，桥接 user_id 仍可能丢）。
+        rest = {
+            k: v
+            for k, v in fields.items()
+            if k not in ("UA", "EVT", "MSG", "UID", "uid")
+        }
+        raw_uid = fields.get("UID", fields.get("uid"))
+        uid = str(raw_uid).strip() if raw_uid is not None else ""
         audit_claw_log(
             submdl=SUBMDL,
             proc=PROC,
             success=success,
+            uid=uid or None,
             rspcd=RSPCD,
             desc=str(desc) if desc is not None else None,
             message=str(fields.get("MSG") or ""),
             level=level,
             caller=caller,
-            extra={k: v for k, v in fields.items() if k not in ("UA", "EVT", "MSG")},
+            extra=rest,
         )
         return
     except Exception:  # noqa: BLE001

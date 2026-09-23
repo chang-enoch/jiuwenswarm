@@ -345,6 +345,9 @@ class HttpSseAgentServerClient(AgentServerClient):
                 assembled.url,
                 assembled.used_rpc_fallback,
             )
+            # 信封身份：直调路径（如 session.delete）不走 open_gateway_request，
+            # ContextVar 常为空；有值时显式写入，无值时仍回退审计上下文。
+            uid = str(getattr(envelope, "user_id", None) or "").strip()
             try:
                 response = await http.request(
                     assembled.verb,
@@ -367,6 +370,7 @@ class HttpSseAgentServerClient(AgentServerClient):
                     request_id=rid,
                     method=str(envelope.method or ""),
                     DSTIP=peer_ip,
+                    **({"UID": uid} if uid else {}),
                 )
                 raise
             emit_audit_ua(
@@ -376,6 +380,7 @@ class HttpSseAgentServerClient(AgentServerClient):
                 request_id=rid,
                 method=str(envelope.method or ""),
                 DSTIP=peer_ip,
+                **({"UID": uid} if uid else {}),
             )
             return result
 
