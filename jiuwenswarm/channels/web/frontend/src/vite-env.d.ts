@@ -12,6 +12,8 @@ interface ImportMetaEnv {
   readonly VITE_LOGIN_AUTH_SIMULATE?: string;
   readonly VITE_BASE_PATH?: string;
   readonly VITE_API_PREFIX?: string;
+  readonly VITE_WELCOME_TITLE_ZH?: string;
+  readonly VITE_WELCOME_TITLE_EN?: string;
 }
 
 interface ImportMeta {
