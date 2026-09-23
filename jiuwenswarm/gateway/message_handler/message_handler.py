@@ -1286,6 +1286,39 @@ class MessageHandler(ABC):
             )
         return False
 
+    def _apply_desktop_stop_semantics(self, msg: "Message") -> None:
+        """Resolve a phone stop after its external conversation is mapped."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if not params.get("desktop_stop"):
+            return
+
+        request_id = str(params.get("request_id") or "")
+        stream_mode = ""
+        if request_id and self._stream_sessions.get(request_id) == msg.session_id:
+            stream_mode = str(self._stream_modes.get(request_id) or "")
+        if not stream_mode:
+            for rid, task in self._stream_tasks.items():
+                if self._stream_sessions.get(rid) == msg.session_id and not task.done():
+                    stream_mode = str(self._stream_modes.get(rid) or "")
+                    if stream_mode:
+                        break
+
+        modes = [stream_mode, str(params.get("mode") or "")]
+        if isinstance(msg.metadata, dict) and msg.metadata.get("reused_local_session"):
+            from jiuwenswarm.gateway.message_handler.external_conv_session import (
+                read_locked_session_mode,
+            )
+
+            # Reused desktop Team streams may have the gateway fallback "plan"
+            # because their locked mode was deliberately not injected.
+            modes.append(read_locked_session_mode(msg.session_id))
+        msg.params = dict(params)
+        msg.params.pop("desktop_stop", None)
+        if any(ChannelMode.is_team_mode(mode) for mode in modes):
+            msg.params.update(intent="pause", mode="team")
+        else:
+            msg.params["intent"] = "cancel"
+
     async def cancel_agent_sessions_on_disconnect(
         self,
         session_keys: list[tuple[str, str]],
@@ -3710,6 +3743,7 @@ class MessageHandler(ABC):
                     continue
 
                 if msg.req_method == ReqMethod.CHAT_CANCEL:
+                    self._apply_desktop_stop_semantics(msg)
                     logger.info(
                         "[MessageHandler] 收到中断请求: id=%s channel_id=%s",
                         msg.id, msg.channel_id,
