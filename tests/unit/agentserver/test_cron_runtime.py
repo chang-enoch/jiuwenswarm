@@ -418,6 +418,45 @@ async def test_cron_tools_create_job_resolves_route_project_dir(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_cron_tools_create_job_push_is_non_final(tmp_path, monkeypatch) -> None:
+    from jiuwenswarm.common.e2a.constants import (
+        E2A_RESPONSE_KIND_CRON,
+        E2A_RESPONSE_STATUS_IN_PROGRESS,
+        E2A_WIRE_SERVER_PUSH_KEY,
+    )
+    from jiuwenswarm.server.gateway_push.wire import build_server_push_wire
+
+    _setup_project_store(tmp_path, monkeypatch)
+    tools, push = _make_cron_tools(tmp_path, monkeypatch)
+
+    token = tools.push_cron_route(
+        CronToolRoute(request_id="req-create-1", channel_id="desktop", session_id="sess-1")
+    )
+    try:
+        await tools.create_job(
+            {
+                "id": "job-nonfinal",
+                "name": "daily",
+                "cron_expr": "0 9 * * *",
+                "timezone": "Asia/Shanghai",
+                "description": "hello",
+                "targets": "web",
+            }
+        )
+    finally:
+        tools.reset_cron_route(token)
+
+    payload = push.payloads[-1]
+    assert payload["is_final"] is False
+    assert payload["status"] == E2A_RESPONSE_STATUS_IN_PROGRESS
+    assert payload["response_kind"] == E2A_RESPONSE_KIND_CRON
+
+    wire = build_server_push_wire(payload)
+    assert wire["is_final"] is False
+    assert wire["metadata"][E2A_WIRE_SERVER_PUSH_KEY] is True
+
+
+@pytest.mark.asyncio
 async def test_cron_tools_create_job_does_not_persist_source_workspace_cwd(
     tmp_path, monkeypatch,
 ) -> None:
