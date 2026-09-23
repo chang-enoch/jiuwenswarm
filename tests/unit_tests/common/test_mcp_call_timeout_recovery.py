@@ -90,6 +90,47 @@ def restore_mcp_timeout_patch():
         yield
 
 
+@pytest.mark.asyncio
+async def test_force_invalidate_defers_aclose_until_host_task_finishes() -> None:
+    """活着的聊天 task 上不得 aclose：跨 task 退 cancel scope 会取消整次请求。"""
+    import asyncio
+
+    aclosed = asyncio.Event()
+
+    class _CancellingStack(AsyncExitStack):
+        def __init__(self, host: asyncio.Task) -> None:
+            super().__init__()
+            self._host = host
+
+        async def aclose(self) -> None:
+            # 复现 anyio：别的 task 退出 scope 时取消进入该 scope 的宿主 task。
+            self._host.cancel()
+            aclosed.set()
+
+    async def host() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        client = SimpleNamespace(
+            _session=object(),
+            _exit_stack=_CancellingStack(current),
+            _is_disconnected=False,
+        )
+        force_invalidate_mcp_client(client)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert current.cancelling() == 0
+        assert not aclosed.is_set()
+
+    # host 必须是独立 task：aclose 挂在 current_task 的 done 回调上。
+    task = asyncio.create_task(host())
+    await task
+    for _ in range(10):
+        if aclosed.is_set():
+            break
+        await asyncio.sleep(0)
+    assert aclosed.is_set()
+
+
 def test_force_invalidate_clears_session_and_replaces_exit_stack() -> None:
     old_stack = AsyncExitStack()
     client = SimpleNamespace(
