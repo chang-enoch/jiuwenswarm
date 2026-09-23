@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from openjiuwen.harness.security import PermissionLevel, PermissionResult, SkillInstallContext, before_skill_install
+from openjiuwen.harness.security.permission_engine.toolguard.tool_policy import evaluate_tiered_policy
 from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_SESSION_ID
 from jiuwenswarm.common.np_transport import named_pipe_transport_for
 from jiuwenswarm.common.utils import logger
@@ -25,6 +26,11 @@ PENDING_SKILL = "behavior_security.pending_skill"
 def desktop_security_active() -> bool:
     # Explicit host capability. Other hosts, including old desktops, keep their behavior.
     return os.environ.get("CLAW_BEHAVIOR_SECURITY") == "1" and bool(os.environ.get("CLAW_SKILL_TOKEN"))
+
+
+def cloud_authorization_enabled(config: dict) -> bool:
+    """Only an explicit YAML boolean enables cloud decisions."""
+    return config.get("xiaoyi_work_security", {}).get("cloud_authorization", {}).get("enabled") is True
 
 
 def _session_id(ctx: Any) -> str:
@@ -97,19 +103,32 @@ class BehaviorSecurityBridge:
         key = event["eventId"]
         if key in self.decisions:
             return self.decisions[key]
-        cloud_enabled = self.config.get("xiaoyi_work_security", {}).get("cloud_authorization", {}).get("enabled", False)
+        cloud_enabled = cloud_authorization_enabled(self.config)
         if not local.is_undetermined:
             self.report(event)
             result = local
         elif not cloud_enabled:
             self.report(event)
-            result = PermissionResult(PermissionLevel.ASK, reason="请授权本次操作（云端授权未开启）")
+            # Normal tool checks already use Core defaults when cloud is off.
+            # Installation hooks may still arrive without a prior local result.
+            tool = event["tool"]
+            args = tool.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            permissions = {**self.config.get("permissions", {}), "defer_unmatched": False}
+            level, matched_rule = evaluate_tiered_policy(
+                permissions, tool["name"], args if isinstance(args, dict) else {},
+            )
+            result = PermissionResult(level, matched_rule=matched_rule)
         else:
             reply = await self._send({**event, "mode": "authorize"})
             decision = reply.get("decision")
             if decision in {"allow", "clarify"}:
-                # CLARIFY has no agreed question field/round-trip protocol yet.
-                # Requirement explicitly permits this one operation in that case.
+                # Keep compatibility with older desktops returning "clarify";
+                # current desktops normalize all non-REJECT results to "allow".
                 result = PermissionResult(PermissionLevel.ALLOW, reason="cloud:" + decision)
             elif decision == "deny":
                 result = PermissionResult(PermissionLevel.DENY, reason=str(reply.get("reason") or "云端拒绝本次操作"))
