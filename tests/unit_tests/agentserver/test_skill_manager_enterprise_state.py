@@ -219,6 +219,41 @@ def test_enterprise_uninstall_does_not_fall_back_from_unknown_origin(tmp_path: P
     assert skill_dir.exists()
 
 
+def test_enterprise_uninstall_resolves_origin_kept_only_on_local_skills(tmp_path: Path) -> None:
+    """旧 skillhub 把 origin 只写在 local_skills，网页仍按该 origin 卸载。"""
+    manager = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
+    skill_dir = _write_skill(tmp_path, "employment-rights-team")
+    manager.record_skill_installation(
+        name="employment-rights-team",
+        source_type="user",
+        origin="skillhub:8",
+        source="skillhub",
+    )
+    state_file = tmp_path / "skills" / "skills_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    plugin = state["installed_plugins"][0]
+    plugin.pop("origin", None)
+    plugin.pop("source_type", None)
+    plugin["marketplace"] = "skillhub"
+    state["local_skills"] = [{
+        "name": "employment-rights-team",
+        "origin": "skillhub:8",
+        "source": "skillhub",
+    }]
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    restored = SkillManager(workspace_dir=str(tmp_path), service_id="svc", agent_id="agent")
+    result = asyncio.run(restored.handle_skills_web_uninstall({
+        "name": "employment-rights-team",
+        "origin": "skillhub:8",
+    }))
+
+    assert result == {"success": True, "name": "employment-rights-team"}
+    assert not skill_dir.exists()
+    assert restored.list_skill_installations() == []
+    assert restored.get_local_skills() == []
+
+
 def test_enterprise_skills_list_does_not_wait_for_marketplace_sync(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
