@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -29,39 +28,18 @@ from openjiuwen.core.single_agent.rail.base import (
 # AbortError 经 plan_node 统一 re-export，不在本模块直连 openjiuwen（见 plan_node 注释）。
 from jiuwenswarm.server.runtime.skill_turbo.plan_node import AbortError
 
-# SkillTurbo 自有 session state key -- 与 openjiuwen 自身命名空间区分，所以前后用双下划线。
-SKILL_TURBO_RESUME_CTX_KEY = "__skill_turbo_resume_ctx__"
-
-# SkillTurbo 专用 agent_id 后缀：executor 和 resume 读取时用 '{card.id}__skill_turbo'，
-# 使 checkpointer key 与 DeepAgent 隔离，避免 DeepAgent 的 post_run 覆盖
-# executor 写入的 resume_ctx / node_artifacts。
-SKILL_TURBO_ID_SUFFIX = "__skill_turbo"
+# ── 单一权威定义 re-export ──
+# SKILL_TURBO_RESUME_CTX_KEY / SKILL_TURBO_ID_SUFFIX / set_skill_turbo_id 的
+# 权威定义在 resume_context.py（checkpointer 键同一性是 HITL resume 链路硬约束，
+# 禁止双份字面量漂移）。此处 re-export 仅为兼容既有 import 方（executor /
+# interface_deep / skill_turbo_tools / 测试），调用方全部无需改动。
+from jiuwenswarm.server.runtime.skill_turbo.resume_context import (  # noqa: F401
+    SKILL_TURBO_ID_SUFFIX,
+    SKILL_TURBO_RESUME_CTX_KEY,
+    set_skill_turbo_id,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def set_skill_turbo_id(session: Any, card: Any) -> None:
-    """将 session 的 agent_id 设为 '{card.id}__skill_turbo'，使 SkillTurbo 的 checkpointer
-    key 与 DeepAgent 隔离，避免 post_run 互相覆盖。
-
-    必须在 session.pre_run() 之前调用。
-    对 FakeSession 等无 _inner 的 stub 是 no-op。
-    """
-    if session is None or card is None:
-        return
-    card_id = getattr(card, "id", None)
-    if not card_id:
-        return
-    inner = getattr(session, "_inner", None)
-    if inner is None:
-        return
-    try:
-        config = inner.config()
-        skill_turbo_id = f"{card_id}{SKILL_TURBO_ID_SUFFIX}"
-        config.set_agent_config(type("SkillTurboAgentConfig", (), {"id": skill_turbo_id})())
-        logger.debug("[SkillTurboResume] set_skill_turbo_id: %s", skill_turbo_id)
-    except Exception as exc:
-        logger.warning("[SkillTurboResume] set_skill_turbo_id failed: %s", exc)
 
 
 @dataclass
@@ -201,31 +179,15 @@ def build_interaction_output_from_abort(
     )
 
 
-def _get_sid(session: Any) -> str:
-    """获取 session ID，兼容 session_id 属性和 get_session_id() 方法。"""
-    sid = getattr(session, "session_id", None)
-    if sid is None:
-        getter = getattr(session, "get_session_id", None)
-        if callable(getter):
-            try:
-                sid = getter()
-            except Exception:
-                sid = "?"
-                logger.debug("[SkillTurboResume] get_session_id failed", exc_info=True)
-        else:
-            sid = "?"
-    return str(sid) if sid else "?"
-
-
-# ──────────────────────── Resume Context ────────────────────────
-# resume_ctx 走 session state + checkpointer 持久化，保证多 worker/多实例
-# 部署的 HITL 恢复可靠（同一 session_id 在任何进程都能从 checkpointer 读到）。
-#
-# save: session.update_state() + post_run 落盘。
-# load: session.pre_run() + get_state() 从 checkpointer 恢复。
-# clear: session.update_state(key=None)。
-#
-# 与 node_artifacts 共享同一持久化语义，避免「产物在、断点不在」的半恢复状态。
+# ──────────────────────── Resume Context（薄委托层） ────────────────────────
+# 实现已收口至 resume_context.py（ResumeContextManager，单一 owner）。
+# 生命周期持久化语义（详见 resume_context 模块）：
+#   save:  session.update_state() + post_run 落盘
+#   load:  session.pre_run() + get_state() 从 checkpointer 恢复
+#   clear: ResumeContextManager.clear 走 {card.id}__skill_turbo 隔离键通道
+#          强制落盘（isolated session pre_run+clear+post_run），并同步清
+#          调用方内存快照防 post_run 复活。
+# 以下函数保留原签名薄委托，供既有调用方与测试 mock 使用。
 
 
 async def save_resume_ctx(
@@ -238,160 +200,60 @@ async def save_resume_ctx(
 ) -> None:
     """中断时保存断点上下文到 session state（checkpointer 持久化）。
 
-    调用方应已 pre_run（executor 在 _persist_node_artifacts 中 pre_run 过），
-    本函数负责 update_state + post_run 完成落盘（与 node_artifacts 共一次 post_run）。
-
-    ``task_states``：中断时的二层任务全量快照（含稳定 ``task_id``）。
-    resume 时复用同一套 id，避免前端 taskRuns 因新 UUID 叠出两套 Stage。
+    薄委托至 ResumeContextManager.save（单一 owner）。保留签名供调用方逐步迁移。
     """
-    if session is None:
-        logger.warning("[SkillTurboResume] save_resume_ctx: session is None, skipping")
-        return
-    sid = _get_sid(session)
-    entry: dict[str, Any] = {
-        "plan_code": plan_code,
-        "inputs": dict(inputs),
-        "pending_tool_call_id": pending_tool_call_id,
-        # update_state 使用 merge 语义；上一轮 mark_resume_in_flight 写入的
-        # resume_in_flight=True 不会因新 entry 缺少该键而被移除。显式置 None
-        # 让 merge 将其从持久化状态中删除，避免下一轮恢复被误判为重复答案。
-        "resume_in_flight": None,
-    }
-    if task_states:
-        entry["task_states"] = copy.deepcopy(task_states)
-    # 与 save_node_artifacts 一致：pre_run 后 update_state 才能经 checkpointer 持久化。
-    # 调用方若已在 pre_run 上下文里，重复 pre_run 是 no-op。
-    try:
-        await session.pre_run(inputs=None)
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] save_resume_ctx pre_run failed: sid=%s err=%s", sid, e
-        )
-    try:
-        session.update_state({SKILL_TURBO_RESUME_CTX_KEY: entry})
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] save_resume_ctx update_state failed: sid=%s err=%s", sid, e
-        )
-        raise
-    logger.info(
-        "[SkillTurboResume] save_resume_ctx: sid=%s tcid=%s plan_code_len=%d task_states=%d",
-        sid,
-        pending_tool_call_id,
-        len(plan_code or ""),
-        len(entry.get("task_states") or []),
+    from jiuwenswarm.server.runtime.skill_turbo.resume_context import ResumeContextManager
+
+    mgr = ResumeContextManager(session)
+    await mgr.save(
+        plan_code=plan_code,
+        inputs=inputs,
+        pending_tool_call_id=pending_tool_call_id,
+        task_states=task_states,
     )
-    try:
-        await session.post_run()
-        logger.info("[SkillTurboResume] save_resume_ctx: persisted OK sid=%s", sid)
-    except Exception as e:
-        logger.warning("[SkillTurboResume] save_resume_ctx post_run failed: sid=%s err=%s", sid, e)
 
 
 async def load_resume_ctx(session: Any) -> dict[str, Any] | None:
-    """从 checkpointer 读取断点上下文。返回 None 表示无可恢复的 SkillTurbo 中断。"""
-    if session is None:
-        logger.warning("[SkillTurboResume] load_resume_ctx: session is None")
-        return None
-    sid = _get_sid(session)
-    try:
-        await session.pre_run(inputs=None)
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] load_resume_ctx pre_run failed: sid=%s err=%s", sid, e
-        )
-        return None
-    try:
-        state = session.get_state(SKILL_TURBO_RESUME_CTX_KEY)
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] load_resume_ctx get_state failed: sid=%s err=%s", sid, e
-        )
-        return None
-    if isinstance(state, dict) and state.get("plan_code"):
-        logger.info(
-            "[SkillTurboResume] load_resume_ctx: found ctx sid=%s tcid=%s",
-            sid, state.get("pending_tool_call_id"),
-        )
-        return copy.deepcopy(state)
-    logger.info("[SkillTurboResume] load_resume_ctx: no ctx found sid=%s", sid)
-    return None
+    """从 checkpointer 读取断点上下文。返回 None 表示无可恢复的 SkillTurbo 中断。
+
+    薄委托至 ResumeContextManager.load（语义逐位一致）。
+    """
+    from jiuwenswarm.server.runtime.skill_turbo.resume_context import ResumeContextManager
+
+    mgr = ResumeContextManager(session)
+    return await mgr.load()
 
 
 async def clear_resume_ctx(session: Any) -> None:
-    """清除断点上下文（resume 跑通后调用）。"""
-    if session is None:
-        return
-    sid = _get_sid(session)
-    try:
-        session.update_state({SKILL_TURBO_RESUME_CTX_KEY: None})
-    except Exception:
-        logger.debug(
-            "[SkillTurboResume] clear_resume_ctx update_state failed", exc_info=True
-        )
-    logger.info("[SkillTurboResume] clear_resume_ctx: cleared sid=%s", sid)
+    """清除断点上下文（resume 跑通后调用）。
+
+    薄委托至 ResumeContextManager.clear。注意：manager.clear() 使用 isolated
+    通道强制落盘，而非原 session 的 update_state(None)——修复键空间错误。
+    若调用方已自行 pre_run，manager 会在 isolated session 上独立 pre_run。
+    """
+    from jiuwenswarm.server.runtime.skill_turbo.resume_context import ResumeContextManager
+
+    mgr = ResumeContextManager(session)
+    await mgr.clear()
 
 
 async def mark_resume_in_flight(session: Any, resume_ctx: dict[str, Any]) -> None:
     """Mark resume_ctx as in-flight so duplicate answer submits are ignored.
 
-    Same-process double-click / retry can otherwise load the same pending tcid
-    and start a second resume stream (gateway does not cancel interrupt-resume).
-
-    Persists via ``update_state`` + ``post_run`` so a later request that
-    ``load_resume_ctx`` (pre_run from checkpointer) also sees the flag.
+    薄委托至 ResumeContextManager.mark_in_flight。
     """
-    if session is None or not isinstance(resume_ctx, dict):
-        return
-    sid = _get_sid(session)
-    marked = dict(resume_ctx)
-    marked["resume_in_flight"] = True
-    try:
-        await session.pre_run(inputs=None)
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] mark_resume_in_flight pre_run failed: sid=%s err=%s",
-            sid,
-            e,
-        )
-    try:
-        session.update_state({SKILL_TURBO_RESUME_CTX_KEY: marked})
-    except Exception:
-        logger.debug(
-            "[SkillTurboResume] mark_resume_in_flight update_state failed",
-            exc_info=True,
-        )
-        return
-    try:
-        await session.post_run()
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] mark_resume_in_flight post_run failed: sid=%s err=%s",
-            sid,
-            e,
-        )
+    from jiuwenswarm.server.runtime.skill_turbo.resume_context import ResumeContextManager
+
+    mgr = ResumeContextManager(session)
+    await mgr.mark_in_flight(resume_ctx)
 
 
 async def clear_resume_in_flight(session: Any) -> None:
-    """Clear the in-flight flag if resume_ctx is still present."""
-    if session is None:
-        return
-    try:
-        state = session.get_state(SKILL_TURBO_RESUME_CTX_KEY)
-    except Exception as e:
-        logger.warning(
-            "[SkillTurboResume] clear_resume_in_flight get_state failed: err=%s",
-            e,
-        )
-        return
-    if not isinstance(state, dict) or not state.get("resume_in_flight"):
-        return
-    cleaned = dict(state)
-    cleaned.pop("resume_in_flight", None)
-    try:
-        session.update_state({SKILL_TURBO_RESUME_CTX_KEY: cleaned})
-    except Exception:
-        logger.debug(
-            "[SkillTurboResume] clear_resume_in_flight update_state failed",
-            exc_info=True,
-        )
+    """Clear the in-flight flag if resume_ctx is still present.
+
+    薄委托至 ResumeContextManager.clear_in_flight（isolated 通道强制落盘）。
+    """
+    from jiuwenswarm.server.runtime.skill_turbo.resume_context import ResumeContextManager
+
+    mgr = ResumeContextManager(session)
+    await mgr.clear_in_flight()
