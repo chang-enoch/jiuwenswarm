@@ -484,8 +484,34 @@ def apply_openai_sse_invoke_patch() -> None:
 
     async def _stream_with_maas_span(self: Any, *args, **kwargs):
         _maybe_inject_maas_span_id(self, kwargs)
-        async for chunk in _orig_stream(self, *args, **kwargs):
+        # [PERF] 打点:LLM 流调用 TTFT 与总时长
+        import time as _perf_time
+        _t0 = _perf_time.perf_counter()
+        _ttft_logged = False
+        _producer_s = 0.0
+        _n_chunks = 0
+        _it = _orig_stream(self, *args, **kwargs)
+        while True:
+            _t_next = _perf_time.perf_counter()
+            try:
+                chunk = await _it.__anext__()
+            except StopAsyncIteration:
+                break
+            _producer_s += _perf_time.perf_counter() - _t_next
+            _n_chunks += 1
+            if not _ttft_logged:
+                _ttft_logged = True
+                logger.info(
+                    "[PERF] llm_stream ttft_ms=%.1f",
+                    (_perf_time.perf_counter() - _t0) * 1000,
+                )
             yield chunk
+        logger.info(
+            "[PERF] llm_stream total_ms=%.1f producer_ms=%.1f chunks=%d",
+            (_perf_time.perf_counter() - _t0) * 1000,
+            _producer_s * 1000,
+            _n_chunks,
+        )
 
     OpenAIModelClient.invoke = _invoke_with_maas_span
     OpenAIModelClient.stream = _stream_with_maas_span

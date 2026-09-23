@@ -1037,6 +1037,82 @@ class TenantAgentPool:
         finally:
             await self._refresh_agent_manager_cache(cache_key, agent_manager)
 
+    _session_prewarm_tasks: ClassVar[set] = set()
+
+    async def prewarm_session_in_background(
+        self,
+        *,
+        request: AgentRequest,
+        session_id: str | None,
+        channel_id: str = "",
+        mode: str = "agent",
+        project_dir: str | None = None,
+    ) -> None:
+        """[PERF 优化③] session.create 成功后后台预热该会话(租户池路径)。
+
+        企业版 warm pool 因预热路径缺请求身份而被强制关闭(见
+        agent_warm_pool._prewarm_enabled_by_env),每个新会话首条 chat 仍全额
+        支付 agent 构建 + prepare_session(实测 ~10s)。本方法在 create 上下文
+        (身份齐全)中按 process_message_stream 同款租户推导,后台完成同一套
+        构建:**不含 LLM 轮次、不写对话历史**。get_agent 按 key 双检锁,与首条
+        chat 并发安全(最坏退化为基线时延)。
+        env ``JIUWENSWARM_SESSION_CREATE_PREWARM=0`` 可关闭。
+        """
+        import os
+        import time
+
+        if str(
+            os.environ.get("JIUWENSWARM_SESSION_CREATE_PREWARM", "1")
+        ).strip().lower() in {"0", "false", "no", "off"}:
+            return
+        if not session_id:
+            return
+
+        async def _run() -> None:
+            started = time.monotonic()
+            try:
+                agent_id, service_id, workspace_key = self.extract_ids(request)
+                agent_id, service_id = self.resolve_control_rpc_tenant(
+                    request, agent_id, service_id
+                )
+                manager = await self.get_agent_manager(
+                    agent_id, service_id, workspace_key
+                )
+                agent = await manager.get_agent(
+                    channel_id=channel_id or "default",
+                    mode=mode,
+                    project_dir=project_dir,
+                    sub_mode=None,
+                    request=request,
+                )
+                if agent is None:
+                    return
+                await agent.prepare_session(
+                    session_id=session_id,
+                    channel_id=channel_id or "default",
+                    mode=("code.normal" if str(mode).startswith("code") else "agent"),
+                    project_dir=project_dir,
+                )
+                logger.info(
+                    "[PERF] session prewarm completed: session_id=%s duration_ms=%.0f",
+                    session_id,
+                    (time.monotonic() - started) * 1000,
+                )
+            except Exception as exc:  # noqa: BLE001 - 预热失败不阻塞业务
+                # 注:CancelledError 为 BaseException(py3.8+),不会被此处捕获,自然穿透
+                logger.warning(
+                    "[PERF] session prewarm failed: session_id=%s error=%s",
+                    session_id,
+                    exc,
+                )
+
+        try:
+            task = asyncio.create_task(_run(), name=f"session-prewarm-{session_id}")
+            self._session_prewarm_tasks.add(task)
+            task.add_done_callback(self._session_prewarm_tasks.discard)
+        except RuntimeError:  # 无运行 loop(理论不可达)静默放弃
+            pass
+
     async def process_message_stream(
             self, request: AgentRequest
     ):

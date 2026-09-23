@@ -1,4 +1,5 @@
 import atexit
+import functools
 from jiuwenswarm.edition import is_enterprise
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
@@ -1961,16 +1962,25 @@ def collapse_nested_agent_workspace_dir(path: Path | str) -> Path:
     ``.../agent/jiuwenclaw_workspace`` (current). PPT tooling historically
     used ``{cwd}/workspace`` as the session parent, which nests a second
     ``workspace`` directory when cwd is already the agent workspace.
+
+    [PERF] 每轮回话都会以相同入参重复调用(_seed_runtime_cwd 等),resolve()
+    是 real FS 调用(实测 cwd_seed 段 46-93ms/轮);同参结果按路径语义稳定,
+    lru_cache 后重复调用近零成本。
     """
-    resolved = Path(path).expanduser()
+    return Path(_collapse_workspace_dir_cached(str(path)))
+
+
+@functools.lru_cache(maxsize=8192)
+def _collapse_workspace_dir_cached(path_str: str) -> str:
+    resolved = Path(path_str).expanduser()
     try:
         resolved = resolved.resolve()
     except OSError:
         resolved = resolved.absolute()
     parent_name = resolved.parent.name.lower()
     if resolved.name.lower() == "workspace" and parent_name in _AGENT_WORKSPACE_DIR_NAMES:
-        return resolved.parent
-    return resolved
+        return str(resolved.parent)
+    return str(resolved)
 
 
 def get_agent_sessions_relative_dir() -> Path:
