@@ -93,11 +93,11 @@ class RuntimeSessionRouteClient:
             timeout = timeout_seconds
             if timeout is None:
                 try:
-                    timeout = float(read_env("GATEWAY_RUNTIME_MANAGER_TIMEOUT", "40"))
+                    timeout = float(read_env("GATEWAY_RUNTIME_MANAGER_TIMEOUT", "300"))
                 except (TypeError, ValueError):
-                    timeout = 40.0
+                    timeout = 300.0
             if timeout <= 0:
-                timeout = 40.0
+                timeout = 300.0
             # route 可能排队到 scope_full_timeout（默认 30s），连接超时单独收短
             self._http = httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),

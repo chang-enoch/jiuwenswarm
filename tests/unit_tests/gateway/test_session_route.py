@@ -361,4 +361,5 @@ async def test_blank_url_and_bad_timeout_fall_back(
     monkeypatch.setenv("GATEWAY_RUNTIME_MANAGER_TIMEOUT", "not-a-number")
     client = RuntimeSessionRouteClient()
     assert client._route_url == "http://127.0.0.1:8091/api/session/route"
+    assert client._http.timeout.read == 300.0
     await client.aclose()

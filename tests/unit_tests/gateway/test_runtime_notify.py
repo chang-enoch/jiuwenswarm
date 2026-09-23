@@ -92,6 +92,59 @@ async def test_request_agentserver_refresh_posts_empty_payload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected_read"),
+    [
+        (None, 300.0),
+        ("15", 15.0),
+        ("not-a-number", 300.0),
+        ("0", 300.0),
+        ("-1", 300.0),
+    ],
+)
+async def test_config_refresh_timeout_matches_runtime_manager_default(
+    monkeypatch,
+    raw: str | None,
+    expected_read: float,
+) -> None:
+    monkeypatch.setenv("GATEWAY_RUNTIME_MANAGER_URL", "http://runtime-manager:8091")
+    if raw is None:
+        monkeypatch.delenv("GATEWAY_RUNTIME_MANAGER_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("GATEWAY_RUNTIME_MANAGER_TIMEOUT", raw)
+    captured: dict = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            captured["timeout"] = kwargs["timeout"]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url: str, *, json: dict | None = None, headers: dict | None = None):
+            class _Resp:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def json() -> dict:
+                    return {"rawdata": {"scopes_refreshed": 0, "pods_sunset": 0}}
+
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    await _request_agentserver_refresh()
+
+    timeout = captured["timeout"]
+    assert timeout.read == expected_read
+    assert timeout.connect == min(5.0, expected_read)
+
+
+@pytest.mark.asyncio
 async def test_request_agentserver_refresh_enforce_sends_binding_headers(
     monkeypatch,
     tmp_path,

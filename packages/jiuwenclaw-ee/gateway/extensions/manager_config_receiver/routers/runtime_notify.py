@@ -83,12 +83,14 @@ async def _request_agentserver_refresh(
         base = "link://runtime"
     if not base:
         return
+    # 与 session route 客户端共用同一变量，未配置时同为 300s。
+    # config_refresh 在锁内按 scope 日落，规模大时可超过原先的 40s。
     try:
-        timeout = float(read_env("GATEWAY_RUNTIME_MANAGER_TIMEOUT", "40"))
+        timeout = float(read_env("GATEWAY_RUNTIME_MANAGER_TIMEOUT", "300"))
     except (TypeError, ValueError):
-        timeout = 40.0
+        timeout = 300.0
     if timeout <= 0:
-        timeout = 40.0
+        timeout = 300.0
 
     # config_refresh 是无载荷端点（rawdata 非空 → 400），配置由 runtime 自行重读 DB
     url = f"{base}/api/session/config_refresh"
