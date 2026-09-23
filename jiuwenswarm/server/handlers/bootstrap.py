@@ -338,6 +338,18 @@ async def handle_session_create(ctx: RequestContext) -> None:
 
             logger.info("[AgentServer] session.create completed: session_id=%s", session_id)
 
+            # [PERF 优化③] create 成功后后台预热该会话(租户池路径,带真实身份
+            # 构建 agent,无 LLM 轮次、不写历史),让首条 chat 免付 ~10s 冷构建
+            asyncio.create_task(
+                ctx.services.tenant_pool().prewarm_session_in_background(
+                    session_id=session_id,
+                    channel_id=channel_id or "default",
+                    mode="agent",
+                    project_dir=(str(project_dir).strip() or None) if project_dir else None,
+                    request=request,
+                )
+            )
+
             if switch_context is not None and dispatch_signals is not None:
                 kvc_task = asyncio.create_task(
                     ctx.services.dispatch_session_switch_kvc(

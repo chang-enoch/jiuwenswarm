@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -241,7 +242,10 @@ def symphony_config_from_dict(raw: dict[str, Any] | None) -> SymphonyConfig:
     )
 
 
+@functools.lru_cache(maxsize=256)
 def _resolve_path(value: Any, default: Path) -> Path:
+    # [PERF] load_symphony_config 每轮聊天都会重跑,symphony_config_from_dict
+    # 内多处 _resolve_path 触发 real FS stat/realpath;入参恒定的默认路径缓存后近零成本。
     text = str(value or "").strip()
     if not text:
         return default.resolve()

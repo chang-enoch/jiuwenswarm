@@ -148,6 +148,13 @@ from jiuwenswarm.llm_sse_patch import apply_openai_sse_invoke_patch
 
 apply_openai_sse_invoke_patch()
 
+# [PERF 实验] symphony 关闭时短路 evolution rail 轨迹采集(实测占回合 ~40%)
+from jiuwenswarm.perf.evolution_rail_short_circuit import (
+    apply_evolution_rail_short_circuit,
+)
+
+apply_evolution_rail_short_circuit()
+
 from jiuwenswarm.common.openjiuwen_rail_compat import install_evolution_rail_kwargs_compat
 from jiuwenswarm.openjiuwen_skip_tool_patch import apply_skip_tool_tool_message_patch
 from jiuwenswarm.openjiuwen_streaming_tool_patch import apply_streaming_tool_wait_timeout_patch

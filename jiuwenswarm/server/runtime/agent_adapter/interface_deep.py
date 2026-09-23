@@ -2179,6 +2179,39 @@ async def ensure_persistent_checkpointer() -> None:
             checkpointer = await CheckpointerFactory.create(
                 CheckpointerConfig(type="persistence", conf=conf),
             )
+            # [PERF] 打点:包一层计时,定位每轮 checkpoint restore/save 的真实耗时
+            import functools as _perf_ft
+
+            def _perf_wrap_cp(_name, _fn):
+                if not asyncio.iscoroutinefunction(_fn):
+                    return _fn
+
+                @_perf_ft.wraps(_fn)
+                async def _timed(*args, **kwargs):
+                    _t0 = time.perf_counter()
+                    try:
+                        return await _fn(*args, **kwargs)
+                    finally:
+                        logger.info(
+                            "[PERF] checkpoint.%s ms=%.1f",
+                            _name,
+                            (time.perf_counter() - _t0) * 1000,
+                        )
+
+                return _timed
+
+            for _cp_name in dir(checkpointer):
+                if _cp_name.startswith("_"):
+                    continue
+                try:
+                    _cp_attr = getattr(checkpointer, _cp_name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if callable(_cp_attr):
+                    try:
+                        setattr(checkpointer, _cp_name, _perf_wrap_cp(_cp_name, _cp_attr))
+                    except Exception:  # noqa: BLE001
+                        pass
             _shared_checkpoint_checkpointer = checkpointer
             CheckpointerFactory.set_default_checkpointer(checkpointer)
             _PERSISTENT_CHECKPOINTER_READY = True
