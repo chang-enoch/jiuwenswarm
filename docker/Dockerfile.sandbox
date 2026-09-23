@@ -31,6 +31,9 @@ RUN if [ -z "$PIP_INDEX_URL" ]; then echo "PIP_INDEX_URL is empty" >&2; exit 1; 
     echo "trusted-host = ${TRUSTED_HOST}" >> /etc/pip.conf && \
     chmod 644 /etc/pip.conf
 
+RUN mkdir -p /opt/jiuwenbox-pip && \
+    chown app:app /opt/jiuwenbox-pip
+
 EXPOSE 8321
 EXPOSE 8322
 
