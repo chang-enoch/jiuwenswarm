@@ -78,6 +78,9 @@ class ChatSendParams(TypedDict, total=False):
     model_name: NotRequired[str]
     """模型名称（Web 前端可选传递）。"""
 
+    model_ref: NotRequired[str]
+    """模型唯一身份引用；由 relay 下发，优先于 model_name。"""
+
     request_id: NotRequired[str]
     """请求 ID（interrupt resume / 问答回复场景关联）。"""
 

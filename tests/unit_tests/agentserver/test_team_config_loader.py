@@ -17,6 +17,7 @@ from jiuwenswarm.agents.harness.team.config_loader import (
     load_team_spec_dict,
     resolve_team_sqlite_db_path,
 )
+from jiuwenswarm.agents.harness.team import config_loader as team_config_loader
 
 
 def _wrap_modes_team(team_mapping: dict[str, dict]) -> dict:
@@ -161,6 +162,201 @@ def test_load_team_spec_dict_uses_first_models_defaults_entry_for_team(monkeypat
     assert model["model_client_config"]["model_name"] == "first-model"
     assert model["model_request_config"]["model"] == "first-model"
     assert model["model_request_config"]["temperature"] == 0.1
+
+
+def test_load_team_spec_dict_merges_tip_default_headers_into_member_model(monkeypatch):
+    """Team members must carry MaaS tip Authorization into custom_headers."""
+    monkeypatch.setattr(
+        team_config_loader,
+        "read_default_headers",
+        lambda: {"Authorization": "Basic tip-auth", "X-Tenant": "tenant-a"},
+        raising=False,
+    )
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://maas.example/v2",
+                        "api_key": "huawei-maas-session",
+                        "model_name": "glm-5.2",
+                        "client_provider": "OpenAI",
+                        "custom_headers": {
+                            "Authorization": "Bearer stale",
+                            "X-Existing": "keep",
+                        },
+                    },
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {"leader": {}, "teammate": {}},
+                }
+            }
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config)
+
+    headers = spec["agents"]["leader"]["model"]["model_client_config"]["custom_headers"]
+    assert headers == {
+        "Authorization": "Basic tip-auth",
+        "X-Tenant": "tenant-a",
+        "X-Existing": "keep",
+    }
+
+
+def test_requested_model_ref_overrides_every_team_agent_model_and_preserves_other_fields():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://first.example.test/v1",
+                        "api_key": "sk-first",
+                        "model_name": "first-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.1},
+                },
+                {
+                    "model_client_config": {
+                        "api_base": "https://selected.example.test/v1",
+                        "api_key": "sk-selected",
+                        "model_name": "selected-model",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.8},
+                },
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {
+                        "leader": {
+                            "model": {
+                                "model_client_config": {"model_name": "leader-default"},
+                                "model_request_config": {"model": "leader-default"},
+                            },
+                            "skills": ["planning"],
+                        },
+                        "teammate": {
+                            "model": {
+                                "model_client_config": {"model_name": "teammate-default"},
+                                "model_request_config": {"model": "teammate-default"},
+                            },
+                            "max_iterations": 7,
+                        },
+                    },
+                }
+            }
+        ),
+    }
+
+    selected_ref = _model_identity_ref(
+        model_name="selected-model",
+        provider="OpenAI",
+        api_base="https://selected.example.test/v1",
+    )
+    spec = load_team_spec_dict(
+        config_base=config, requested_model_name="selected-model", requested_model_ref=selected_ref
+    )
+
+    for agent in spec["agents"].values():
+        assert agent["model"]["model_client_config"]["model_name"] == "selected-model"
+        assert agent["model"]["model_client_config"]["api_key"] == "sk-selected"
+        assert agent["model"]["model_request_config"]["model"] == "selected-model"
+    assert spec["agents"]["leader"]["skills"] == ["planning"]
+    assert spec["agents"]["teammate"]["max_iterations"] == 7
+
+
+def test_requested_model_name_only_preserves_explicit_member_models():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {"model_name": "selected-model"},
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {
+                "demo_team": {
+                    "team_name": "demo_team",
+                    "agents": {
+                        "leader": {
+                            "model": {
+                                "model_client_config": {"model_name": "leader-default"},
+                                "model_request_config": {"model": "leader-default"},
+                            }
+                        },
+                        "teammate": {},
+                    },
+                }
+            }
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="selected-model")
+
+    assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "leader-default"
+    assert spec["agents"]["teammate"]["model"]["model_client_config"]["model_name"] == "selected-model"
+
+
+def test_requested_model_name_falls_back_to_first_default_when_missing():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {"model_name": "configured-model"},
+                    "model_config_obj": {},
+                }
+            ]
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    spec = load_team_spec_dict(config_base=config, requested_model_name="missing-model")
+
+    assert spec["agents"]["leader"]["model"]["model_client_config"]["model_name"] == "configured-model"
+
+
+def test_requested_model_name_fails_closed_when_ambiguous():
+    config = {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "model_name": "duplicate-model",
+                        "api_base": "https://first.example.test/v1",
+                    },
+                    "model_config_obj": {},
+                },
+                {
+                    "model_client_config": {
+                        "model_name": "duplicate-model",
+                        "api_base": "https://second.example.test/v1",
+                    },
+                    "model_config_obj": {},
+                },
+            ]
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        load_team_spec_dict(config_base=config, requested_model_name="duplicate-model")
 
 
 def _model_identity_ref(*, model_name: str, provider: str, api_base: str) -> str:
@@ -1213,3 +1409,178 @@ def test_load_team_spec_dict_preserves_arbitrary_team_top_level_fields(monkeypat
     # The locked agent-core dev-stable may not expose this optional field yet;
     # this test only covers JiuwenSwarm's config preservation contract.
     assert spec["max_debate_rounds"] == 2
+
+
+def test_requested_model_ref_in_legacy_model_config_fails_closed():
+    ref = _model_identity_ref(
+        model_name="selected-model",
+        provider="OpenAI",
+        api_base="https://selected.example.test/v1",
+    )
+    config = {
+        "models": {
+            "default": {
+                "model_client_config": {
+                    "model_name": "selected-model",
+                    "api_base": "https://selected.example.test/v1",
+                    "client_provider": "OpenAI",
+                },
+                "model_config_obj": {},
+            }
+        },
+        **_wrap_modes_team(
+            {"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}
+        ),
+    }
+
+    with pytest.raises(ValueError, match="owner is unavailable"):
+        load_team_spec_dict(
+            config_base=config,
+            requested_model_name="selected-model",
+            requested_model_ref=ref,
+        )
+
+
+def _duplicate_request_model_config() -> dict:
+    return {
+        "models": {
+            "defaults": [
+                {
+                    "model_client_config": {
+                        "api_base": "https://builtin.example/v1/",
+                        "api_key": "sk-builtin",
+                        "model_name": "glm-5.3",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.1},
+                },
+                {
+                    "model_client_config": {
+                        "api_base": "https://third-party.example/v1/",
+                        "api_key": "sk-third-party",
+                        "model_name": "glm-5.3",
+                        "client_provider": "OpenAI",
+                    },
+                    "model_config_obj": {"temperature": 0.8},
+                },
+            ]
+        },
+        **_wrap_modes_team({"demo_team": {"team_name": "demo_team", "agents": {"leader": {}, "teammate": {}}}}),
+    }
+
+
+def test_requested_model_ref_selects_owner_after_defaults_reorder():
+    config = _duplicate_request_model_config()
+    config["models"]["defaults"].reverse()
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1/",
+    )
+
+    spec = load_team_spec_dict(
+        config_base=config,
+        requested_model_name="glm-5.3",
+        requested_model_ref=ref,
+    )
+
+    for agent in spec["agents"].values():
+        assert agent["model"]["model_client_config"]["api_base"] == "https://third-party.example/v1/"
+
+
+def test_load_team_spec_dict_logs_final_member_model_identity(monkeypatch):
+    config = _duplicate_request_model_config()
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1",
+    )
+
+    messages = []
+    monkeypatch.setattr(
+        team_config_loader.logger,
+        "info",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+    load_team_spec_dict(
+        config_base=config,
+        requested_model_name="glm-5.3",
+        requested_model_ref=ref,
+    )
+
+    model_logs = [message for message in messages if "member model resolved" in message]
+    assert len(model_logs) == 2
+    assert all(ref in message for message in model_logs)
+    assert all("sk-third-party" not in message for message in model_logs)
+
+
+def test_requested_model_ref_name_mismatch_fails_closed():
+    ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1/",
+    )
+
+    with pytest.raises(ValueError, match="name mismatch"):
+        load_team_spec_dict(
+            config_base=_duplicate_request_model_config(),
+            requested_model_name="qwen3.7-max",
+            requested_model_ref=ref,
+        )
+
+
+def test_requested_model_ref_unknown_and_ambiguous_fail_closed():
+    unknown_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://unknown.example/v1/",
+    )
+    with pytest.raises(ValueError, match="owner not found"):
+        load_team_spec_dict(
+            config_base=_duplicate_request_model_config(),
+            requested_model_name="glm-5.3",
+            requested_model_ref=unknown_ref,
+        )
+
+    ambiguous_config = _duplicate_request_model_config()
+    ambiguous_config["models"]["defaults"].append(dict(ambiguous_config["models"]["defaults"][0]))
+    shared_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://builtin.example/v1/",
+    )
+    with pytest.raises(ValueError, match="owner is ambiguous"):
+        load_team_spec_dict(
+            config_base=ambiguous_config,
+            requested_model_name="glm-5.3",
+            requested_model_ref=shared_ref,
+        )
+
+
+def test_member_model_refs_allow_auto_assignment_across_same_name_providers():
+    config = _duplicate_request_model_config()
+    first_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://builtin.example/v1",
+    )
+    second_ref = _model_identity_ref(
+        model_name="glm-5.3",
+        provider="OpenAI",
+        api_base="https://third-party.example/v1",
+    )
+    config["modes"]["team"]["demo_team"]["agents"] = {
+        "leader": {"model": {"ref": first_ref}},
+        "teammate": {"model": {"ref": second_ref}},
+    }
+
+    spec = load_team_spec_dict(config_base=config)
+
+    assert (
+        spec["agents"]["leader"]["model"]["model_client_config"]["api_base"]
+        == "https://builtin.example/v1/"
+    )
+    assert (
+        spec["agents"]["teammate"]["model"]["model_client_config"]["api_base"]
+        == "https://third-party.example/v1/"
+    )

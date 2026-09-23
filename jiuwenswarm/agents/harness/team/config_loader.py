@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from copy import deepcopy
 from pathlib import Path
@@ -14,13 +12,17 @@ from typing import Any
 from openjiuwen.agent_teams.paths import get_agent_teams_home
 
 from jiuwenswarm.common.config import get_config
+from jiuwenswarm.common.local_env_config import read_default_headers
+from jiuwenswarm.common.model_identity import (
+    MODEL_IDENTITY_REFERENCE_PREFIX,
+    build_model_identity_reference,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ITERATIONS = 200
 _DEFAULT_COMPLETION_TIMEOUT = 600.0
 _DEFAULT_MAX_DEBATE_ROUNDS = 5
-_MODEL_IDENTITY_REF_PREFIX = "model-identity-v1:"
 _DEFAULT_AGENT_WORKSPACE = {"stable_base": True}
 _DEFAULT_TEAM_WORKSPACE = {"enabled": True}
 _DEFAULT_TRANSPORT = {"type": "inprocess"}
@@ -28,6 +30,45 @@ _DEFAULT_TRANSPORT = {"type": "inprocess"}
 
 class TeamTemplateNotFoundError(ValueError):
     """Raised when a bound team references a template that no longer exists."""
+
+
+def merge_tip_default_headers(model_client_config: dict[str, Any]) -> dict[str, Any]:
+    """Merge trusted tip headers into a model client config without mutating it.
+
+    Huawei MaaS uses ``api_key=huawei-maas-session`` as a placeholder while the
+    real Basic Authorization is supplied by the tip ``default_headers``.  The
+    tip Authorization therefore takes precedence; unrelated tip headers only
+    fill keys that are not explicitly configured on the model.
+    """
+    merged_config = deepcopy(model_client_config)
+    try:
+        tip_headers = read_default_headers()
+    except Exception:  # noqa: BLE001 - malformed tip data must not break teams
+        logger.warning(
+            "[TeamConfigLoader] failed to read tip default_headers",
+            exc_info=True,
+        )
+        return merged_config
+
+    if not tip_headers:
+        return merged_config
+
+    existing_headers = merged_config.get("custom_headers")
+    merged_headers = dict(existing_headers) if isinstance(existing_headers, dict) else {}
+    for header_name, header_value in tip_headers.items():
+        key = str(header_name)
+        if key.lower() == "authorization":
+            merged_headers[key] = str(header_value)
+        else:
+            merged_headers.setdefault(key, str(header_value))
+    merged_config["custom_headers"] = merged_headers
+    logger.info(
+        "[TeamConfigLoader] merged tip default_headers into custom_headers: "
+        "keys=%s has_authorization=%s",
+        sorted(str(key) for key in merged_headers),
+        any(str(key).lower() == "authorization" for key in merged_headers),
+    )
+    return merged_config
 
 
 def _get_modes_team(config_base: dict[str, Any]) -> dict[str, Any]:
@@ -213,12 +254,25 @@ def _resolve_default_model_config(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     models_raw = config_base.get("models", {})
     if not isinstance(models_raw, dict):
         return {}
 
     defaults_raw = models_raw.get("defaults")
+    requested_ref = (requested_model_ref or "").strip()
+    if requested_ref:
+        selected = resolve_model_identity_reference(requested_ref, config_base)
+        selected_name = str((selected.get("model_client_config") or {}).get("model_name") or "").strip()
+        requested_name = (requested_model_name or "").strip()
+        if requested_name and selected_name != requested_name:
+            raise ValueError(
+                "team model reference name mismatch: "
+                f"expected {requested_name!r}, found {selected_name!r}"
+            )
+        return selected
+
     if isinstance(defaults_raw, list):
         # When the caller (chat page) provides a requested model name, prefer
         # the entry whose ``model_client_config.model_name`` matches it so
@@ -226,12 +280,25 @@ def _resolve_default_model_config(
         # back to the page-selected model instead of the first list item.
         requested = (requested_model_name or "").strip()
         if requested:
+            matches: list[dict[str, Any]] = []
             for item in defaults_raw:
                 if not isinstance(item, dict):
                     continue
                 mcc = item.get("model_client_config") or {}
                 if isinstance(mcc, dict) and mcc.get("model_name") == requested:
-                    return item
+                    matches.append(item)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError(
+                    "requested team model name is ambiguous; provide model_ref: "
+                    f"{requested!r}"
+                )
+            else:
+                logger.warning(
+                    "[TeamConfigLoader] requested model name not found; using first default: %s",
+                    requested,
+                )
 
         for item in defaults_raw:
             if isinstance(item, dict):
@@ -248,12 +315,16 @@ def _build_default_model_dict(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     model_config = _resolve_default_model_config(
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
-    model_client_config = dict(model_config.get("model_client_config", {}))
+    model_client_config = merge_tip_default_headers(
+        dict(model_config.get("model_client_config", {}))
+    )
     model_request_config = dict(model_config.get("model_config_obj", {}))
 
     model_name = model_client_config.get("model_name", "")
@@ -315,21 +386,30 @@ def _build_agent_spec_dict(
     return merged
 
 
-def _normalized_model_identity_text(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def build_model_identity_reference(model_name: Any, client_config: dict[str, Any]) -> str:
-    """Build a credential-free model identity that is independent of list order."""
-    identity = {
-        "api_base": _normalized_model_identity_text(client_config.get("api_base")).rstrip("/"),
-        "model_name": _normalized_model_identity_text(model_name),
-        "provider": _normalized_model_identity_text(client_config.get("client_provider")).lower(),
-    }
-    digest = hashlib.sha256(
-        json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    return f"{_MODEL_IDENTITY_REF_PREFIX}{digest}"
+def _log_resolved_agent_models(agents: dict[str, Any]) -> None:
+    """Log final model identities without exposing credentials."""
+    for agent_key, agent_spec in agents.items():
+        model_spec = agent_spec.get("model") if isinstance(agent_spec, dict) else None
+        if not isinstance(model_spec, dict):
+            continue
+        client_config = model_spec.get("model_client_config")
+        if not isinstance(client_config, dict):
+            client_config = {}
+        request_config = model_spec.get("model_request_config")
+        if not isinstance(request_config, dict):
+            request_config = {}
+        model_name = str(
+            client_config.get("model_name") or request_config.get("model") or ""
+        ).strip()
+        model_ref = str(model_spec.get("ref") or "").strip()
+        if not model_ref and model_name:
+            model_ref = build_model_identity_reference(model_name, client_config)
+        logger.info(
+            "[TeamConfigLoader] member model resolved: member=%s model_name=%s model_ref=%s",
+            agent_key,
+            model_name or "<none>",
+            model_ref or "<none>",
+        )
 
 
 def resolve_model_identity_reference(
@@ -338,9 +418,9 @@ def resolve_model_identity_reference(
 ) -> dict[str, Any]:
     """Resolve one stable model identity to its unique tenant-owned model entry."""
     normalized_ref = str(model_ref or "").strip().lower()
-    digest = normalized_ref.removeprefix(_MODEL_IDENTITY_REF_PREFIX)
+    digest = normalized_ref.removeprefix(MODEL_IDENTITY_REFERENCE_PREFIX)
     if (
-        not normalized_ref.startswith(_MODEL_IDENTITY_REF_PREFIX)
+        not normalized_ref.startswith(MODEL_IDENTITY_REFERENCE_PREFIX)
         or len(digest) != 64
         or any(char not in "0123456789abcdef" for char in digest)
     ):
@@ -390,7 +470,7 @@ def resolve_legacy_index_model_reference(
     client_config = entry.get("model_client_config")
     if not isinstance(client_config, dict):
         raise ValueError(f"team model reference points to invalid entry: {normalized_ref!r}")
-    actual_name = _normalized_model_identity_text(client_config.get("model_name"))
+    actual_name = str(client_config.get("model_name") or "").strip()
     if actual_name != model_name.strip():
         raise ValueError(
             "team model reference name mismatch: "
@@ -405,7 +485,7 @@ def resolve_team_model_reference(
 ) -> dict[str, Any]:
     """Resolve stable identities and legacy index references during transition."""
     normalized_ref = str(model_ref or "").strip()
-    if normalized_ref.lower().startswith(_MODEL_IDENTITY_REF_PREFIX):
+    if normalized_ref.lower().startswith(MODEL_IDENTITY_REFERENCE_PREFIX):
         return resolve_model_identity_reference(normalized_ref, config_base)
     return resolve_legacy_index_model_reference(normalized_ref, config_base)
 
@@ -419,7 +499,9 @@ def _resolve_agent_model_reference(
 
     entry = resolve_team_model_reference(model_raw.get("ref"), config_base)
 
-    model_client_config = deepcopy(entry.get("model_client_config") or {})
+    model_client_config = merge_tip_default_headers(
+        deepcopy(entry.get("model_client_config") or {})
+    )
     actual_name = str(model_client_config.get("model_name") or "").strip()
     model_request_config = deepcopy(entry.get("model_config_obj") or {})
     request_overrides = model_raw.get("model_request_config")
@@ -439,10 +521,12 @@ def _build_agents_config(
     config_base: dict[str, Any],
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
 ) -> dict[str, Any]:
     default_model = _build_default_model_dict(
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
     default_workspace, max_iterations, completion_timeout = _build_agent_defaults()
 
@@ -474,9 +558,15 @@ def _build_agents_config(
                 agent_config = {}
         else:
             agent_config = dict(raw_agent_config) if isinstance(raw_agent_config, dict) else {}
-        referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
-        if referenced_model is not None:
-            agent_config["model"] = referenced_model
+        has_requested_model_ref = bool(
+            requested_model_ref and requested_model_ref.strip()
+        )
+        if has_requested_model_ref:
+            agent_config["model"] = deepcopy(default_model)
+        else:
+            referenced_model = _resolve_agent_model_reference(agent_config.get("model"), config_base)
+            if referenced_model is not None:
+                agent_config["model"] = referenced_model
         # No longer auto-fill all skills from global into each member by default.
         # On spawn, each member workspace exposes only its configured skill links.
         # Team-shared skills are maintained in the team workspace skill view.
@@ -511,6 +601,7 @@ def _build_agents_config(
             completion_timeout=completion_timeout,
         )
 
+    _log_resolved_agent_models(agents)
     return agents
 
 
@@ -673,16 +764,16 @@ def load_team_spec_dict(
     config_base: dict[str, Any] | None = None,
     *,
     requested_model_name: str | None = None,
+    requested_model_ref: str | None = None,
     template_id: str | None = None,
     template_snapshot: dict[str, Any] | None = None,
     strict_template: bool = False,
 ) -> dict[str, Any]:
     """Load team config and build a TeamAgentSpec-compatible dict.
 
-    When ``requested_model_name`` is provided (e.g. from the chat page model
-    selector), team members without an explicit ``modes.team.agents.*.model``
-    fall back to the matching entry in ``models.defaults`` instead of the
-    first list item.
+    ``requested_model_ref`` is authoritative and applies the resolved model to
+    every member. A name-only request remains a compatibility fallback for
+    members without an explicit model.
     """
     if config_base is None:
         config_base = get_config()
@@ -709,6 +800,7 @@ def load_team_spec_dict(
         team_raw,
         config_base,
         requested_model_name=requested_model_name,
+        requested_model_ref=requested_model_ref,
     )
     spec_dict = deepcopy(team_raw)
     spec_dict.pop("enable_team_plan", None)
