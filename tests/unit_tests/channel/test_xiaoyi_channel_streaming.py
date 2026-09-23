@@ -392,3 +392,157 @@ async def test_html_card_on_completed_sticky_uses_message_id() -> None:
         )
     )
     assert captured == [("xiaoyi-session-1", "pc-turn-uuid", "pc-turn-uuid")]
+
+
+def _text_frames(sent: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    frames: list[tuple[str, str]] = []
+    for wrapper in sent:
+        if wrapper.get("msgType") != "agent_response":
+            continue
+        result = _result(wrapper)
+        for part in result.get("artifact", {}).get("parts") or []:
+            if part.get("kind") == "text":
+                frames.append((str(result.get("taskId") or ""), str(part.get("text") or "")))
+    return frames
+
+
+def _track_text_then_artifact(channel: XiaoyiChannel, order: list[str]) -> None:
+    inner = channel._safe_ws_send
+
+    async def tracking_send(url_key: str, payload: dict[str, Any]) -> None:
+        await inner(url_key, payload)
+        result = _result(payload)
+        if result.get("kind") != "artifact-update":
+            return
+        parts = result.get("artifact", {}).get("parts") or []
+        if parts and parts[0].get("kind") == "text":
+            order.append("text")
+
+    channel._safe_ws_send = tracking_send
+
+
+def _seed_held_text(channel: XiaoyiChannel, *, completed: bool = False) -> None:
+    channel._mark_session_active("xiaoyi-session-1", "xiaoyi-task-1")
+    if completed:
+        channel._mark_session_completed("xiaoyi-session-1", "xiaoyi-task-1")
+    channel._text_stream_pending[("xiaoyi-session-1", "xiaoyi-task-1")] = ("用户。", "text")
+
+
+async def _send_tool_phase(channel: XiaoyiChannel) -> None:
+    await channel.send(
+        _artifact_message(
+            EventType.CHAT_TOOL_CALL,
+            {
+                "event_type": "chat.tool_call",
+                "tool_call": {"name": "send_file_to_user"},
+            },
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_flushes_held_text_before_artifact() -> None:
+    channel, sent = _build_channel()
+    order: list[str] = []
+    _track_text_then_artifact(channel, order)
+
+    async def fake_send_file(session_id, task_id, file_info, url_key):
+        order.append("file")
+
+    channel._send_file_response = fake_send_file
+    _seed_held_text(channel)
+    await channel.send(
+        _artifact_message(
+            EventType.CHAT_FILE,
+            {
+                "event_type": "chat.file",
+                "files": [{"path": "/tmp/a.jpg", "name": "a.jpg"}],
+            },
+        )
+    )
+    assert order == ["text", "file"]
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+    await _send_tool_phase(channel)
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+
+
+@pytest.mark.asyncio
+async def test_file_flush_keeps_sticky_task_id_when_completed() -> None:
+    """sticky 已收尾时产物会改挂 msg.id；扣住的正文仍走原 taskId。"""
+    channel, sent = _build_channel()
+    captured: list[str] = []
+
+    async def fake_send_file(session_id, task_id, file_info, url_key):
+        captured.append(task_id)
+
+    channel._send_file_response = fake_send_file
+    _seed_held_text(channel, completed=True)
+    await channel.send(
+        _artifact_message(
+            EventType.CHAT_FILE,
+            {
+                "event_type": "chat.file",
+                "files": [{"path": "/tmp/a.jpg", "name": "a.jpg"}],
+            },
+            message_id="pc-turn-uuid",
+        )
+    )
+    assert captured == ["pc-turn-uuid"]
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+
+
+@pytest.mark.asyncio
+async def test_reference_flushes_held_text_before_artifact() -> None:
+    channel, sent = _build_channel()
+    order: list[str] = []
+    _track_text_then_artifact(channel, order)
+
+    async def fake_send_reference(session_id, task_id, message_id, items, url_key):
+        order.append("reference")
+
+    channel._send_reference_response = fake_send_reference
+    _seed_held_text(channel)
+    await channel.send(
+        _artifact_message(
+            EventType.CHAT_REFERENCE,
+            {
+                "event_type": "chat.reference",
+                "references": [
+                    {
+                        "title": "今日新闻",
+                        "url": "https://example.com/news",
+                        "source": "web",
+                        "name": "news",
+                    }
+                ],
+            },
+        )
+    )
+    assert order == ["text", "reference"]
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+    await _send_tool_phase(channel)
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+
+
+@pytest.mark.asyncio
+async def test_html_card_flushes_held_text_before_artifact() -> None:
+    channel, sent = _build_channel()
+    order: list[str] = []
+    _track_text_then_artifact(channel, order)
+
+    async def fake_send_html(session_id, task_id, message_id, cards_info, url_key):
+        order.append("html_card")
+
+    channel._send_html_card_response = fake_send_html
+    _seed_held_text(channel)
+    await channel.send(
+        _artifact_message(
+            EventType.CHAT_HTML_CARD,
+            {"event_type": "chat.html_card", "url": "https://example.com/card.html"},
+        )
+    )
+    assert order == ["text", "html_card"]
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+    await _send_tool_phase(channel)
+    assert _text_frames(sent) == [("xiaoyi-task-1", "用户。\n")]
+
