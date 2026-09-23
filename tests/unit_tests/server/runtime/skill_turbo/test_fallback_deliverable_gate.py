@@ -9,6 +9,7 @@ validate_fallback_success 校验缝：PPTX 真实存在且交付完成才放行�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,9 +21,6 @@ from jiuwenswarm.server.runtime.skill_turbo.fallback_handler import (
     FallbackContractError,
 )
 from jiuwenswarm.server.runtime.skill_turbo.plan_node import PlanNode
-from jiuwenswarm.server.runtime.skill_turbo.skill_codes.ppt.ppt_gen_root import (
-    PPTGenRootNode,
-)
 
 # 根级兜底子代理仅完成 P4 阶段的输出形态：
 # 校验正文 + 末尾单行 JSON 契约，result 仅含 P4 级字段。
@@ -57,6 +55,37 @@ def _make_handler(contract_output: str) -> DeepAgentFallbackHandler:
     return DeepAgentFallbackHandler(
         adapter, request_id="req-ut", channel_id="officeclaw", session_id="sess-ut"
     )
+
+
+class PPTGenRootNode(PlanNode):
+    """PPT 编排根节点（本地合成：ppt 技能源码已外部化，校验语义对齐技能包实现）。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            plan_name="ppt_gen_root",
+            instruction="PPT生成任务流根节点，串联P0-P10全流程",
+            sub_plans=[],
+            depth=0,
+        )
+
+    async def _execute(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        return {"node": self.plan_name, "status": "ok"}
+
+    def validate_fallback_success(
+        self,
+        inputs: dict[str, Any],
+        contract_result: dict[str, Any],
+    ) -> str | None:
+        merged = {**inputs, **(contract_result or {})}
+        pptx_path = str(merged.get("pptx_path") or "").strip()
+        if not pptx_path or not Path(pptx_path).is_file():
+            return (
+                "root fallback 未产出可交付的 PPTX（pptx_path 缺失或文件不存在），"
+                "仅完成部分阶段不能视为全流程成功"
+            )
+        if str(merged.get("delivery_status") or "").strip() not in ("ok", "partial"):
+            return "root fallback 未完成 P10 交付（delivery_status 缺失或为 failed）"
+        return None
 
 
 class TestPPTRootValidator:
