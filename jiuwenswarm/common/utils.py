@@ -198,6 +198,9 @@ class SafeRotatingFileHandler(BaseRotatingHandler):
     def __init__(self, filename, maxBytes=0, backupCount=0, encoding=None,
                  delay=False, errors=None):
         """Initialize the handler."""
+        # Parallel pytest / repeated setup_logger can race on a shared log root;
+        # ensure the parent exists immediately before opening the file.
+        Path(filename).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         super().__init__(filename, 'a', encoding, errors)
         self.max_bytes = maxBytes
         self.backup_count = backupCount
