@@ -3970,14 +3970,7 @@ class SkillManager:
             }
 
         origin = str(params.get("origin") or "").strip()
-        if origin:
-            matches = [
-                record for record in self.list_skill_installations()
-                if str(record.get("origin") or "").strip() == origin
-            ]
-            installation = matches[0] if len(matches) == 1 else None
-        else:
-            installation = self._find_skill_installation(name=name)
+        installation = self._find_web_uninstall_installation(name=name, origin=origin)
         if installation is None:
             return {
                 "success": False,
@@ -6180,6 +6173,50 @@ class SkillManager:
         source = str(dto.get("source") or "").strip()
         if source:
             payload["source"] = source
+
+    def _find_web_uninstall_installation(
+        self,
+        *,
+        name: str,
+        origin: str,
+    ) -> dict[str, Any] | None:
+        """定位网页卸载要删的安装记录。
+
+        ``installed_plugins.origin`` 精确命中优先。旧 skillhub 记录把 origin
+        只写在 ``local_skills`` 上，插件行没有 origin；这时仅当本地记录的 name
+        与请求一致、且插件行 origin 为空时才认领，并带上本地 origin 供后续按身份删除。
+        插件行已有别的 origin，或 origin 在两本账里都不存在时，不按 name 回退。
+        """
+        if not origin:
+            return self._find_skill_installation(name=name)
+        matches = [
+            record for record in self.list_skill_installations()
+            if str(record.get("origin") or "").strip() == origin
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return None
+        local_matches = [
+            record for record in self.get_local_skills()
+            if isinstance(record, dict) and str(record.get("origin") or "").strip() == origin
+        ]
+        if len(local_matches) != 1:
+            return None
+        if str(local_matches[0].get("name") or "").strip() != name:
+            return None
+        # G.EXP.04: 多条件过滤不用跨行推导式，改为显式循环。
+        candidates = []
+        for record in self.list_skill_installations():
+            record_name = str(record.get("name") or "").strip()
+            record_origin = str(record.get("origin") or "").strip()
+            if record_name == name and not record_origin:
+                candidates.append(record)
+        if len(candidates) != 1:
+            return None
+        resolved = dict(candidates[0])
+        resolved["origin"] = origin
+        return resolved
 
     def _find_skill_installation(
         self,
