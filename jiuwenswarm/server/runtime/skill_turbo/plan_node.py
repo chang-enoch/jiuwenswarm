@@ -14,6 +14,12 @@ PlanNode 与 skill code 的契约 (v1):
 8. 节点失败应直接 raise 异常，框架会自动触发 fallback，不要在节点内吞异常。
 9. 每个 skill_code 必须有一个入口文件，且文件中必须暴露 root: PlanNode。
 10. plan_name 在同一 skill 内应唯一，便于日志、trace 和 fallback 定位节点。
+11. 编排类节点（串联多个阶段/子流程、有终端交付物）应覆盖
+    validate_fallback_success(inputs, contract_result) -> str | None：引擎在
+    fallback 契约自证通过后、结果写回 inputs 前强制调用，返回 str（拒绝原因）
+    触发终止性降级，返回 None 放行；实现异常同样 fail-closed。基类默认放行。
+    参考实现：relay-claw
+    office-claw-skills/pptx-craft/turbo/turbo_codes/ppt/ppt_gen_root.py。
 """
 
 from __future__ import annotations

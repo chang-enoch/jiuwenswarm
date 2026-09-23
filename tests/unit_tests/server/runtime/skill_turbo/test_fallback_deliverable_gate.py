@@ -9,9 +9,7 @@ validate_fallback_success 校验缝：PPTX 真实存在且交付完成才放行�
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -21,71 +19,13 @@ from jiuwenswarm.server.runtime.skill_turbo.fallback_handler import (
     FallbackContractError,
 )
 from jiuwenswarm.server.runtime.skill_turbo.plan_node import PlanNode
-
-# 根级兜底子代理仅完成 P4 阶段的输出形态：
-# 校验正文 + 末尾单行 JSON 契约，result 仅含 P4 级字段。
-_INCIDENT_OUTPUT = (
-    "校验全部通过：✅ 无 chapter/section/agenda 结构页；✅ 研究需求=13 页（P2–P14），"
-    "与 page_count=13 完全一致；✅ P1=cover、P15=ending；✅ 每页字段齐全。\n"
-    "\n"
-    "**本轮 fallback 完成情况总结**\n"
-    "\n"
-    "本次替代失败的 p4_content_plan / p4_3_outline_gen 链路，已修复根因并完成 P4 产物。\n"
-    "以下字段可直接回写 inputs 供下游（P5 页面内容生成）消费：\n"
-    "\n"
-    '`{"success": true, "result": {"outline_path": '
-    '"C:/ws/20260917151247/output/20260917_151258_000/outline.md", '
-    '"p4_outline_gen_status": "completed", "p4_validate_status": "passed", '
-    '"content_plan_status": "completed", "total_pages": 15, "content_pages": 13}}`'
+from tests.unit_tests.server.runtime.skill_turbo._ppt_gate_fixture import (
+    INCIDENT_FAILURE,
+    INCIDENT_INPUTS,
+    INCIDENT_OUTPUT,
+    PPTGenRootNode,
+    make_handler,
 )
-
-_INCIDENT_INPUTS = {
-    "output_dir": "C:/ws/20260917151247/output/20260917_151258_000",
-    "outline_path": "C:/ws/20260917151247/output/20260917_151258_000/outline.md",
-    "topic": "糖尿病防治指南",
-    "p4_validate_status": "failed",
-}
-
-_FAILURE = "fallback 未达成节点 p4_content_plan 契约: fallback 输出未包含 JSON 契约声明"
-
-
-def _make_handler(contract_output: str) -> DeepAgentFallbackHandler:
-    adapter = MagicMock()
-    adapter.spawn_fallback = AsyncMock(return_value=contract_output)
-    return DeepAgentFallbackHandler(
-        adapter, request_id="req-ut", channel_id="officeclaw", session_id="sess-ut"
-    )
-
-
-class PPTGenRootNode(PlanNode):
-    """PPT 编排根节点（本地合成：ppt 技能源码已外部化，校验语义对齐技能包实现）。"""
-
-    def __init__(self) -> None:
-        super().__init__(
-            plan_name="ppt_gen_root",
-            instruction="PPT生成任务流根节点，串联P0-P10全流程",
-            sub_plans=[],
-            depth=0,
-        )
-
-    async def _execute(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        return {"node": self.plan_name, "status": "ok"}
-
-    def validate_fallback_success(
-        self,
-        inputs: dict[str, Any],
-        contract_result: dict[str, Any],
-    ) -> str | None:
-        merged = {**inputs, **(contract_result or {})}
-        pptx_path = str(merged.get("pptx_path") or "").strip()
-        if not pptx_path or not Path(pptx_path).is_file():
-            return (
-                "root fallback 未产出可交付的 PPTX（pptx_path 缺失或文件不存在），"
-                "仅完成部分阶段不能视为全流程成功"
-            )
-        if str(merged.get("delivery_status") or "").strip() not in ("ok", "partial"):
-            return "root fallback 未完成 P10 交付（delivery_status 缺失或为 failed）"
-        return None
 
 
 class TestPPTRootValidator:
@@ -97,7 +37,7 @@ class TestPPTRootValidator:
             "p4_validate_status": "passed",
             "content_plan_status": "completed",
         }
-        reason = root.validate_fallback_success(dict(_INCIDENT_INPUTS), contract_result)
+        reason = root.validate_fallback_success(dict(INCIDENT_INPUTS), contract_result)
         assert reason is not None
         assert "PPTX" in reason
 
@@ -157,9 +97,9 @@ class TestPPTRootValidator:
 class TestStreamFallbackHonorsValidator:
     async def test_incident_false_success_rejected(self):
         """流式：根级 fallback 虚假 success → FallbackContractError。"""
-        handler = _make_handler(_INCIDENT_OUTPUT)
+        handler = make_handler(INCIDENT_OUTPUT)
         root = PPTGenRootNode()
-        inputs = dict(_INCIDENT_INPUTS)
+        inputs = dict(INCIDENT_INPUTS)
 
         chunks: list[dict[str, Any]] = []
         with pytest.raises(FallbackContractError) as excinfo:
@@ -168,7 +108,7 @@ class TestStreamFallbackHonorsValidator:
                     node_name="ppt_gen_root",
                     instruction="PPT生成任务流根节点，串联P0-P10全流程",
                     inputs=inputs,
-                    error=RuntimeError(_FAILURE),
+                    error=RuntimeError(INCIDENT_FAILURE),
                     parent_session=None,
                     result_validator=root.validate_fallback_success,
                 )
@@ -183,7 +123,7 @@ class TestStreamFallbackHonorsValidator:
             "fallback.finished",
         ]
         # 契约字段不得回写共享上下文（与契约失败路径一致）
-        assert inputs == _INCIDENT_INPUTS
+        assert inputs == INCIDENT_INPUTS
 
     async def test_truthful_delivery_accepted_and_merged(self, tmp_path):
         pptx = tmp_path / "diabetes.pptx"
@@ -193,7 +133,7 @@ class TestStreamFallbackHonorsValidator:
             f'`{{"success": true, "result": {{"pptx_path": "{pptx.as_posix()}", '
             '"delivery_status": "ok"}}}`'
         )
-        handler = _make_handler(output)
+        handler = make_handler(output)
         root = PPTGenRootNode()
         inputs = {"topic": "糖尿病防治指南"}
 
@@ -204,7 +144,7 @@ class TestStreamFallbackHonorsValidator:
                     node_name="ppt_gen_root",
                     instruction="PPT生成任务流根节点，串联P0-P10全流程",
                     inputs=inputs,
-                    error=RuntimeError(_FAILURE),
+                    error=RuntimeError(INCIDENT_FAILURE),
                     parent_session=None,
                     result_validator=root.validate_fallback_success,
                 )
@@ -220,9 +160,9 @@ class TestStreamFallbackHonorsValidator:
 
 class TestNonStreamFallbackHonorsValidator:
     async def test_incident_false_success_rejected(self):
-        handler = _make_handler(_INCIDENT_OUTPUT)
+        handler = make_handler(INCIDENT_OUTPUT)
         root = PPTGenRootNode()
-        inputs = dict(_INCIDENT_INPUTS)
+        inputs = dict(INCIDENT_INPUTS)
 
         with pytest.raises(FallbackContractError) as excinfo:
             await handler.fallback(
@@ -230,18 +170,18 @@ class TestNonStreamFallbackHonorsValidator:
                     node_name="ppt_gen_root",
                     instruction="PPT生成任务流根节点，串联P0-P10全流程",
                     inputs=inputs,
-                    error=RuntimeError(_FAILURE),
+                    error=RuntimeError(INCIDENT_FAILURE),
                     parent_session=None,
                     result_validator=root.validate_fallback_success,
                 )
             )
 
         assert "PPTX" in str(excinfo.value)
-        assert inputs == _INCIDENT_INPUTS
+        assert inputs == INCIDENT_INPUTS
 
     async def test_validator_crash_fails_closed(self):
         """校验器自身异常也必须拒绝（fail-closed），不能放行虚假成功。"""
-        handler = _make_handler(_INCIDENT_OUTPUT)
+        handler = make_handler(INCIDENT_OUTPUT)
         inputs = {"topic": "x"}
 
         def _crashing_validator(
@@ -255,7 +195,7 @@ class TestNonStreamFallbackHonorsValidator:
                     node_name="ppt_gen_root",
                     instruction="PPT生成任务流根节点，串联P0-P10全流程",
                     inputs=inputs,
-                    error=RuntimeError(_FAILURE),
+                    error=RuntimeError(INCIDENT_FAILURE),
                     parent_session=None,
                     result_validator=_crashing_validator,
                 )
@@ -267,7 +207,7 @@ class TestNonStreamFallbackHonorsValidator:
         """校验器抛出 AbortError（HITL 中断）必须原样上抛，不得吞成契约失败。"""
         from jiuwenswarm.server.runtime.skill_turbo.plan_node import AbortError
 
-        handler = _make_handler(_INCIDENT_OUTPUT)
+        handler = make_handler(INCIDENT_OUTPUT)
         inputs = {"topic": "x"}
 
         def _aborting_validator(
@@ -281,7 +221,7 @@ class TestNonStreamFallbackHonorsValidator:
                     node_name="ppt_gen_root",
                     instruction="PPT生成任务流根节点，串联P0-P10全流程",
                     inputs=inputs,
-                    error=RuntimeError(_FAILURE),
+                    error=RuntimeError(INCIDENT_FAILURE),
                     parent_session=None,
                     result_validator=_aborting_validator,
                 )
