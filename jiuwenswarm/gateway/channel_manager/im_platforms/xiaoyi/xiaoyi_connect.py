@@ -1038,9 +1038,15 @@ class XiaoyiChannel(BaseChannel):
         # mode 门控跳过——send_file_to_user 的 chat.file 被静默丢弃（且工具侧
         # 已标记已发送，重试被去重，用户永远收不到文件）。
         if msg.event_type == EventType.CHAT_FILE:
+            stream_task_id = team_task_key[1]
             task_id = self._artifact_delivery_task_id(session_id, task_id, msg)
             files = msg.payload.get("files", {}) if isinstance(msg.payload, dict) else {}
             if files:
+                # 产物会插进同一条流：先把扣住的最后一片正文收尾，避免文件卡片
+                # 插在半句话中间（手机按到达顺序拼接，尾巴会粘到最终答复前面）。
+                await self._flush_text_stream_segment(
+                    session_id, stream_task_id, team_task_key, reason="before_artifact"
+                )
                 for file_info in files:
                     # Convert file path to file info dict if it's a string
                     if isinstance(file_info, dict):
@@ -1067,10 +1073,14 @@ class XiaoyiChannel(BaseChannel):
 
         # Handle chat.reference（手机参考来源卡片；须在 non_user_visible SKIPPED 之前）
         if msg.event_type == EventType.CHAT_REFERENCE:
+            stream_task_id = team_task_key[1]
             task_id = self._artifact_delivery_task_id(session_id, task_id, msg)
             payload = msg.payload if isinstance(msg.payload, dict) else {}
             refs = coerce_references(payload.get("references"))
             if refs:
+                await self._flush_text_stream_segment(
+                    session_id, stream_task_id, team_task_key, reason="before_artifact"
+                )
                 message_id = str(msg.id or task_id or "")
                 a2a_items = build_a2a_reference_items(refs)
                 for url_key, ws in self._ws_connections.items():
@@ -1092,6 +1102,7 @@ class XiaoyiChannel(BaseChannel):
 
         # Handle chat.html_card event（与 chat.file 同理：两种 mode 都要处理）
         if msg.event_type == EventType.CHAT_HTML_CARD:
+            stream_task_id = team_task_key[1]
             task_id = self._artifact_delivery_task_id(session_id, task_id, msg)
             payload = msg.payload if isinstance(msg.payload, dict) else {}
             cards_info = payload.get("cardsInfo")
@@ -1106,6 +1117,9 @@ class XiaoyiChannel(BaseChannel):
                         }
                     ]
             if cards_info:
+                await self._flush_text_stream_segment(
+                    session_id, stream_task_id, team_task_key, reason="before_artifact"
+                )
                 message_id = str(msg.id or task_id or "")
                 for url_key, ws in self._ws_connections.items():
                     if ws:
