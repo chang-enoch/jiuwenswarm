@@ -55,6 +55,8 @@ def _build_skill_turbo_guide_text(language: str, skill_names: list[str]) -> str:
 
 若 `skill_acceleration_exec` 返回成功（产物已生成），**禁止**再用 `skill_tool` 重复同一任务——直接向用户总结结果即可。若 `skill_acceleration_exec` 返回失败或未处理，**必须**继续用 `skill_tool` 加载对应技能走标准流程完成用户任务。
 
+⏸️ **暂停不是失败**：当 `skill_acceleration_exec` 暂停等待用户回答（返回"技能加速已暂停"类信息，或向用户弹出补充问题卡片）时，这是任务流的正常提问环节。**必须停止后续工具调用，等待用户回答**；用户回答后加速通道会自动从断点继续。**禁止**把暂停当成失败而改走 `skill_tool` 标准流程，那会丢弃已完成的阶段并从头重跑。
+
 🚫 **选区/编辑已有 PPT 排除（重要例外，仅适用于 PPT 类任务）**：当用户消息出现"{keywords}"等选区字段，或意图是**编辑、修改已有 PPT 文件的局部内容**（如改字体颜色、改某段文案、调某页样式、替换某区域）而非从零生成整套演示文稿时，**禁止调用 `skill_acceleration_exec`**——它只会从流水线 Stage 1 重新生成全新 PPT，无法复用已有文件做局部修改。此类请求请改用 `skill_tool` 加载 pptx-craft 标准流程（支持编辑已有 PPT），或直接用 `edit_file`/读写 pptx 的普通工具完成局部修改。本条仅约束 PPT 局部编辑类请求，不适用于从零生成新产物的任务。
 """
     names = ", ".join(skill_names)
@@ -65,6 +67,8 @@ def _build_skill_turbo_guide_text(language: str, skill_names: list[str]) -> str:
 If you have already mistakenly called `skill_tool` to load the corresponding skill body (i.e. this does **NOT** fall under the exception above - it was just a misfire), **you MUST still call `skill_acceleration_exec` immediately** - do NOT abandon the acceleration channel because "SKILL.md is already loaded" or "research is already done."
 
 If `skill_acceleration_exec` returns success (the artifact is already generated), you are **forbidden** from calling `skill_tool` again for the same task — just summarize the result to the user. If `skill_acceleration_exec` returns failure or is not handled, you **MUST** fall back to `skill_tool` to load the corresponding skill and complete the user's task via the standard flow.
+
+⏸️ **Pause is NOT failure**: When `skill_acceleration_exec` pauses to wait for the user's answer (returning a "skill acceleration paused" style message, or showing a follow-up question card to the user), that is a normal clarification step of the pipeline. You **MUST stop making further tool calls and wait for the user's answer**; the acceleration channel will automatically resume from the breakpoint once answered. **DO NOT** treat the pause as a failure and switch to the `skill_tool` standard flow — that would discard completed stages and rerun from scratch.
 
 🚫 **PPT region/edit-existing exclusion (critical exception, PPT tasks only)**: When the user message contains selection fields such as "{keywords}", or the intent is to **edit or modify a local part of an existing PPT file** (e.g. change font color, rewrite a paragraph, restyle a slide, replace a region) rather than generating a full deck from scratch, you are **FORBIDDEN from calling `skill_acceleration_exec`** — it only regenerates a brand-new PPT from pipeline Stage 1 and cannot reuse an existing file for local edits. For such requests, use `skill_tool` to load the pptx-craft standard flow (which supports editing existing PPTs), or directly use `edit_file` / pptx read-write tools to make the local change. This clause applies ONLY to local edits of existing PPTs, not to creating new artifacts from scratch.
 """

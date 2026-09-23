@@ -289,13 +289,14 @@ PPT_TURBO_UNCONFIRMED_FINISH_TEXT = (
 )
 _SKILL_TURBO_ARTIFACT_SUMMARY_MARKER = "[SkillAccelerationExec 产物摘要]"
 
-# 工具返回值会先被 AbilityManager 收成 ToolMessage。after_tool_call 再用
-# StreamEventRail._tool_interrupted_message（随 prompt 语言中/英）覆写 tool_msg。
-# _fix_incomplete_tool_context 认 rail 文案 + 中英文 legacy 模板，故本常量取中文
-# 默认句即可。禁止返回 {'success': False, 'error': '任务已暂停等待审批'}：
-# str(dict) 进 ToolMessage 后模型会当成加速失败并回退 skill_tool。
+# HITL 暂停时工具不再返回本占位文案（改返回 _SKILL_TURBO_HITL_RESULT_KEY 标记
+# dict，见 build_skill_turbo_hitl_result）。本常量保留两个用途：
+# 1) after_tool_call 改写后的 tool_msg 文案基准（"已暂停等待回答"，非"被用户打断"，
+#    防止外层模型把暂停误读为失败而放弃加速通道）；
+# 2) _fix_incomplete_tool_context 的中断占位识别模板。
 _SKILL_TURBO_HITL_PLACEHOLDER = (
-    "[工具执行被中断] 工具 skill_acceleration_exec 执行过程中被用户打断，没有执行结果。"
+    "[技能加速已暂停] 工具 skill_acceleration_exec 正在等待用户回答，"
+    "回答后将自动继续执行，没有失败。"
 )
 
 # ── 待在外层 tool_result 之后发出的 PPT 交付总结 ──
@@ -467,7 +468,14 @@ def reset_skill_turbo_outer_todo_active(token: Token) -> None:
 # skill_turbo_tools catch AbortError 后提取 ToolInterruptException 存入此 ContextVar，
 # StreamEventRail.after_tool_call 读取后改写 ctx.inputs.tool_result 为 TIE，
 # 使 harness 原生 HITL 机制（build_interrupt_state）检测并触发暂停。
+# ContextVar 依赖工具体与 after_tool_call 同执行上下文，跨上下文时不可见，
+# 仅作为旧路径兜底；主信号走工具返回值中的 _SKILL_TURBO_HITL_RESULT_KEY 标记。
 _skill_turbo_hitl_tic: ContextVar[Any] = ContextVar("skill_turbo_hitl_tic", default=None)
+
+# HITL 暂停信号随工具返回值传递：SDK tracer 在工具结束时会对含返回值的
+# span 执行 copy.deepcopy，故标记值必须是可深拷贝的纯数据（dict/JSON），
+# 禁止直接返回 ToolInterruptException 等异常对象（无法按 SDK 方式重建）。
+_SKILL_TURBO_HITL_RESULT_KEY = "__skill_turbo_hitl__"
 
 
 def set_skill_turbo_hitl_tic(tic: Any) -> Token:
@@ -476,6 +484,13 @@ def set_skill_turbo_hitl_tic(tic: Any) -> Token:
 
 def get_skill_turbo_hitl_tic() -> Any:
     return _skill_turbo_hitl_tic.get()
+
+
+def build_skill_turbo_hitl_result(tic: Any) -> dict[str, Any]:
+    """构造随工具返回值传递的 HITL 暂停标记（deepcopy 安全的纯数据）。"""
+    request = getattr(tic, "request", None)
+    dump = request.model_dump(mode="json") if request is not None else {}
+    return {_SKILL_TURBO_HITL_RESULT_KEY: True, "request": dump}
 
 
 def set_pending_ppt_delivery_summary(summary: str) -> None:
@@ -1165,7 +1180,7 @@ async def skill_turbo(query: str) -> dict[str, Any] | str:
             )
             set_skill_turbo_hitl_tic(tic)
             hitl_interrupt = True
-            return _SKILL_TURBO_HITL_PLACEHOLDER
+            return build_skill_turbo_hitl_result(tic)
         # Fallback: AbortError 无 ToolInterruptException cause，返回错误
         logger.warning("[SkillTurboTool] AbortError without ToolInterruptException cause")
         return _wrap_skill_turbo_result(

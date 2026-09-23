@@ -652,15 +652,24 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         content: str,
         tool_name: str,
     ) -> bool:
+        from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+            _SKILL_TURBO_HITL_PLACEHOLDER,
+        )
+
         legacy_templates = [
             f"[Tool execution interrupted] Tool {tool_name} was interrupted by user during execution, "
             f"no result available.",
             f"[Tool interrupted] Tool {tool_name} was interrupted by the user and has no result.",
             f"[工具执行被中断] 工具 {tool_name} 执行过程中被用户打断，没有执行结果。",
+            # HITL 暂停 tool_msg（skill_acceleration_exec 专用文案）
+            _SKILL_TURBO_HITL_PLACEHOLDER
+            if tool_name == "skill_acceleration_exec"
+            else "",
         ]
         normalized_content = self._normalize_tool_interrupt_text(content)
         return any(
-            normalized_content == self._normalize_tool_interrupt_text(template)
+            template
+            and normalized_content == self._normalize_tool_interrupt_text(template)
             for template in legacy_templates
         )
 
@@ -1203,47 +1212,79 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         if tc_id:
             self._inflight_tool_calls.pop(tc_id, None)
 
-        # SkillTurbo HITL: skill_turbo_tools 在 ContextVar 存了 ToolInterruptException，
-        # 此处改写 ctx.inputs.tool_result 为 TIE，使 harness 原生 HITL 机制检测并暂停。
-        if self._skill_turbo_adapter is not None:
-            try:
-                from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
-                    get_skill_turbo_hitl_tic,
-                    set_skill_turbo_hitl_tic,
-                )
-                _skill_turbo_tic = get_skill_turbo_hitl_tic()
-                if _skill_turbo_tic is not None:
-                    set_skill_turbo_hitl_tic(None)
-                    if isinstance(ctx.inputs, ToolCallInputs):
-                        from openjiuwen.core.single_agent.interrupt.exception import (
-                            ToolInterruptException,
+        # SkillTurbo HITL：主信号是工具返回值里的 __skill_turbo_hitl__ 标记
+        # （deepcopy 安全、随返回值穿越任何执行上下文），ContextVar 中的
+        # ToolInterruptException 作为旧路径兜底。此处把 ctx.inputs.tool_result
+        # 改写为 TIE，使 harness 原生 HITL 机制（build_interrupt_state）检测并暂停。
+        # 暂停处理不依赖 _skill_turbo_adapter 绑定：适配器缺失时同样必须暂停，
+        # 否则外层模型会把暂停占位当失败而放弃加速通道。
+        # （token 复位已在函数入口 reset_skill_turbo_context 统一完成。）
+        try:
+            from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+                _SKILL_TURBO_HITL_PLACEHOLDER,
+                _SKILL_TURBO_HITL_RESULT_KEY,
+                get_skill_turbo_hitl_tic,
+                set_skill_turbo_hitl_tic,
+            )
+            _hitl_request_dump: dict[str, Any] | None = None
+            _raw_tool_result = ctx.inputs.tool_result
+            if (
+                isinstance(_raw_tool_result, dict)
+                and _raw_tool_result.get(_SKILL_TURBO_HITL_RESULT_KEY)
+                and isinstance(_raw_tool_result.get("request"), dict)
+            ):
+                _hitl_request_dump = _raw_tool_result["request"]
+            _skill_turbo_tic = (
+                get_skill_turbo_hitl_tic() if _hitl_request_dump is None else None
+            )
+            if _hitl_request_dump is not None or _skill_turbo_tic is not None:
+                set_skill_turbo_hitl_tic(None)
+                if isinstance(ctx.inputs, ToolCallInputs):
+                    from openjiuwen.core.single_agent.interrupt.exception import (
+                        ToolInterruptException,
+                    )
+                    from openjiuwen.core.single_agent.interrupt.response import (
+                        ToolCallInterruptRequest,
+                    )
+                    if _hitl_request_dump is not None:
+                        _hitl_request: Any = ToolCallInterruptRequest.model_validate(
+                            _hitl_request_dump
                         )
-                        new_tic = ToolInterruptException(
-                            request=_skill_turbo_tic.request,
-                            tool_call=ctx.inputs.tool_call,
+                        _original_tcid = str(_hitl_request.tool_call_id or "?")
+                    else:
+                        _hitl_request = _skill_turbo_tic.request
+                        _original_tcid = (
+                            _skill_turbo_tic.tool_call.id
+                            if _skill_turbo_tic.tool_call
+                            else "?"
                         )
-                        ctx.inputs.tool_result = new_tic
-                        ctx.inputs.tool_msg = ToolMessage(
-                            content=self._tool_interrupted_message(
-                                ctx.inputs.tool_name or "skill_acceleration_exec"
-                            ),
-                            tool_call_id=ctx.inputs.tool_call.id,
-                        )
+                    new_tic = ToolInterruptException(
+                        request=_hitl_request,
+                        tool_call=ctx.inputs.tool_call,
+                    )
+                    ctx.inputs.tool_result = new_tic
+                    ctx.inputs.tool_msg = ToolMessage(
+                        content=_SKILL_TURBO_HITL_PLACEHOLDER,
+                        tool_call_id=ctx.inputs.tool_call.id,
+                    )
                     logger.info(
                         "[StreamEventRail] SkillTurbo HITL: rewrote tool_result to TIE. "
-                        "original_tcid=%s harness_tcid=%s",
-                        _skill_turbo_tic.tool_call.id if _skill_turbo_tic.tool_call else "?",
-                        ctx.inputs.tool_call.id if isinstance(ctx.inputs, ToolCallInputs) else "?",
+                        "source=%s original_tcid=%s harness_tcid=%s",
+                        "result_marker" if _hitl_request_dump is not None else "contextvar",
+                        _original_tcid,
+                        ctx.inputs.tool_call.id
+                        if isinstance(ctx.inputs, ToolCallInputs)
+                        else "?",
                     )
                     # 卡片由 harness __interaction__ 转换统一发出（外层
                     # tool_call_id，harness 恢复按同一 id 对齐）；此处不再主动
                     # emit，避免同一次中断发出两张 ask_user 卡片。
                     return  # 跳过 _emit_tool_result：中断态无结果可发
-            except Exception:
-                logger.debug(
-                    "[StreamEventRail] skill_turbo HITL rewrite failed",
-                    exc_info=True,
-                )
+        except Exception:
+            logger.warning(
+                "[StreamEventRail] skill_turbo HITL rewrite failed",
+                exc_info=True,
+            )
 
         if (
             str(getattr(tc, "name", "") or "").strip() == "deepresearch_execute"
