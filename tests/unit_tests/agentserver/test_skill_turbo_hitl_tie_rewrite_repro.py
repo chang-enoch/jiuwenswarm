@@ -82,6 +82,15 @@ class _HitlTool(Tool):
 
 
 class _HitlModel:
+    """Fake model: always emits the HITL tool call.
+
+    ImageModalityProbe may consume ``invoke`` calls before the ReAct loop;
+    using a call counter would misfire on CI. Always returning the tool call
+    is safe: if the TIE rewrite works, the loop pauses on the first tool
+    execution (result_type=interrupt); if it fails, the loop exhausts
+    max_iterations (result_type=error) — the assertion correctly fails.
+    """
+
     def __init__(self):
         self.model_client_config = ModelClientConfig(
             client_provider="OpenAI", api_key="fake", api_base="https://fake.invalid"
@@ -89,33 +98,28 @@ class _HitlModel:
         self.model_config = ModelRequestConfig(model_name="fake")
         self.calls = []
 
-    def _respond(self):
+    def _tool_call_message(self):
         from openjiuwen.core.foundation.llm import AssistantMessage
 
-        if len(self.calls) == 1:
-            return AssistantMessage(
-                content="",
-                tool_calls=[
-                    ToolCall(
-                        id="call-hitl-1",
-                        type="function",
-                        name=TOOL_NAME,
-                        arguments="{}",
-                    )
-                ],
-            )
-        return AssistantMessage(content="fallback to standard flow")
+        return AssistantMessage(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="call-hitl-1",
+                    type="function",
+                    name=TOOL_NAME,
+                    arguments="{}",
+                )
+            ],
+        )
 
     async def invoke(self, messages, **kwargs):
         self.calls.append(list(messages))
-        return self._respond()
+        return self._tool_call_message()
 
     async def stream(self, messages, **kwargs):
-        msg = await self.invoke(messages, **kwargs)
-        if msg.tool_calls:
-            yield AssistantMessageChunk(content="", tool_calls=msg.tool_calls)
-        else:
-            yield AssistantMessageChunk(content=msg.content)
+        self.calls.append(list(messages))
+        yield AssistantMessageChunk(content="", tool_calls=self._tool_call_message().tool_calls)
 
 
 @pytest.mark.asyncio
