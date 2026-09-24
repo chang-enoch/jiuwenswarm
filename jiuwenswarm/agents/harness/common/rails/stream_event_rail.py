@@ -1212,7 +1212,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
 
                 set_skill_turbo_hitl_tic(None)
             except Exception:
-                pass
+                logger.debug("[StreamEventRail] stale TIC cleanup on early return failed", exc_info=True)
             return
 
         tc = ctx.inputs.tool_call
@@ -1239,12 +1239,12 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             _tool_name = str(getattr(ctx.inputs, "tool_name", "") or "")
             _hitl_request_dump: dict[str, Any] | None = None
             _raw_tool_result = ctx.inputs.tool_result
-            if (
+            _is_hitl_marker = (
                 _tool_name == "skill_acceleration_exec"
                 and isinstance(_raw_tool_result, dict)
-                and _raw_tool_result.get(_SKILL_TURBO_HITL_RESULT_KEY)
-                and isinstance(_raw_tool_result.get("request"), dict)
-            ):
+                and bool(_raw_tool_result.get(_SKILL_TURBO_HITL_RESULT_KEY))
+            )
+            if _is_hitl_marker and isinstance(_raw_tool_result.get("request"), dict):
                 _hitl_request_dump = _raw_tool_result["request"]
             _skill_turbo_tic = (
                 get_skill_turbo_hitl_tic() if _hitl_request_dump is None else None
