@@ -50,6 +50,7 @@ class RedisConfig:
     host: str = "localhost"
     port: int = 6379
     password: str | None = None
+    username: str | None = None
     db: int = 0
     key_prefix: str = "jiuwenswarm:"
     pool_size: int = 10
@@ -85,6 +86,7 @@ class RedisConfig:
         if kp and not kp.endswith(":"):
             kp = f"{kp}:"
         pw = cls._normalize_password(m.get("password"))
+        username = cls._normalize_password(m.get("username"))
         mode = str(m.get("mode") or "standalone").strip().lower()
         if mode not in ("standalone", "cluster"):
             mode = "standalone"
@@ -105,6 +107,7 @@ class RedisConfig:
             host=host,
             port=port,
             password=pw,
+            username=username,
             db=_coerce_int(m.get("db"), 0),
             key_prefix=kp,
             pool_size=max(1, _coerce_int(m.get("pool_size"), 10)),
@@ -157,6 +160,7 @@ class RedisClient:
                 or [ClusterNode(self._cfg.host, self._cfg.port)]
             self._redis = RedisCluster(
                 startup_nodes=nodes,
+                username=self._cfg.username,
                 password=self._cfg.password,
                 decode_responses=True,
                 socket_connect_timeout=self._cfg.connect_timeout,
@@ -168,7 +172,7 @@ class RedisClient:
         self._pool = redis.ConnectionPool(
             host=self._cfg.host,
             port=self._cfg.port,
-            username=None,
+            username=self._cfg.username,
             password=self._cfg.password,
             db=self._cfg.db,
             decode_responses=True,

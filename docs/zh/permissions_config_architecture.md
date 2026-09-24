@@ -17,7 +17,7 @@
 flowchart TB
     subgraph sources [配置来源]
         YAML["config.yaml::permissions 全局段<br/>标准版未命中 agents[id]"]
-        AGENTS["config.yaml::permissions.agents[id]<br/>标准版精确命中整段替换"]
+        AGENTS["config.yaml::permissions.agents[id]<br/>稀疏覆盖∪包内模板"]
         TPL[("permissions_template.body<br/>企业 Agent 级基线")]
         OVL["session overlay<br/>企业会话内存叠加"]
     end
@@ -76,14 +76,16 @@ flowchart TB
 | 函数 | 职责 |
 | --- | --- |
 | `setup_permissions_agent_base()` | 绑定当前 Task 的 Agent 级 body（企业模板或标准版 yaml `agents[id]`） |
-| `resolve_yaml_agent_permissions_body()` | 标准版精确匹配 `permissions.agents[agent_id]`；企业版恒为未命中 |
+| `resolve_yaml_agent_permissions_body()` | 命中覆盖或种子 id：返回「包内模板 ∪ 稀疏覆盖」；其它未命中 / 企业版为 `None` |
+| `get_shipped_template_permissions_config()` | 包内 `resources/config.yaml` 的 permissions 全局段（剥掉 `agents`），作 agent 缺省底 |
+| `get_yaml_agent_permissions_overlay()` | 标准版返回 yaml 稀疏覆盖段（供落盘）；未命中 / 企业版为 `None` |
 | `resolve_permissions_body_from_enterprise()` | 从企业配置 `permissions` 槽位取首个启用模板 body |
 | `get_global_permissions_config()` | 标准版全局策略段（yaml 去掉 `agents`），不读 Agent base |
 | `get_base_permissions_config()` | Agent base 优先，否则全局 yaml（**不再读实例级 permissions_config 表**） |
 | `get_effective_permissions_config()` | 企业版：base + 会话 overlay；其他：yaml/base |
 | `apply_permissions_config_payload()` | 刷新进程缓存（显式 body 或 yaml fallback） |
 | `reload_permissions_from_gateway_db()` | 冷启动：仅刷新为 yaml fallback（模板 / `agents[id]` 在请求路径注入） |
-| `persist_permissions_mutate()` | 标准版：`persist_target_agent_id` 命中则写 `agents[id]`，否则写全局并保留 `agents`；企业 session 写 overlay；企业 base 仅内存 |
+| `persist_permissions_mutate()` | 标准版：`persist_target_agent_id` 命中则写稀疏 `agents[id]`（种子首次建空覆盖，只落 mutate 字段）；否则写全局并保留已有 `agents`（不自动 seed）；企业 session 写 overlay；企业 base 仅内存 |
 | `clear_permissions_config_cache()` | 清进程缓存 |
 
 
@@ -138,16 +140,16 @@ permissions:
     tool_bindings: {}
   external_directory: {...}    # 旧键，加载时自动迁移到 file_guard.global
   agents:                      # 标准版保留键，不是工具名；Gateway GET 会剥离
-    office-excel:              # 精确匹配 runtime agent_id；整段替换，不与全局合并
-      enabled: true
+    office-excel:              # 精确匹配 runtime agent_id；稀疏覆盖叠到包内模板
+      enabled: true            # 按需写入；未写的字段回落包内模板（非用户全局）
       tools: {...}
 ```
 
 `permissions.agents` 只在标准版生效：
 
-- **精确命中** `agents[agent_id]` 且 value 为 dict：该 Agent 使用该完整 body（内层再嵌套 `agents` 忽略）。
-- **未命中**：使用全局段。种子 id（`office-excel`）在护栏全局 persist 或专属落盘时从当前全局模板 copy-on-write 建桶；已有桶不覆盖。其它 id 仍不自动建桶。
-- **Web RPC** 带 `request.agent_id` 且命中时读写 `agents[id]`；无 `agent_id` 保持全局（不要把 `extract_ids` 的默认 `"default"` 当成命中）。
+- **精确命中** `agents[agent_id]` 或 **种子 id**（如 `office-excel`，可尚未建桶）：生效策略 = **包内模板** ∪ 稀疏覆盖（`tools` / `file_guard` 深合并，其余键覆盖；内层再嵌套 `agents` 忽略）。缺省不受用户全局 permissions 改动影响。
+- **其它 id 未命中**：使用用户全局段。专属落盘时种子 id 可按需建空覆盖桶，**只写入本次 mutate 字段**；**全局 persist 不自动 seed**。
+- **Web RPC** 带 `request.agent_id` 且命中（或种子可建桶）时读写 `agents[id]`；无 `agent_id` 保持全局（不要把 `extract_ids` 的默认 `"default"` 当成命中）。
 - **HITL 落盘** 在 `build_permission_rail` 时钉住 `persist_target_agent_id`（supervisor Task 不继承 ContextVar）。
 - **snapshot**：专属 body / 企业模板 rail 必须返回 `None`，使用构建时的 `_static_config`。
 - **企业版**：不解析 yaml `agents`，只用 `template_ref.permissions`。
@@ -558,4 +560,4 @@ Manager REST ──HTTP──► Gateway Receiver ──► gateway.db
 
 ## 十一、一句话总结
 
-**企业版**：策略存在 `permissions_template`，经 Agent `template_ref.permissions` 绑定到具体 Agent，请求路径注入 `PERMISSIONS_AGENT_BASE`（可叠加会话 overlay）。**标准版 / 单机**：`config.yaml::permissions` 全局段 + 可选 `permissions.agents[agent_id]` 精确整段替换（如 Excel `office-excel`）；未命中共享全局。**执行层**仅在 AgentServer 由 PermissionRail / 引擎做 allow/ask/deny。实例级 `permissions_config` 表与对应 REST/WS 推送已废弃并移除。
+**企业版**：策略存在 `permissions_template`，经 Agent `template_ref.permissions` 绑定到具体 Agent，请求路径注入 `PERMISSIONS_AGENT_BASE`（可叠加会话 overlay）。**标准版 / 单机**：用户全局 `permissions` + 可选 `permissions.agents[agent_id]` 稀疏覆盖（如 Excel `office-excel`）；种子 / 命中桶的缺省底为**包内模板**，不受用户全局改动影响。**执行层**仅在 AgentServer 由 PermissionRail / 引擎做 allow/ask/deny。实例级 `permissions_config` 表与对应 REST/WS 推送已废弃并移除。
