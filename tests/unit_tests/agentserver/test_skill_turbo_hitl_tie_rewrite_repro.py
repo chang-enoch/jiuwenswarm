@@ -36,7 +36,7 @@ from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
     set_skill_turbo_hitl_tic,
 )
 
-TOOL_NAME = "skill_turbo_hitl_repro_tool"
+TOOL_NAME = "skill_acceleration_exec"
 
 
 class _StreamSession:
@@ -125,7 +125,7 @@ class _HitlModel:
 
 @pytest.mark.asyncio
 async def test_skill_turbo_hitl_tie_rewrite_survives_ability_manager_chain():
-    tool_name = f"skill_turbo_hitl_repro_{uuid.uuid4().hex[:8]}"
+    tool_name = TOOL_NAME
     from openjiuwen.core.foundation.tool import LocalFunction
 
     tool = LocalFunction(

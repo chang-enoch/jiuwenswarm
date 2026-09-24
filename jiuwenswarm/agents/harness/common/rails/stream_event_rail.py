@@ -1203,6 +1203,16 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
 
         session = ctx.session
         if session is None or not isinstance(ctx.inputs, ToolCallInputs):
+            # TIE 块未执行，清理可能残留的 stale TIC（reset_skill_turbo_context
+            # 不含 TIC 清理——TIC 由工具体直接 set，不经 token 绑定机制）。
+            try:
+                from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+                    set_skill_turbo_hitl_tic,
+                )
+
+                set_skill_turbo_hitl_tic(None)
+            except Exception:
+                pass
             return
 
         tc = ctx.inputs.tool_call
@@ -1230,7 +1240,8 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             _hitl_request_dump: dict[str, Any] | None = None
             _raw_tool_result = ctx.inputs.tool_result
             if (
-                isinstance(_raw_tool_result, dict)
+                _tool_name == "skill_acceleration_exec"
+                and isinstance(_raw_tool_result, dict)
                 and _raw_tool_result.get(_SKILL_TURBO_HITL_RESULT_KEY)
                 and isinstance(_raw_tool_result.get("request"), dict)
             ):
