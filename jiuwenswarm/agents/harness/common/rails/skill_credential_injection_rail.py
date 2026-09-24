@@ -110,8 +110,8 @@ def _split_subcommands(command: str) -> list[str]:
             buf.append(ch)
             i += 1
             continue
-        # 二字符分隔符 && / || 必须先于单字符 ; | & 判定：
-        # 否则 || 会被当成单个 | 拆开（产生空子命令），&& 同理
+        # 二字符分隔符 && / || 必须先于单字符 ; / | / & 判定，
+        # 否则 || 会被当成单个 | 拆开，产生空子命令； && 同理
         sep_len = 0
         if command[i : i + 2] in ("&&", "||"):
             sep_len = 2
