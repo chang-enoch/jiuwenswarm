@@ -20,8 +20,10 @@ RUN uv pip install --system --break-system-packages \
     ${PIP_EXTRA_ARGS} \
     -e .
 
-COPY docker/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
-RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
+# entrypoint 从仓库原路径运行：dev 模式下 hp-code 将仓库挂载到 /app/jiuwenswarm，
+# 直接生效仓库内脚本（便于联调）；生产镜像内置同路径副本
+COPY docker/sandbox-entrypoint.sh /app/jiuwenswarm/docker/sandbox-entrypoint.sh
+RUN chmod +x /app/jiuwenswarm/docker/sandbox-entrypoint.sh
 
 RUN if [ -z "$PIP_INDEX_URL" ]; then echo "PIP_INDEX_URL is empty" >&2; exit 1; fi && \
     TRUSTED_HOST=${PIP_INDEX_URL#*//} && \
@@ -38,5 +40,5 @@ EXPOSE 8321
 EXPOSE 8322
 
 ENV JIUWENBOX_LISTEN=http://0.0.0.0:8321
-ENTRYPOINT ["/usr/local/bin/sandbox-entrypoint.sh"]
+ENTRYPOINT ["/app/jiuwenswarm/docker/sandbox-entrypoint.sh"]
 CMD ["python3", "-m", "jiuwenbox.server.launcher"]
