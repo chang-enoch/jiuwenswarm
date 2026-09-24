@@ -74,20 +74,24 @@ def emit_audit(
         keyword = str(event_type or "").strip().upper()
         success = keyword != "EVT"
         desc = fields.get("UA") or fields.get("EVT") or fields.get("MSG")
-        # UID/uid 必须进 audit_claw_log(uid=)，不能只塞 extra（否则无 ContextVar
-        # 时顶层 UID/user_id 仍为空，仅靠 extra 覆盖占位符，桥接 user_id 仍可能丢）。
-        rest = {
-            k: v
-            for k, v in fields.items()
-            if k not in ("UA", "EVT", "MSG", "UID", "uid")
-        }
+        # UID / session_id / request_id 必须进 audit_claw_log 顶层映射入参，
+        # 不能只塞 extra（否则无 ContextVar 时 trace_id/txn_seq/UID 仍为占位，
+        # 且会把 session_id/request_id 原名泄漏到 attributes）。
+        _lift = ("UA", "EVT", "MSG", "UID", "uid", "session_id", "request_id")
+        rest = {k: v for k, v in fields.items() if k not in _lift}
         raw_uid = fields.get("UID", fields.get("uid"))
         uid = str(raw_uid).strip() if raw_uid is not None else ""
+        raw_sid = fields.get("session_id")
+        raw_rid = fields.get("request_id")
+        sid = str(raw_sid).strip() if raw_sid is not None else ""
+        rid = str(raw_rid).strip() if raw_rid is not None else ""
         audit_claw_log(
             submdl=SUBMDL,
             proc=PROC,
             success=success,
             uid=uid or None,
+            session_id=sid or None,
+            request_id=rid or None,
             rspcd=RSPCD,
             desc=str(desc) if desc is not None else None,
             message=str(fields.get("MSG") or ""),

@@ -378,7 +378,8 @@ class A2AManager:
             emit_audit_ua(
                 SUBMDL="gateway",
                 PROC="a2a_agent_authorize",
-                UA=normalized_agent_id,
+                UA="a2a_agent_authorize",
+                agent_id=normalized_agent_id,
             )
             return
         authorized = await self._resolve_authorized_a2a_agent_ids(resource_id)

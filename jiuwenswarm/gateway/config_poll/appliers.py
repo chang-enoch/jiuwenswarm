@@ -72,13 +72,23 @@ async def apply_log_masking_rule_table(ctx: TableApplyContext) -> None:
 
 
 async def apply_channel_config_table(ctx: TableApplyContext) -> None:
+    """Apply channel_config rows via overlay reload hooks.
+
+    Overlay modules historically lived under ``jiuwenclaw.gateway`` and were not
+    carried into ``jiuwenswarm.gateway`` after the package rename. Missing
+    imports must not fail the whole poll cycle (would re-ERROR every interval
+    because the syncer keeps the snapshot only after a successful apply).
+    """
     try:
         from jiuwenswarm.gateway.channel_config_overlay import ChannelConfigChange
         from jiuwenswarm.gateway.channel_config_reload import maybe_trigger_channel_config_reload
-    except ImportError as exc:
-        raise RuntimeError(
-            "channel_config reload unavailable; manager_config_receiver not loaded"
-        ) from exc
+    except ImportError:
+        logger.warning(
+            "[ConfigPoll] channel_config reload skipped "
+            "(jiuwenswarm.gateway.channel_config_overlay/reload not present); "
+            "audit/logging/masking poll unaffected"
+        )
+        return
 
     for channel_id in sorted(ctx.removed_channel_ids):
         await maybe_trigger_channel_config_reload(

@@ -373,6 +373,8 @@ class SendFileToolkit:
                 PROC="send_file_to_user",
                 MSG=msg_parts[0],
                 EVT="send_file_failed",
+                session_id=route.session_id,
+                request_id=route.request_id,
             )
             return "\n".join(msg_parts)
 
@@ -583,6 +585,7 @@ class SendFileToolkit:
                 MSG="no_write_stream",
                 EVT="send_file_failed",
                 session_id=route.session_id,
+                request_id=route.request_id,
             )
             return (
                 "发送文件失败：当前请求无可用的流式通道，无法投递企业下载链接。"
@@ -599,6 +602,7 @@ class SendFileToolkit:
                 MSG=str(exc)[:512],
                 EVT="send_file_failed",
                 session_id=route.session_id,
+                request_id=route.request_id,
             )
             return f"发送文件失败：对象存储未配置或不可用（{exc}）"
 
@@ -644,6 +648,7 @@ class SendFileToolkit:
                 MSG=parts[0],
                 EVT="send_file_failed",
                 session_id=route.session_id,
+                request_id=route.request_id,
             )
             return "\n".join(parts)
 
@@ -674,6 +679,7 @@ class SendFileToolkit:
                 MSG=str(exc)[:512],
                 EVT="send_file_failed",
                 session_id=route.session_id,
+                request_id=route.request_id,
             )
             return f"发送文件失败：写入对话流失败（{exc}）"
 
@@ -682,6 +688,7 @@ class SendFileToolkit:
             SUBMDL="file",
             PROC="send_file_to_user",
             session_id=route.session_id,
+            request_id=route.request_id,
             file_count=len(files_payload),
         )
         result_parts = [

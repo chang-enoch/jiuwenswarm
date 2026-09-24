@@ -102,6 +102,8 @@ def audit_claw_log(
     proc: str,
     success: bool = True,
     uid: str | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
     rspcd: str | None = None,
     desc: str | None = None,
     error: str = "",
@@ -117,9 +119,10 @@ def audit_claw_log(
         submdl: 子模块（gateway / agent / sandbox / api_client / file / alert）。
         proc: 过程名（挂点表，如 ws_resolve_identity / write_file / create_sandbox）。
         success: True → UA（成功正常），False → EVT（失败/违规/异常/告警）。
-        uid / session_id 等缺省走请求上下文回退；rspcd 缺省 UA→0000。
+        uid / session_id / request_id 缺省走请求上下文回退；映射进 UID / trace_id / txn_seq。
+        rspcd 缺省 UA→0000。
         desc: 与关键字同名的文案；error/message: 失败原因与补充信息。
-        extra / **details: 附加属性（如 origin/path/sandbox_id）。
+        extra / **details: 附加属性（如 origin/path/sandbox_id）；勿放 session_id/request_id。
 
     跨组件：打点传入 ``DSTIP`` 时，自动补 ``SRCIP``=本端缓存（显式 SRCIP 优先）。
     """
@@ -134,6 +137,16 @@ def audit_claw_log(
             **(extra or {}),
             **details,
         }
+        # 桥接键只作映射入参，禁止经 extra 原名写出。
+        for bridge in (
+            "session_id",
+            "request_id",
+            "user_id",
+            "bot_id",
+            "group_id",
+            "channel_id",
+        ):
+            merged_extra.pop(bridge, None)
         try:
             from jiuwenswarm.common.audit_net import enrich_extra_with_hop_ips
 
@@ -145,7 +158,13 @@ def audit_claw_log(
         event_type = "UA" if success else "EVT"
         level_norm = (level or ("INFO" if success else "WARN")).upper()
         text = desc or message or f"{submdl}.{proc} {'成功' if success else '失败'}"
-        resolved_uid = uid or ctx.get("user_id", "")
+        resolved_uid = (str(uid).strip() if uid else "") or ctx.get("user_id", "")
+        resolved_session = (
+            str(session_id).strip() if session_id else ""
+        ) or ctx.get("session_id", "")
+        resolved_request = (
+            str(request_id).strip() if request_id else ""
+        ) or ctx.get("request_id", "")
         from jiuwenswarm.common.audit_emit import capture_audit_caller
 
         audit.log_audit(
@@ -157,8 +176,8 @@ def audit_claw_log(
             MSG=error or message or "",
             UID=resolved_uid,
             RSPCD=rspcd if rspcd is not None else ("0000" if success else ""),
-            session_id=ctx.get("session_id", ""),
-            request_id=ctx.get("request_id", ""),
+            session_id=resolved_session,
+            request_id=resolved_request,
             user_id=resolved_uid,
             bot_id=ctx.get("bot_id", ""),
             group_id=ctx.get("group_id", ""),

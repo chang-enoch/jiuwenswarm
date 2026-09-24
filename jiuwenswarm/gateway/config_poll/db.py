@@ -15,6 +15,8 @@ POLL_TABLES: tuple[str, ...] = (
     "audit_log_config",
 )
 _POLL_TABLES = frozenset(POLL_TABLES)
+# 本进程 DB handler 未注册的表：只告警一次，避免每轮 ERROR 刷屏
+_skipped_uninitialized: set[str] = set()
 
 
 def _normalize_updated_at(value: Any) -> datetime | None:
@@ -71,7 +73,21 @@ async def list_table_records(table: str) -> list[dict[str, Any]]:
     store = get_persistent_store()
     if store is not None:
         await store.ensure_ready()
-        rows = await store.list(table)
+        try:
+            rows = await store.list(table)
+        except ValueError as exc:
+            # 例如 ``Table channel_config not initialized``：当前 Gateway
+            # 进程未注册该表模型，跳过即可（audit 等其它表仍正常）。
+            if "not initialized" in str(exc):
+                if table not in _skipped_uninitialized:
+                    _skipped_uninitialized.add(table)
+                    logger.warning(
+                        "[ConfigPoll] skip table=%s (%s); other poll tables unaffected",
+                        table,
+                        exc,
+                    )
+                return []
+            raise
         return [dict(row) for row in rows or []]
 
     from jiuwenswarm.server.runtime.enterprise_config import db_queries
