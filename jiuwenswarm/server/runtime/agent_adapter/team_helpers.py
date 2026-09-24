@@ -1262,6 +1262,60 @@ _TEAM_TASK_TERMINAL_STATUSES = frozenset({"completed", "cancelled"})
 _TEAM_MEMBER_UNSTARTED_STATUS = "unstarted"
 
 
+_POOL_RELEASE_TIMEOUT_S = 90.0
+_POOL_RELEASE_POLL_S = 0.2
+
+
+def _pool_entry_running(info: Any, team_name: str, session_id: str) -> bool:
+    """True when this session's team is still RUNNING in the runner pool."""
+    if getattr(info, "team_name", None) != team_name:
+        return False
+    if getattr(info, "current_session_id", None) != session_id:
+        return False
+    state = getattr(info, "state", None)
+    return getattr(state, "value", state) == "running"
+
+
+async def _await_runner_pool_release(team_name: str, session_id: str) -> None:
+    """Wait out an in-flight team.session.reset before opening a new stream.
+
+    Reset clears the local stream marker immediately, then spends a long time
+    in stop_coordination. A chat.send in that window used to activate against
+    the still-pooled team, get reject_running, and end with no output.
+    A paused entry is left alone so the next stream can resume it.
+    """
+    deadline = time.monotonic() + _POOL_RELEASE_TIMEOUT_S
+    while True:
+        try:
+            infos = await Runner.list_active_teams()
+        except Exception as exc:
+            logger.warning(
+                "[TeamHelpers] list active teams failed before stream: session_id=%s error=%s",
+                session_id,
+                exc,
+            )
+            return
+        if not any(_pool_entry_running(info, team_name, session_id) for info in infos):
+            return
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[TeamHelpers] runner pool still running before first stream; stopping: "
+                "session_id=%s team_name=%s",
+                session_id,
+                team_name,
+            )
+            try:
+                await Runner.stop_agent_team(team_name=team_name, session_id=session_id)
+            except Exception as exc:
+                logger.warning(
+                    "[TeamHelpers] stop stuck runner pool failed: session_id=%s error=%s",
+                    session_id,
+                    exc,
+                )
+            return
+        await asyncio.sleep(_POOL_RELEASE_POLL_S)
+
+
 def _run_agent_team_streaming(**kwargs: Any) -> AsyncIterator[Any]:
     # The public Runner facade re-yields the core generator and does not
     # propagate aclose(). Keep the core handle so early round termination runs
@@ -2582,6 +2636,7 @@ async def _consume_stream_with_query(
             _safe_query_preview(initial_query),
         )
         runner_entered_at = time.monotonic()
+        await _await_runner_pool_release(str(getattr(team_spec, "team_name", "") or ""), session_id)
         team_stream = _run_agent_team_streaming(
             agent_team=team_spec,
             inputs={"query": initial_query},

@@ -5389,3 +5389,72 @@ def test_workflow_runs_persist_and_restore_honor_sessions_root(
     )
     assert restored is not None
     assert restored["wf-1"].id == "wf-1"
+
+
+def _pool_info(state: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        team_name="oc_team",
+        current_session_id="sess",
+        state=SimpleNamespace(value=state),
+    )
+
+
+@pytest.mark.asyncio
+async def test_await_runner_pool_release_waits_until_running_entry_leaves(monkeypatch):
+    snapshots = [[_pool_info("running")], []]
+    stopped: list[dict[str, str]] = []
+
+    async def _list_active_teams():
+        return snapshots.pop(0)
+
+    async def _stop_agent_team(**kwargs):
+        stopped.append(kwargs)
+        return True
+
+    monkeypatch.setattr(team_helpers.Runner, "list_active_teams", _list_active_teams)
+    monkeypatch.setattr(team_helpers.Runner, "stop_agent_team", _stop_agent_team)
+    monkeypatch.setattr(team_helpers, "_POOL_RELEASE_POLL_S", 0.01)
+
+    await team_helpers._await_runner_pool_release("oc_team", "sess")
+
+    assert stopped == []
+    assert snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_await_runner_pool_release_leaves_paused_entry(monkeypatch):
+    stopped: list[dict[str, str]] = []
+
+    async def _list_active_teams():
+        return [_pool_info("paused")]
+
+    async def _stop_agent_team(**kwargs):
+        stopped.append(kwargs)
+        return True
+
+    monkeypatch.setattr(team_helpers.Runner, "list_active_teams", _list_active_teams)
+    monkeypatch.setattr(team_helpers.Runner, "stop_agent_team", _stop_agent_team)
+
+    await team_helpers._await_runner_pool_release("oc_team", "sess")
+
+    assert stopped == []
+
+
+@pytest.mark.asyncio
+async def test_await_runner_pool_release_stops_entry_that_stays_running(monkeypatch):
+    stopped: list[dict[str, str]] = []
+
+    async def _list_active_teams():
+        return [_pool_info("running")]
+
+    async def _stop_agent_team(**kwargs):
+        stopped.append(kwargs)
+        return True
+
+    monkeypatch.setattr(team_helpers.Runner, "list_active_teams", _list_active_teams)
+    monkeypatch.setattr(team_helpers.Runner, "stop_agent_team", _stop_agent_team)
+    monkeypatch.setattr(team_helpers, "_POOL_RELEASE_TIMEOUT_S", 0)
+
+    await team_helpers._await_runner_pool_release("oc_team", "sess")
+
+    assert stopped == [{"team_name": "oc_team", "session_id": "sess"}]
