@@ -219,6 +219,33 @@ def _resolve_member_skills(config: dict[str, Any], role: str) -> list[str]:
     return [str(skill).strip() for skill in skills if str(skill).strip()]
 
 
+def _resolve_member_skills_for_spec(
+    config: dict[str, Any],
+    role: str,
+    base_spec: Any,
+    member_name: str | None = None,
+) -> list[str]:
+    """Resolve skill names for one member, preferring its own spec entry.
+
+    Predefined members are keyed by ``member_name`` (not by role), so
+    ``config.agents.<role>`` misses them and every member ended up with an
+    empty skill view. The per-member template (``base_spec.skills``, populated
+    by ``load_team_spec_dict`` from ``modes.team.<id>.agents.<member_name>``)
+    is authoritative; ``config.agents`` entries remain the fallback for
+    team-editor-shaped configs that only carry role-level skills.
+    """
+    spec_skills = getattr(base_spec, "skills", None)
+    if isinstance(spec_skills, list):
+        return [str(skill).strip() for skill in spec_skills if str(skill).strip()]
+    member_name = str(member_name or getattr(base_spec, "member_name", "") or "").strip()
+    if member_name and member_name not in {"leader", "teammate"}:
+        agents = config.get("agents") if isinstance(config, dict) else None
+        member = agents.get(member_name) if isinstance(agents, dict) else None
+        if isinstance(member, dict) and isinstance(member.get("skills"), list):
+            return [str(skill).strip() for skill in member["skills"] if str(skill).strip()]
+    return _resolve_member_skills(config, role)
+
+
 # ---------------------------------------------------------------------------
 # Config-attribute extraction: harness settings (config.yaml) baked into spec
 # ``params`` at spec-build time. Per-request environment values stay on the
@@ -470,6 +497,7 @@ def _build_team_capability_specs(
     role: str,
     *,
     enable_permissions: bool = False,
+    member_skills: list[str] | None = None,
 ) -> tuple[list[RailSpec], list[BuiltinToolSpec]]:
     """Build the chat-team profile rail/tool specs for a member."""
     rails_specs: list[RailSpec] = [
@@ -492,7 +520,7 @@ def _build_team_capability_specs(
     rails_specs.append(
         RailSpec(
             type=registry.MEMBER_SKILL_TOOLKIT,
-            params={"skills": _resolve_member_skills(config, role)},
+            params={"skills": member_skills if member_skills is not None else _resolve_member_skills(config, role)},
         )
     )
 
@@ -541,6 +569,7 @@ def _build_code_capability_specs(
     role: str,
     *,
     enable_permissions: bool = False,
+    member_skills: list[str] | None = None,
 ) -> tuple[list[RailSpec], list[BuiltinToolSpec]]:
     """Build the code profile (code.team / team.plan) rail/tool specs for a member.
 
@@ -589,7 +618,7 @@ def _build_code_capability_specs(
     rails_specs.append(
         RailSpec(
             type=registry.MEMBER_SKILL_TOOLKIT,
-            params={"skills": _resolve_member_skills(config, role)},
+            params={"skills": member_skills if member_skills is not None else _resolve_member_skills(config, role)},
         )
     )
     rails_specs.extend(
@@ -611,26 +640,38 @@ def build_member_capability_specs(
     role: str,
     *,
     enable_permissions: bool = False,
+    member_skills: list[str] | None = None,
 ) -> tuple[list[RailSpec], list[BuiltinToolSpec]]:
     """Build the rail and tool specs for a team member.
 
     Branches by mode: the code modes get the code profile (``swarm.code_*``
     rails), all other modes get the chat-team profile. The member-skill toolkit
-    rail carries the role's selected skill names, and the role adds its skill
-    evolution rails.
+    rail carries the member's selected skill names (``member_skills`` when
+    provided, else role-level ``config.agents.<role>.skills``), and the role
+    adds its skill evolution rails.
 
     Args:
         config: The resolved ``config.yaml`` mapping (team blueprint shape).
         mode: The request mode ("team" / "code.team" / "team.plan").
         role: The member role ("leader" or "teammate").
         enable_permissions: Effective team permission toggle from TeamAgentSpec.
+        member_skills: Per-member skill names (from the member's own spec
+            entry); None falls back to role-level resolution.
 
     Returns:
         A ``(rails_specs, tool_specs)`` tuple of openjiuwen specs.
     """
     if _is_code_mode(mode):
-        return _build_code_capability_specs(config, mode, role, enable_permissions=enable_permissions)
-    return _build_team_capability_specs(config, role, enable_permissions=enable_permissions)
+        return _build_code_capability_specs(
+            config, mode, role,
+            enable_permissions=enable_permissions,
+            member_skills=member_skills,
+        )
+    return _build_team_capability_specs(
+        config, role,
+        enable_permissions=enable_permissions,
+        member_skills=member_skills,
+    )
 
 
 def _is_subagent_enabled(sub_cfg: Any) -> bool:
@@ -729,6 +770,7 @@ def build_member_deep_agent_spec(
     role: str,
     base_spec: DeepAgentSpec,
     *,
+    member_name: str | None = None,
     enable_permissions: bool = False,
     mcp_configs: list[McpServerConfig] | None = None,
 ) -> DeepAgentSpec:
@@ -743,6 +785,7 @@ def build_member_deep_agent_spec(
         mode: The request mode ("team" / "code.team" / "team.plan").
         role: The member role ("leader" or "teammate").
         base_spec: The base member ``DeepAgentSpec`` to extend.
+        member_name: Named member key for config skill fallback.
         enable_permissions: Effective team permission toggle from TeamAgentSpec.
         mcp_configs: MCP server configs inherited from ``config.yaml``.
 
@@ -750,11 +793,17 @@ def build_member_deep_agent_spec(
         A new ``DeepAgentSpec`` with the capability specs applied.
     """
     rails_specs, tool_specs = build_member_capability_specs(
-        config, mode, role, enable_permissions=enable_permissions,
+        config, mode, role,
+        enable_permissions=enable_permissions,
+        member_skills=_resolve_member_skills_for_spec(config, role, base_spec, member_name),
     )
 
     merged_rails = list(base_spec.rails or [])
-    merged_rails.extend(rails_specs)
+    existing_runtime_rails = {
+        rail.type for rail in merged_rails
+        if rail.type in {registry.STREAM_EVENT, registry.REQUEST_SCOPED_MCP_TOOLS}
+    }
+    merged_rails.extend(rail for rail in rails_specs if rail.type not in existing_runtime_rails)
     merged_tools = list(base_spec.tools or [])
     merged_tools.extend(tool_specs)
     merged_mcps = _merge_mcp_configs(base_spec.mcps, mcp_configs)
