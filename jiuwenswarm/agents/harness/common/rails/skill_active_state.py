@@ -12,6 +12,10 @@ from typing import Any, Optional
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.rails.base import DeepAgentRail
 
+from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+    is_interrupt_resume_source,
+)
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SESSION_ID = "default"
@@ -19,6 +23,10 @@ _DEFAULT_SESSION_ID = "default"
 # when ToolCallInputs has no conversation_id (contextvars alone are not enough
 # across gather / nested callbacks).
 _SESSION_ID_EXTRA_KEY = "__jiuwenswarm_session_id__"
+# chat.send 的 source（permission/confirm/ask_user 等 HITL 恢复来源）。
+# 由 interface._build_inputs 写入 run_context.extra，before_invoke 读取，
+# 用于 CR-3a：HITL 恢复轮不计入过期计数。
+_CHAT_SEND_SOURCE_EXTRA_KEY = "__jiuwenswarm_chat_send_source__"
 
 _current_session_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "skill_active_session_id",
@@ -124,6 +132,50 @@ def _nonempty_str(value: Any) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _is_interrupt_resume_invoke(ctx: AgentCallbackContext) -> bool:
+    """本轮 invoke 是否为 permission/confirm/ask_user 等 HITL 恢复轮。
+
+    source 由 ``interface._build_inputs`` 从 chat.send 参数透传到
+    ``run_context.extra``（CR-3a）；恢复轮是同一任务的继续而非技能闲置，
+    不计入过期计数。evolution 等其他 source 不在此列。
+    """
+    inputs = getattr(ctx, "inputs", None)
+    run_context = getattr(inputs, "run_context", None)
+    extra = getattr(run_context, "extra", None)
+    if not isinstance(extra, dict):
+        return False
+    source = _nonempty_str(
+        extra.get(_CHAT_SEND_SOURCE_EXTRA_KEY) or extra.get("chat_send_source")
+    )
+    return is_interrupt_resume_source(source)
+
+
+def resolve_stale_invoke_limit(config: Any) -> Optional[int]:
+    """从 agent 配置读取过期兜底轮数（CR-3b）。
+
+    读取 ``config["react"]["skill_stale_invoke_limit"]``：缺失/类型无效
+    返回 None（用 rail 默认值 5）；``<= 0`` 原样透传（显式禁用兜底）。
+    装配点（interface_deep._build_skill_active_state_rail）消费。
+    """
+    if not isinstance(config, dict):
+        return None
+    react = config.get("react")
+    if not isinstance(react, dict) or "skill_stale_invoke_limit" not in react:
+        return None
+    raw = react.get("skill_stale_invoke_limit")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[SkillActiveStateRail] invalid skill_stale_invoke_limit=%r, "
+            "fallback to default",
+            raw,
+        )
+        return None
 
 
 def _extract_session_id(ctx: AgentCallbackContext) -> Optional[str]:
@@ -239,7 +291,9 @@ class SkillActiveStateRail(DeepAgentRail):
         if not existing or existing == _DEFAULT_SESSION_ID or session_id != _DEFAULT_SESSION_ID:
             extra[_SESSION_ID_EXTRA_KEY] = session_id
 
-    def _expire_stale_active_skill(self, session_id: str) -> None:
+    def _expire_stale_active_skill(
+        self, session_id: str, *, is_resume_invoke: bool = False
+    ) -> None:
         """过期兜底（改动 3）：连续 N 轮 invoke 无 skill_tool 调用 → 清空。
 
         skill_complete 遵从性不可靠（实测用户显式要求结束后模型仍不调
@@ -247,8 +301,14 @@ class SkillActiveStateRail(DeepAgentRail):
         ``stale_invoke_limit <= 0`` 时禁用。计数语义：每次 before_invoke
         递增（本轮"尚未"调用 skill_tool），skill_tool 激活清零——连续
         N 轮无调用后，第 N+1 轮开始时清空。
+
+        HITL 恢复轮（permission/confirm/ask_user resume，CR-3a）不递增：
+        连续审批/ask_user 交互是同一任务的继续而非技能闲置，若计入会
+        在密集 HITL 场景误清空 active_skill。
         """
         if self._stale_invoke_limit is None or self._stale_invoke_limit <= 0:
+            return
+        if is_resume_invoke:
             return
         state = _sessions.get(session_id)
         if state is None or not state.active_skill:
@@ -267,14 +327,17 @@ class SkillActiveStateRail(DeepAgentRail):
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         session_id = self._resolve_session_id(ctx)
-        # 生命周期修正：before_invoke 不清空 active_skill（新用户任务不清、
-        # HITL 恢复轮也不再需要特殊保护）。清空只发生在 skill_complete、
-        # 切换到另一个 skill（after_tool_call 覆盖替换）、会话结束
-        # （adapter 淘汰 / teardown 调 clear_session_skill_state）、或
-        # 连续 N 轮无 skill_tool 调用的过期兜底。
+        # 生命周期修正：before_invoke 不清空 active_skill（新用户任务不清）。
+        # 清空只发生在 skill_complete、切换到另一个 skill（after_tool_call
+        # 覆盖替换）、会话结束（adapter 淘汰 / teardown 调
+        # clear_session_skill_state）、或连续 N 轮无 skill_tool 调用的过期
+        # 兜底（HITL 恢复轮不计入，CR-3a）。
         # 这里只做过期检查 + 把 default 哨兵下的孤儿态收养到真实会话
         # （ToolCallInputs 缺 conversation_id 时可能记录在 default 下）。
-        self._expire_stale_active_skill(session_id)
+        self._expire_stale_active_skill(
+            session_id,
+            is_resume_invoke=_is_interrupt_resume_invoke(ctx),
+        )
         adopt_default_active_skill(session_id)
         self._bind_session_id(ctx, session_id)
 
@@ -376,6 +439,7 @@ class SkillActiveStateRail(DeepAgentRail):
 
 __all__ = [
     "SkillActiveStateRail",
+    "_CHAT_SEND_SOURCE_EXTRA_KEY",
     "_DEFAULT_SESSION_ID",
     "_SESSION_ID_EXTRA_KEY",
     "_current_session_var",
@@ -383,4 +447,5 @@ __all__ = [
     "clear_session_skill_state",
     "get_session_active_skill",
     "resolve_skill_session_id",
+    "resolve_stale_invoke_limit",
 ]

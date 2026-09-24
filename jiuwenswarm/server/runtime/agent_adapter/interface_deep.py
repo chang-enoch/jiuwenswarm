@@ -285,6 +285,7 @@ from jiuwenswarm.agents.harness.common.rails.disabled_tools_rail import (
 from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
     SkillActiveStateRail,
     clear_session_skill_state,
+    resolve_stale_invoke_limit,
 )
 from jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail import (
     SkillCredentialInjectionRail,
@@ -7981,13 +7982,21 @@ class JiuWenSwarmDeepAdapter:
             return None
         return None
 
-    def _build_skill_active_state_rail(self) -> SkillActiveStateRail | None:
+    def _build_skill_active_state_rail(
+        self, config: dict[str, Any] | None = None
+    ) -> SkillActiveStateRail | None:
         try:
-            rail = SkillActiveStateRail(session_id=self._skill_rail_session_id())
+            # CR-3b：react.skill_stale_invoke_limit 可配置（缺失用默认 5，
+            # <=0 禁用兜底），否则生产装配点恒为默认值不可调。
+            rail = SkillActiveStateRail(
+                session_id=self._skill_rail_session_id(),
+                stale_invoke_limit=resolve_stale_invoke_limit(config),
+            )
             logger.info(
                 "[JiuWenSwarmDeepAdapter] SkillActiveStateRail create success "
-                "(session_id=%s)",
+                "(session_id=%s stale_invoke_limit=%s)",
                 self._skill_rail_session_id() or "-",
+                rail._stale_invoke_limit,  # noqa: SLF001
             )
             return rail
         except Exception as exc:
@@ -9767,7 +9776,7 @@ class JiuWenSwarmDeepAdapter:
                 skill_credential_rail_newly_created = True
 
         if self._skill_active_state_rail is None:
-            self._skill_active_state_rail = self._build_skill_active_state_rail()
+            self._skill_active_state_rail = self._build_skill_active_state_rail(config)
 
         progressive_tool_rail = None
         if "tool_lazy_load" in config:

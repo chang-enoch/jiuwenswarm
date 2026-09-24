@@ -1752,6 +1752,41 @@ class JiuWenSwarm:
                 context,
             )
 
+        # HITL resume source（CR-3a）：把 chat.send 的 source 透传到
+        # run_context.extra，供 SkillActiveStateRail.before_invoke 识别
+        # permission/confirm/ask_user 恢复轮——此类轮次是同一任务的继续，
+        # 不计入 active_skill 过期计数。
+        try:
+            from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
+                _CHAT_SEND_SOURCE_EXTRA_KEY,
+            )
+
+            chat_send_source = (
+                params.get("source").strip()
+                if isinstance(params.get("source"), str) and params.get("source").strip()
+                else ""
+            )
+            if chat_send_source:
+                run_payload = inputs.get("run")
+                if not isinstance(run_payload, dict):
+                    run_payload = {}
+                    inputs["run"] = run_payload
+                context = run_payload.get("context")
+                if not isinstance(context, dict):
+                    context = {}
+                    run_payload["context"] = context
+                extra = context.get("extra")
+                if not isinstance(extra, dict):
+                    extra = {}
+                    context["extra"] = extra
+                extra[_CHAT_SEND_SOURCE_EXTRA_KEY] = chat_send_source
+                extra["chat_send_source"] = chat_send_source
+        except Exception:
+            logger.debug(
+                "[_build_inputs] failed to attach chat_send_source",
+                exc_info=True,
+            )
+
         # Per-request workspace_dir scopes one prompt's cwd to the given
         # directory; threaded into inputs["cwd"] which downstream init_cwd
         # installs onto openjiuwen's CwdState ContextVar. See E2A-protocol.md

@@ -22,6 +22,7 @@ from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
     clear_session_skill_state,
     get_session_active_skill,
     resolve_skill_session_id,
+    resolve_stale_invoke_limit,
 )
 from jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail import (
     SkillCredentialInjectionRail,
@@ -288,9 +289,18 @@ class TestStaleInvokeExpiry(unittest.TestCase):
         ctx.extra = {}
         asyncio.run(rail.after_tool_call(ctx))
 
-    def _invoke(self, rail, query="q"):
+    def _invoke(self, rail, query="q", source=None):
         ctx = AgentCallbackContext(agent=MagicMock())
-        ctx.inputs = InvokeInputs(query=query, conversation_id=self.sid)
+        if source:
+            run_context = MagicMock()
+            run_context.extra = {"chat_send_source": source}
+            ctx.inputs = InvokeInputs(
+                query=query,
+                conversation_id=self.sid,
+                run_context=run_context,
+            )
+        else:
+            ctx.inputs = InvokeInputs(query=query, conversation_id=self.sid)
         ctx.extra = {}
         asyncio.run(rail.before_invoke(ctx))
 
@@ -303,6 +313,34 @@ class TestStaleInvokeExpiry(unittest.TestCase):
         assert get_session_active_skill(self.sid) == "hwocr"
         # 第 6 轮开始时清空
         self._invoke(rail, query="q6")
+        assert get_session_active_skill(self.sid) is None
+
+    def test_hitl_resume_invoke_not_counted(self):
+        # CR-3a：HITL 恢复轮（同一任务的继续）不计入过期计数——
+        # 密集审批/ask_user 交互不会误清空 active_skill
+        rail = self._rail(limit=3)
+        self._activate(rail)
+        self._invoke(rail)  # count=1
+        self._invoke(rail)  # count=2
+        # 连续多轮 HITL 恢复：计数冻结
+        for i in range(5):
+            self._invoke(
+                rail, query=f"resume{i}", source="permission_interrupt"
+            )
+        assert get_session_active_skill(self.sid) == "hwocr"
+        # 恢复 normal 轮后从冻结值继续累计
+        self._invoke(rail)  # count=3
+        assert get_session_active_skill(self.sid) == "hwocr"
+        self._invoke(rail)  # count>=3 → 清空
+        assert get_session_active_skill(self.sid) is None
+
+    def test_evolution_source_still_counted(self):
+        # 非 HITL 恢复 source（如 evolution）照常计数
+        rail = self._rail(limit=2)
+        self._activate(rail)
+        self._invoke(rail, source="evolution_interrupt")  # count=1
+        self._invoke(rail, source="evolution_interrupt")  # count=2
+        self._invoke(rail)  # count>=2 → 清空
         assert get_session_active_skill(self.sid) is None
 
     def test_skill_tool_call_resets_counter(self):
@@ -379,6 +417,50 @@ class TestCredentialInjectionUsesPreset(unittest.TestCase):
         env = bash_ctx.inputs.tool_args["env"]
         assert env["HWOCR_AK"] == "ak"
         assert env["HWOCR_SK"] == "sk"
+
+
+class TestResolveStaleInvokeLimit(unittest.TestCase):
+    """CR-3b：react.skill_stale_invoke_limit 配置解析。"""
+
+    def test_missing_returns_none(self):
+        assert resolve_stale_invoke_limit(None) is None
+        assert resolve_stale_invoke_limit({}) is None
+        assert resolve_stale_invoke_limit({"react": {}}) is None
+        assert resolve_stale_invoke_limit({"react": {"other": 1}}) is None
+        assert resolve_stale_invoke_limit("not-a-dict") is None
+
+    def test_valid_value(self):
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": 10}}
+            )
+            == 10
+        )
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": "7"}}
+            )
+            == 7
+        )
+
+    def test_zero_and_negative_passthrough(self):
+        # <=0 原样透传（显式禁用兜底）
+        assert (
+            resolve_stale_invoke_limit({"react": {"skill_stale_invoke_limit": 0}})
+            == 0
+        )
+        assert (
+            resolve_stale_invoke_limit({"react": {"skill_stale_invoke_limit": -1}})
+            == -1
+        )
+
+    def test_invalid_falls_back_to_default(self):
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": "abc"}}
+            )
+            is None
+        )
 
 
 class TestAdoptDefaultActiveSkill(unittest.TestCase):
