@@ -28,7 +28,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 from pathlib import Path
 from shutil import which
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, ClassVar, List, Optional, Tuple, cast
 from urllib.parse import quote_plus
 
 import yaml
@@ -16696,6 +16696,9 @@ class JiuWenSwarmDeepAdapter:
             )
         return False
 
+    # 进程内已完成卡一次性守卫：同 (session, goal) 只落盘一次；跨进程重复由磁盘检查兜底
+    _GOAL_COMPLETED_PERSISTED: ClassVar[set[tuple[str, str]]] = set()
+
     @staticmethod
     def _record_goal_completed_history_if_needed(
         *,
@@ -16716,6 +16719,8 @@ class JiuWenSwarmDeepAdapter:
         if not goal_id:
             return
         sid = (session_id or "default").strip() or "default"
+        if (sid, goal_id) in JiuWenSwarmDeepAdapter._GOAL_COMPLETED_PERSISTED:
+            return
         if JiuWenSwarmDeepAdapter._goal_completed_history_exists(sid, goal_id):
             return
 
@@ -16743,6 +16748,7 @@ class JiuWenSwarmDeepAdapter:
                 "evidence": evidence,
             },
         )
+        JiuWenSwarmDeepAdapter._GOAL_COMPLETED_PERSISTED.add((sid, goal_id))
 
     @staticmethod
     def _interaction_goal_updated_payload(payload: Any) -> dict[str, Any]:
