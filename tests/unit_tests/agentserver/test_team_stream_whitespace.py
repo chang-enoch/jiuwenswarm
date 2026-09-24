@@ -63,6 +63,16 @@ def test_response_chunk_team_keeps_whitespace_drops_empty() -> None:
     assert parse_stream_chunk(empty, preserve_whitespace=True) is None
 
 
+def test_chunked_answer_preserves_whitespace_in_team_mode() -> None:
+    chunk = SimpleNamespace(
+        type="answer",
+        payload={"output": {"output": "\n\n", "chunked": True}},
+    )
+    assert parse_stream_chunk(chunk) is None
+    parsed = parse_stream_chunk(chunk, preserve_whitespace=True)
+    assert parsed == {"event_type": "chat.delta", "content": "\n\n"}
+
+
 def test_team_helpers_wires_preserve_whitespace() -> None:
     """Guard against regressing the team call-site without importing heavy deps."""
     source = Path("jiuwenswarm/server/runtime/agent_adapter/team_helpers.py").read_text(

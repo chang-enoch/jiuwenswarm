@@ -452,7 +452,9 @@ def _parse_typed_chunk(
             content = str(payload)
             is_chunked = False
 
-        if not content or not content.strip():
+        # Team (preserve_whitespace): keep formatting-only chunked answer deltas
+        # (e.g. "\n\n" for Markdown tables). Default still strips whitespace-only.
+        if _is_absent_stream_text(content, preserve_whitespace=preserve_whitespace):
             return None
 
         if _has_streamed_content and not is_chunked:
