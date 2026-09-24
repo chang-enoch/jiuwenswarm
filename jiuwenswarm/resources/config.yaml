@@ -803,6 +803,7 @@ redis:
   host: ${REDIS_HOST:-localhost}
   port: ${REDIS_PORT:-6379}
   password: ${REDIS_PASSWORD:-}
+  username: ${REDIS_USER:-}
   db: ${REDIS_DB:-0}
   # Session 数据过期时间（秒）
   session_ttl: ${REDIS_SESSION_TTL:-604800}
