@@ -1226,6 +1226,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                 get_skill_turbo_hitl_tic,
                 set_skill_turbo_hitl_tic,
             )
+            _tool_name = str(getattr(ctx.inputs, "tool_name", "") or "")
             _hitl_request_dump: dict[str, Any] | None = None
             _raw_tool_result = ctx.inputs.tool_result
             if (
@@ -1237,6 +1238,13 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             _skill_turbo_tic = (
                 get_skill_turbo_hitl_tic() if _hitl_request_dump is None else None
             )
+            if _skill_turbo_tic is not None and _tool_name != "skill_acceleration_exec":
+                logger.warning(
+                    "[StreamEventRail] stale skill_turbo TIC dropped for tool=%s",
+                    _tool_name,
+                )
+                set_skill_turbo_hitl_tic(None)
+                _skill_turbo_tic = None
             if _hitl_request_dump is not None or _skill_turbo_tic is not None:
                 set_skill_turbo_hitl_tic(None)
                 if isinstance(ctx.inputs, ToolCallInputs):
@@ -1285,6 +1293,24 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                 "[StreamEventRail] skill_turbo HITL rewrite failed",
                 exc_info=True,
             )
+            # 降级：原始 marker dict 不可直接透传给模型（无语义 JSON 会让
+            # 模型误判失败并回退 skill_tool）。改为可读暂停文案兜底。
+            from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+                _SKILL_TURBO_HITL_RESULT_KEY,
+            )
+            if (
+                isinstance(ctx.inputs, ToolCallInputs)
+                and isinstance(ctx.inputs.tool_result, dict)
+                and ctx.inputs.tool_result.get(_SKILL_TURBO_HITL_RESULT_KEY)
+            ):
+                from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+                    _SKILL_TURBO_HITL_PLACEHOLDER,
+                )
+                ctx.inputs.tool_result = _SKILL_TURBO_HITL_PLACEHOLDER
+                ctx.inputs.tool_msg = ToolMessage(
+                    content=_SKILL_TURBO_HITL_PLACEHOLDER,
+                    tool_call_id=ctx.inputs.tool_call.id,
+                )
 
         if (
             str(getattr(tc, "name", "") or "").strip() == "deepresearch_execute"

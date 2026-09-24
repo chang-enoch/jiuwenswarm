@@ -32,6 +32,7 @@ from jiuwenswarm.agents.harness.common.rails.stream_event_rail import (
 from jiuwenswarm.server.runtime.skill_turbo import skill_turbo_tools
 from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
     build_skill_turbo_hitl_result,
+    get_skill_turbo_hitl_tic,
     set_skill_turbo_hitl_tic,
 )
 
@@ -238,3 +239,84 @@ def test_skill_turbo_hitl_result_marker_is_deepcopy_safe():
     cloned = copy.deepcopy(marker)
     assert cloned == marker
     assert cloned["request"]["message"] == "页数"
+
+
+@pytest.mark.asyncio
+async def test_stale_tic_does_not_hijack_unrelated_tool():
+    """验证残留 TIC 不会劫持非 skill_acceleration_exec 工具的 after_tool_call。"""
+    rail = JiuSwarmStreamEventRail()
+    rail.set_skill_turbo_adapter(SimpleNamespace(_instance=None))
+    session = _StreamSession()
+    tic = _make_tic()
+    set_skill_turbo_hitl_tic(tic)
+    try:
+        tc = SimpleNamespace(id="call-web-1", name="web_search", arguments={})
+        ctx = SimpleNamespace(
+            session=session,
+            inputs=ToolCallInputs(
+                tool_call=tc,
+                tool_name="web_search",
+                tool_args={},
+                tool_result="search results here",
+                tool_msg=None,
+            ),
+            extra={},
+            exception=None,
+            request_force_finish=lambda *_a, **_kw: None,
+        )
+        await rail.after_tool_call(ctx)
+        assert ctx.inputs.tool_result == "search results here", (
+            "unrelated tool_result should not be rewritten by stale TIC"
+        )
+        assert get_skill_turbo_hitl_tic() is None, (
+            "stale TIC should be cleared after being dropped"
+        )
+    finally:
+        set_skill_turbo_hitl_tic(None)
+
+
+@pytest.mark.asyncio
+async def test_marker_validation_failure_degrades_to_readable_placeholder(monkeypatch):
+    """验证 marker 校验失败时降级为可读暂停文案，不透传原始 dict。"""
+    from openjiuwen.core.single_agent.interrupt.response import (
+        ToolCallInterruptRequest,
+    )
+
+    def _raise_validation_error(*_args, **_kwargs):
+        raise ValueError("simulated schema drift")
+
+    monkeypatch.setattr(ToolCallInterruptRequest, "model_validate", _raise_validation_error)
+
+    rail = JiuSwarmStreamEventRail()
+    rail.set_skill_turbo_adapter(SimpleNamespace(_instance=None))
+    session = _StreamSession()
+    from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+        _SKILL_TURBO_HITL_PLACEHOLDER,
+        _SKILL_TURBO_HITL_RESULT_KEY,
+    )
+
+    bad_marker = {_SKILL_TURBO_HITL_RESULT_KEY: True, "request": {"message": "x"}}
+    tc = SimpleNamespace(
+        id="call-9",
+        name="skill_acceleration_exec",
+        arguments={"query": "make ppt"},
+    )
+    ctx = SimpleNamespace(
+        session=session,
+        inputs=ToolCallInputs(
+            tool_call=tc,
+            tool_name="skill_acceleration_exec",
+            tool_args={"query": "make ppt"},
+            tool_result=bad_marker,
+            tool_msg=None,
+        ),
+        extra={},
+        exception=None,
+        request_force_finish=lambda *_a, **_kw: None,
+    )
+    set_skill_turbo_hitl_tic(None)
+    await rail.after_tool_call(ctx)
+    assert ctx.inputs.tool_result == _SKILL_TURBO_HITL_PLACEHOLDER, (
+        "marker validation failure should degrade to readable placeholder, "
+        f"got {ctx.inputs.tool_result!r}"
+    )
