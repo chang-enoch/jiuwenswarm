@@ -25,6 +25,7 @@ SYNC_ENV_SCHEMA: frozenset[str] = frozenset(
         "API_BASE",
         "MEMORY_ENGINE",
         "EVOLUTION_ENABLED",
+        "TTSE_ENABLED",
         "EMBED_API_KEY",
         "EMBED_API_BASE",
         "EMBED_MODEL",
@@ -135,16 +136,43 @@ def _ensure_react_evolution_dict(result: dict[str, Any]) -> dict[str, Any]:
     return evolution
 
 
+def _ensure_react_ttse_dict(result: dict[str, Any]) -> dict[str, Any]:
+    """Prefer config.react.ttse; migrate bare config.ttse into react when needed."""
+    react = result.get("react")
+    if not isinstance(react, dict):
+        react = {}
+        result["react"] = react
+    ttse = react.get("ttse")
+    if not isinstance(ttse, dict):
+        top = result.pop("ttse", None)
+        ttse = top if isinstance(top, dict) else {}
+        react["ttse"] = ttse
+    else:
+        top = result.pop("ttse", None)
+        if isinstance(top, dict) and top:
+            logger.warning(
+                "sync_agents_configs: discarding top-level ttse=%r; "
+                "react.ttse takes precedence",
+                top,
+            )
+    return ttse
+
+
 def synthesize_config(
     config: Any,
     env: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Materialize memory/evolution into config; protocol authority is env.
+    """Materialize memory/evolution/ttse into config; protocol authority is env.
 
-    Writes ``config.memory.engine`` and ``config.react.evolution`` from
+    Writes ``config.memory.engine`` and ``config.react.evolution.enabled`` from
     ``MEMORY_ENGINE`` / ``EVOLUTION_ENABLED``. Mis-sent config blocks are
     overlaid from env (warn). When env values are blank/absent, falls back to
     existing config then defaults (``builtin`` / ``enabled=false``).
+
+    ``react.ttse.enabled`` is set only when inbound config or ``TTSE_ENABLED``
+    is explicit. Omitting the key keeps sparse sync snapshots compatible with
+    ``_merge_ttse_config`` (runtime wins only when present; otherwise disk /
+    template default applies — shipped template defaults to ``true``).
     """
     if not isinstance(config, dict):
         raise ValueError("agent config must be an object")
@@ -156,15 +184,22 @@ def synthesize_config(
         inbound_engine = str(mem_in.get("engine")).strip().lower()
 
     inbound_evo: bool | None = None
+    inbound_ttse: bool | None = None
     react_in = config.get("react")
     if isinstance(react_in, dict) and isinstance(react_in.get("evolution"), dict):
         if "enabled" in react_in["evolution"]:
             inbound_evo = bool(react_in["evolution"].get("enabled"))
     elif isinstance(config.get("evolution"), dict) and "enabled" in config["evolution"]:
         inbound_evo = bool(config["evolution"].get("enabled"))
+    if isinstance(react_in, dict) and isinstance(react_in.get("ttse"), dict):
+        if "enabled" in react_in["ttse"]:
+            inbound_ttse = bool(react_in["ttse"].get("enabled"))
+    elif isinstance(config.get("ttse"), dict) and "enabled" in config["ttse"]:
+        inbound_ttse = bool(config["ttse"].get("enabled"))
 
     memory = _ensure_memory_dict(result)
     evolution = _ensure_react_evolution_dict(result)
+    ttse = _ensure_react_ttse_dict(result)
 
     engine = (
         inbound_engine
@@ -172,6 +207,8 @@ def synthesize_config(
         else "builtin"
     )
     evo_enabled = bool(inbound_evo) if inbound_evo is not None else False
+    # None = leave key absent so _merge_ttse_config inherits on-disk default.
+    ttse_enabled: bool | None = bool(inbound_ttse) if inbound_ttse is not None else None
 
     if isinstance(env, dict):
         env_engine_raw = env.get("MEMORY_ENGINE")
@@ -205,8 +242,21 @@ def synthesize_config(
                 )
             evo_enabled = env_evo
 
+        env_ttse = _env_bool(env.get("TTSE_ENABLED"))
+        if env_ttse is not None:
+            if inbound_ttse is not None and inbound_ttse != env_ttse:
+                logger.warning(
+                    "sync_agents_configs: TTSE_ENABLED env=%r overlays "
+                    "mis-sent config enabled=%r",
+                    env.get("TTSE_ENABLED"),
+                    inbound_ttse,
+                )
+            ttse_enabled = env_ttse
+
     memory["engine"] = engine
     evolution["enabled"] = evo_enabled
+    if ttse_enabled is not None:
+        ttse["enabled"] = ttse_enabled
     return result
 
 

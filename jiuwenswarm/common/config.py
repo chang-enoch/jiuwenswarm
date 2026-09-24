@@ -928,6 +928,21 @@ def update_evolution_enabled_in_config(value: bool) -> None:
     dump_yaml_round_trip(_current_config_yaml_path(), data)
 
 
+def update_ttse_enabled_in_config(value: bool) -> None:
+    """更新 react.ttse.enabled（经验自演进 / TTSE 总开关）并写回用户 override。"""
+    data = load_yaml_round_trip(_current_config_yaml_path())
+    react = data.get("react")
+    if not isinstance(react, dict):
+        react = {}
+        data["react"] = react
+    ttse = react.get("ttse")
+    if not isinstance(ttse, dict):
+        ttse = {}
+        react["ttse"] = ttse
+    ttse["enabled"] = value
+    dump_yaml_round_trip(_current_config_yaml_path(), data)
+
+
 def update_context_engine_enabled_in_config(value: bool) -> None:
     """更新 react.context_engine_config.enabled（上下文压缩开关）并写回。"""
     data = load_yaml_round_trip(_current_config_yaml_path())

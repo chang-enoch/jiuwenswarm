@@ -109,6 +109,7 @@ BUSINESS_MIRROR_KEYS: frozenset[str] = frozenset(
         "API_BASE",
         "MEMORY_ENGINE",
         "EVOLUTION_ENABLED",
+        "TTSE_ENABLED",
         "EMBED_API_KEY",
         "EMBED_API_BASE",
         "EMBED_MODEL",

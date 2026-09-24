@@ -148,7 +148,7 @@ from jiuwenswarm.llm_sse_patch import apply_openai_sse_invoke_patch
 
 apply_openai_sse_invoke_patch()
 
-# [PERF 实验] symphony 关闭时短路 evolution rail 轨迹采集(实测占回合 ~40%)
+# [PERF 实验] 企业版 + symphony 关闭时短路 evolution rail 轨迹 drain
 from jiuwenswarm.perf.evolution_rail_short_circuit import (
     apply_evolution_rail_short_circuit,
 )

@@ -26,6 +26,7 @@ from jiuwenswarm.common.config import (
     update_skill_retrieval_in_config,
     update_setup_guide_enabled_in_config,
     update_evolution_enabled_in_config,
+    update_ttse_enabled_in_config,
     update_xiaoyi_runtime_in_config,
 )
 
@@ -171,6 +172,19 @@ class TestConfigFunctions:
         raw = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
         assert raw["react"]["evolution"]["enabled"] is False
         assert get_evolution_enabled(raw) is False
+
+    @staticmethod
+    def test_update_ttse_enabled_in_config(
+        monkeypatch: pytest.MonkeyPatch,
+        temp_config_file: Path,
+    ):
+        monkeypatch.setattr("jiuwenswarm.common.config.get_config_file", lambda: temp_config_file)
+
+        update_ttse_enabled_in_config(False)
+
+        raw = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+        assert raw["react"]["ttse"]["enabled"] is False
+        assert get_ttse_enabled(raw) is False
 
     @pytest.mark.parametrize(
         ("config", "expected"),
