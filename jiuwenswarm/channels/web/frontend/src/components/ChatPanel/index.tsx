@@ -413,14 +413,14 @@ function WelcomeHeading() {
   if (isZh) {
     return (
       <>
-        JiuwenSwarm 轻松解决工作每个问题！
+        {import.meta.env.VITE_WELCOME_TITLE_ZH || 'JiuwenSwarm 轻松解决工作每个问题！'}
       </>
     );
   }
 
   return (
     <>
-      JiuwenSwarm makes work easier!
+      {import.meta.env.VITE_WELCOME_TITLE_EN || 'JiuwenSwarm makes work easier!'}
     </>
   );
 }
