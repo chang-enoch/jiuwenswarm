@@ -48,10 +48,10 @@ dependencies = [
     "sqlite-vec==0.1.6",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "python-multipart>=0.0.27",  # CVE-2026-42561 MultipartParser DoS
+    "python-multipart>=0.0.31",  # CVE-2026-42561 / CVE-2026-53539 multipart DoS
     # Transitive dep floors for known CVEs (prevent resolve downgrade)
     "lxml>=6.1.0",  # CVE-2026-41066 XXE
-    "pillow>=12.2.0",  # CVE-2026-40192 FITS gzip bomb DoS
+    "pillow>=12.3.0",  # CVE-2026-40192 / CVE-2026-59203 / CVE-2026-59204 image DoS
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
@@ -98,9 +98,9 @@ harmony = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "httptools>=0.6.3",
-    "python-multipart>=0.0.27",  # CVE-2026-42561
+    "python-multipart>=0.0.31",  # CVE-2026-42561 / CVE-2026-53539
     "lxml>=6.1.0",  # CVE-2026-41066
-    "pillow>=12.2.0",  # CVE-2026-40192
+    "pillow>=12.3.0",  # CVE-2026-40192 / CVE-2026-59203 / CVE-2026-59204
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
