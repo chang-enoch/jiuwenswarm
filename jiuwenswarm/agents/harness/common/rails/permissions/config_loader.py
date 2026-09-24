@@ -16,13 +16,14 @@ logger = logging.getLogger(__name__)
 
 PersistScope = Literal["session", "base"]
 
-# 标准版 yaml 保留键：按 agent_id 分桶的完整 permissions body，不是工具名。
+# 标准版 yaml 保留键：按 agent_id 分桶的 permissions 覆盖段（稀疏），不是工具名。
 PERMISSIONS_AGENTS_KEY = "agents"
-# 护栏全局 persist / 专属落盘未命中时，从当前全局模板克隆这些桶（已有则不覆盖）。
+# 种子 id：未建桶时专属落盘仍可写入 agents[id]（按需稀疏，非整段克隆全局）。
 SEED_PERMISSIONS_AGENT_IDS: tuple[str, ...] = ("office-excel",)
 
 _cached_global: dict[str, Any] | None = None
 _cached_agents: dict[str, dict[str, Any]] = {}
+_cached_template_permissions: dict[str, Any] | None = None
 _cache_source: str | None = None
 _session_overlays: dict[str, dict[str, Any]] = {}
 
@@ -71,9 +72,10 @@ def get_permissions_agent_base() -> dict[str, Any] | None:
 
 
 def clear_permissions_config_cache() -> None:
-    global _cached_global, _cached_agents, _cache_source
+    global _cached_global, _cached_agents, _cached_template_permissions, _cache_source
     _cached_global = None
     _cached_agents = {}
+    _cached_template_permissions = None
     _cache_source = None
 
 
@@ -139,31 +141,6 @@ def _is_seed_permissions_agent_id(agent_id: str | None) -> bool:
     return bool(normalized) and normalized in SEED_PERMISSIONS_AGENT_IDS
 
 
-def _clone_permissions_template_body(source: dict[str, Any] | None) -> dict[str, Any]:
-    """从全局/模板 permissions 段克隆一份可作 ``agents[id]`` 的 body。"""
-    return sanitize_agent_permissions_body(strip_permissions_agents(source))
-
-
-def _seed_missing_agent_buckets(
-    agents_table: dict[str, Any],
-    template_body: dict[str, Any],
-) -> bool:
-    """按种子 id 补桶；已有 dict 不覆盖。返回是否新建过桶。"""
-    cloned = _clone_permissions_template_body(template_body)
-    created = False
-    for agent_id in SEED_PERMISSIONS_AGENT_IDS:
-        existing = agents_table.get(agent_id)
-        if isinstance(existing, dict):
-            continue
-        agents_table[agent_id] = copy.deepcopy(cloned)
-        created = True
-        logger.info(
-            "[permissions_config] seeded yaml agents[%s] from global template",
-            agent_id,
-        )
-    return created
-
-
 def _parse_agents_table(raw: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
@@ -192,6 +169,12 @@ def _ingest_permissions_raw(raw: dict[str, Any], source: str) -> dict[str, Any]:
 
 
 def _load_yaml_cache(*, force_reload: bool = False) -> dict[str, Any]:
+    """加载 yaml 缓存，返回剥掉 ``agents`` 后的全局段。
+
+    副作用：标准版同步填充 ``_cached_agents``。调用方若需要 ``agents[id]``
+    覆盖表，必须读 ``_cached_agents``，**禁止**对返回值做 ``.get("agents")``
+    （返回值永远不含该键）。
+    """
     global _cached_global
     if not force_reload and _cached_global is not None:
         return copy.deepcopy(_cached_global)
@@ -199,40 +182,147 @@ def _load_yaml_cache(*, force_reload: bool = False) -> dict[str, Any]:
     return _ingest_permissions_raw(raw, "yaml")
 
 
+def _ensure_yaml_permissions_cache(*, force_reload: bool = False) -> None:
+    """确保 ``_cached_global`` / ``_cached_agents`` 已从 yaml 加载。"""
+    _load_yaml_cache(force_reload=force_reload)
+
+
 def get_global_permissions_config(*, force_reload: bool = False) -> dict[str, Any]:
-    """标准版全局策略段（yaml 去掉 ``agents``）。不读 ``PERMISSIONS_AGENT_BASE``。"""
+    """标准版全局策略段（yaml 去掉 ``agents``）。不读 ``PERMISSIONS_AGENT_BASE``。
+
+    该段为「包内模板 ∪ 用户 override」的生效全局，可被 UI 改写。
+    Agent 稀疏覆盖的缺省底请用 ``get_shipped_template_permissions_config``。
+    """
     return _load_yaml_cache(force_reload=force_reload)
 
 
-def resolve_yaml_agent_permissions_body(agent_id: str | None) -> dict[str, Any] | None:
-    """标准版精确匹配 ``permissions.agents[agent_id]``；企业版不解析 yaml ``agents``。
+def get_shipped_template_permissions_config(*, force_reload: bool = False) -> dict[str, Any]:
+    """包内 ``resources/config.yaml`` 的 permissions 全局段（剥掉 ``agents``）。
 
-    value 非 dict 视为未命中。命中后返回已剥掉内层 ``agents`` 的完整 body。
+    不受用户全局 permissions 改动影响；供 ``agents[id]`` 稀疏覆盖的缺省底。
+    """
+    global _cached_template_permissions
+    if not force_reload and _cached_template_permissions is not None:
+        return copy.deepcopy(_cached_template_permissions)
+    from jiuwenswarm.common.utils import load_yaml_dict, resolve_shipped_template_config_path
+
+    raw = load_yaml_dict(resolve_shipped_template_config_path()).get("permissions")
+    _cached_template_permissions = strip_permissions_agents(
+        raw if isinstance(raw, dict) else {}
+    )
+    return copy.deepcopy(_cached_template_permissions)
+
+
+def merge_agent_permissions_overlay(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """以 base（通常为包内模板）为底，agent 稀疏覆盖叠加上去。
+
+    ``tools`` / ``file_guard`` 深合并，其余键覆盖。
+    """
+    merged = strip_permissions_agents(base if isinstance(base, dict) else {})
+    if not isinstance(overlay, dict) or not overlay:
+        return merged
+
+    overlay_clean = sanitize_agent_permissions_body(overlay)
+
+    overlay_tools = overlay_clean.get("tools")
+    if isinstance(overlay_tools, dict):
+        tools = merged.get("tools")
+        if not isinstance(tools, dict):
+            tools = {}
+            merged["tools"] = tools
+        tools.update(copy.deepcopy(overlay_tools))
+
+    overlay_overrides = overlay_clean.get("approval_overrides")
+    if isinstance(overlay_overrides, list):
+        base_list = list(merged.get("approval_overrides") or [])
+        existing = {
+            _approval_override_fingerprint(item)
+            for item in base_list
+            if isinstance(item, dict)
+        }
+        for item in overlay_overrides:
+            if not isinstance(item, dict):
+                continue
+            fingerprint = _approval_override_fingerprint(item)
+            if fingerprint in existing:
+                continue
+            base_list.append(copy.deepcopy(item))
+            existing.add(fingerprint)
+        merged["approval_overrides"] = base_list
+
+    overlay_fg = overlay_clean.get("file_guard")
+    if isinstance(overlay_fg, dict):
+        fg = merged.get("file_guard")
+        if not isinstance(fg, dict):
+            fg = {}
+            merged["file_guard"] = fg
+        _deep_merge_file_guard(fg, overlay_fg)
+
+    for key, value in overlay_clean.items():
+        if key in ("tools", "approval_overrides", "file_guard"):
+            continue
+        merged[key] = copy.deepcopy(value)
+
+    return merged
+
+
+def get_yaml_agent_permissions_overlay(agent_id: str | None) -> dict[str, Any] | None:
+    """标准版返回 yaml ``permissions.agents[id]`` 稀疏覆盖段；企业版 / 未命中为 ``None``。
+
+    不与模板/全局合并；供落盘 mutate。内层再嵌套 ``agents`` 已剥离。
+
+    实现注意：全局缓存 API（``_load_yaml_cache`` / ``get_global_permissions_config``）
+    返回值已剥掉 ``agents``，不能对返回 dict 做 ``.get("agents")``。覆盖表只存在于
+    ``_cached_agents``（由 ``_ingest_permissions_raw`` 在加载时填充）。
     """
     if is_enterprise():
         return None
     normalized = normalize_permissions_agent_id(agent_id)
     if not normalized:
         return None
-    _load_yaml_cache()
+    _ensure_yaml_permissions_cache()
     body = _cached_agents.get(normalized)
     if not isinstance(body, dict):
         return None
     return copy.deepcopy(body)
 
 
-def resolve_permissions_persist_target(agent_id: str | None) -> str | None:
-    """命中 yaml ``agents[id]`` 时返回该 id（写专属 body）；否则 ``None``（写全局）。
+def resolve_yaml_agent_permissions_body(agent_id: str | None) -> dict[str, Any] | None:
+    """标准版解析 ``permissions.agents[agent_id]``；企业版不解析 yaml ``agents``。
 
-    企业版恒为 ``None``。种子 id（如 ``office-excel``）未命中仍返回该 id，persist 时
-    从全局模板 copy-on-write 建桶。其它 id 未命中不新建。
+    - 命中稀疏覆盖，或种子 id（如 ``office-excel``）尚未建桶：返回
+      「包内模板 ∪ 覆盖」生效 body（缺省不受用户全局改动影响）。
+    - 其它 id 未命中：``None``（调用方回落用户全局）。
     """
     if is_enterprise():
         return None
     normalized = normalize_permissions_agent_id(agent_id)
     if not normalized:
         return None
-    if resolve_yaml_agent_permissions_body(normalized) is not None:
+    overlay = get_yaml_agent_permissions_overlay(normalized)
+    if overlay is None and not _is_seed_permissions_agent_id(normalized):
+        return None
+    return merge_agent_permissions_overlay(
+        get_shipped_template_permissions_config(),
+        overlay or {},
+    )
+
+
+def resolve_permissions_persist_target(agent_id: str | None) -> str | None:
+    """命中 yaml ``agents[id]`` 时返回该 id（写专属覆盖）；否则 ``None``（写全局）。
+
+    企业版恒为 ``None``。种子 id（如 ``office-excel``）未命中仍返回该 id，persist 时
+    按需建空覆盖桶并只写入本次 mutate 字段。其它 id 未命中不新建。
+    """
+    if is_enterprise():
+        return None
+    normalized = normalize_permissions_agent_id(agent_id)
+    if not normalized:
+        return None
+    if get_yaml_agent_permissions_overlay(normalized) is not None:
         return normalized
     if _is_seed_permissions_agent_id(normalized):
         return normalized
@@ -523,9 +613,9 @@ def persist_permissions_mutate(
     """变更 permissions 并持久化。
 
     - 标准版：写 ``config.yaml``。``persist_target_agent_id`` 命中 yaml
-      ``agents[id]`` 时只更新该 body；种子 id 未命中则从全局模板 copy-on-write
-      建桶后写入；其它未命中写全局。全局 persist 会补齐缺失的种子桶（如
-      ``office-excel``），已有桶不覆盖。
+      ``agents[id]`` 时只更新该稀疏覆盖段；种子 id 未命中则建空覆盖后只写入
+      本次 mutate 字段（不整段克隆全局）。其它未命中写全局。全局 persist
+      **不**自动 seed ``agents`` 桶。
     - 企业版 + ``persist_scope='session'``：仅更新指定会话的内存 overlay。
     - 企业版 + ``persist_scope='base'``：仅更新进程内存缓存（不再写 permissions_config 表；
       Agent 级策略请改 permissions_template）。不读写 yaml ``agents``。
@@ -569,10 +659,11 @@ def persist_permissions_mutate(
         return permissions
 
     target_id = normalize_permissions_agent_id(persist_target_agent_id)
-    agent_body = resolve_yaml_agent_permissions_body(target_id) if target_id else None
-    if target_id and agent_body is not None:
-        permissions = copy.deepcopy(agent_body)
-        old_permissions = copy.deepcopy(permissions)
+    agent_overlay = get_yaml_agent_permissions_overlay(target_id) if target_id else None
+    if target_id and agent_overlay is not None:
+        permissions = copy.deepcopy(agent_overlay)
+        template_base = get_shipped_template_permissions_config()
+        old_effective = merge_agent_permissions_overlay(template_base, permissions)
         mutate_fn(permissions)
         permissions = sanitize_agent_permissions_body(permissions)
         _persist_agent_permissions_to_yaml(target_id, permissions)
@@ -582,24 +673,28 @@ def persist_permissions_mutate(
             target_id,
             source,
         )
-        _sync_skill_grants(old_permissions, permissions)
-        return permissions
+        new_effective = merge_agent_permissions_overlay(template_base, permissions)
+        _sync_skill_grants(old_effective, new_effective)
+        return new_effective
 
     if target_id and _is_seed_permissions_agent_id(target_id):
-        permissions = _clone_permissions_template_body(get_global_permissions_config())
-        old_permissions = copy.deepcopy(permissions)
+        permissions: dict[str, Any] = {}
+        template_base = get_shipped_template_permissions_config()
+        old_effective = copy.deepcopy(template_base)
         mutate_fn(permissions)
         permissions = sanitize_agent_permissions_body(permissions)
         _persist_agent_permissions_to_yaml(target_id, permissions)
         _cached_agents[target_id] = copy.deepcopy(permissions)
         logger.info(
-            "[permissions_config] standard agent persist copy-on-write "
-            "agent_id=%s source=%s",
+            "[permissions_config] standard agent persist sparse-create "
+            "agent_id=%s source=%s keys=%s",
             target_id,
             source,
+            sorted(permissions.keys()),
         )
-        _sync_skill_grants(old_permissions, permissions)
-        return permissions
+        new_effective = merge_agent_permissions_overlay(template_base, permissions)
+        _sync_skill_grants(old_effective, new_effective)
+        return new_effective
 
     permissions = get_global_permissions_config()
     if not isinstance(permissions, dict):
@@ -655,17 +750,15 @@ def _persist_global_permissions_to_yaml(permissions: dict[str, Any]) -> None:
 
     section = copy.deepcopy(permissions)
     section.pop(PERMISSIONS_AGENTS_KEY, None)
-    if not is_enterprise():
-        if agents_table is None:
-            agents_table = {}
-        _seed_missing_agent_buckets(agents_table, section)
+    if agents_table is not None:
         section[PERMISSIONS_AGENTS_KEY] = agents_table
-        for agent_id, body in agents_table.items():
-            normalized = normalize_permissions_agent_id(str(agent_id) if agent_id is not None else None)
-            if normalized and isinstance(body, dict):
-                _cached_agents[normalized] = sanitize_agent_permissions_body(body)
-    elif agents_table is not None:
-        section[PERMISSIONS_AGENTS_KEY] = agents_table
+        if not is_enterprise():
+            for agent_id, body in agents_table.items():
+                normalized = normalize_permissions_agent_id(
+                    str(agent_id) if agent_id is not None else None
+                )
+                if normalized and isinstance(body, dict):
+                    _cached_agents[normalized] = sanitize_agent_permissions_body(body)
     if not isinstance(data, dict):
         data = {}
     data["permissions"] = section
