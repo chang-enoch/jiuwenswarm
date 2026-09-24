@@ -233,12 +233,13 @@ def _iter_executed_scripts(subcommand: str) -> list[str]:
 def match_skills_in_command(command: str, known_skills: Iterable[str]) -> list[str]:
     """Return every distinct known skill whose script the command *executes*.
 
-    命令归一化（反斜杠→斜杠）后按 ``&& / || / ; / | / &`` 拆子命令，对每个
-    子命令做**执行位判定**（见 ``_iter_executed_scripts``），再对执行位脚本
-    路径**逐段**扫描，任一段精确命中已知技能名即算引用（整段边界，
-    mx-a-x 不会误匹配 mx-a；大小写不敏感）。覆盖 ``<skill>/scripts/x.py``
-    子目录与 ``<skill>/x.py`` 根目录布局、带引号绝对路径解释器的实录形态、
-    wrapper 前缀与直执行形态。按命令中出现顺序去重返回。
+    命令归一化（反斜杠→斜杠）后按 ``&& / || / ; / | / & / 换行`` 拆子命令
+    （见 ``_split_subcommands``），对每个子命令做**执行位判定**（见
+    ``_iter_executed_scripts``），再对执行位脚本路径**逐段**扫描，任一段
+    精确命中已知技能名即算引用（整段边界，mx-a-x 不会误匹配 mx-a；
+    大小写不敏感）。覆盖 ``<skill>/scripts/x.py`` 子目录与 ``<skill>/x.py``
+    根目录布局、带引号绝对路径解释器的实录形态、wrapper 前缀、直执行
+    与多行复合命令形态。按命令中出现顺序去重返回。
 
     注意不能用「/skill/ 后缀到脚本」的单个捕获组正则：finditer 非重叠
     匹配会让最靠前的无关段（如 /Object/、/relay-claw/）吞掉整个匹配。
