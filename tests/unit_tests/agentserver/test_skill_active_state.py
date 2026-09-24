@@ -1,6 +1,6 @@
 # coding: utf-8
 # pylint: disable=protected-access
-"""Tests for skill active-state session id + HITL preserve behavior."""
+"""Tests for skill active-state lifecycle: activation, switch, completion, teardown."""
 
 import asyncio
 import unittest
@@ -12,17 +12,17 @@ from openjiuwen.core.single_agent.rail.base import (
     ToolCallInputs,
 )
 
+from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+    is_interrupt_resume_source,
+)
 from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
-    _CHAT_SEND_SOURCE_EXTRA_KEY,
     _DEFAULT_SESSION_ID,
-    _PRESERVE_SKILL_ACTIVE_EXTRA_KEY,
     _SESSION_ID_EXTRA_KEY,
     SkillActiveStateRail,
     clear_session_skill_state,
     get_session_active_skill,
-    is_interrupt_resume_source,
     resolve_skill_session_id,
-    should_preserve_skill_active_from_params,
+    resolve_stale_invoke_limit,
 )
 from jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail import (
     SkillCredentialInjectionRail,
@@ -73,7 +73,7 @@ class TestResolveSkillSessionId(unittest.TestCase):
         assert resolve_skill_session_id(ctx) == _DEFAULT_SESSION_ID
 
 
-class TestPreserveSkillActiveParams(unittest.TestCase):
+class TestInterruptResumeSource(unittest.TestCase):
     def test_interrupt_sources(self):
         assert is_interrupt_resume_source("permission_interrupt")
         assert is_interrupt_resume_source("confirm_interrupt")
@@ -84,48 +84,6 @@ class TestPreserveSkillActiveParams(unittest.TestCase):
         assert not is_interrupt_resume_source("custom_interrupt")
         assert not is_interrupt_resume_source("user")
         assert not is_interrupt_resume_source("")
-
-    def test_params_permission_resume(self):
-        assert should_preserve_skill_active_from_params(
-            {
-                "source": "permission_interrupt",
-                "request_id": "req-1",
-                "query": "",
-                "answers": [{"x": 1}],
-            }
-        )
-
-    def test_params_answers_only_no_source(self):
-        assert not should_preserve_skill_active_from_params(
-            {"query": "", "answers": [{"selected_options": ["本次允许"]}]}
-        )
-
-    def test_params_source_without_request_id_still_preserves(self):
-        # Source alone is enough to keep active skill across security HITL.
-        assert should_preserve_skill_active_from_params(
-            {
-                "source": "permission_interrupt",
-                "query": "",
-                "answers": [{"x": 1}],
-            }
-        )
-        assert should_preserve_skill_active_from_params(
-            {"source": "permission_interrupt", "query": ""}
-        )
-
-    def test_params_evolution_source_not_preserved_here(self):
-        assert not should_preserve_skill_active_from_params(
-            {
-                "source": "evolution_interrupt",
-                "request_id": "req-1",
-                "answers": [{"x": 1}],
-            }
-        )
-
-    def test_params_new_user_query(self):
-        assert not should_preserve_skill_active_from_params(
-            {"query": "再用 hwocr 识别", "source": ""}
-        )
 
 
 class TestSkillActiveStateRailPreset(unittest.TestCase):
@@ -165,7 +123,7 @@ class TestSkillActiveStateRailPreset(unittest.TestCase):
         assert ctx.extra[_SESSION_ID_EXTRA_KEY] == "officeclaw_preset_sess"
 
 
-class TestHitlPreserveActiveSkill(unittest.TestCase):
+class TestSkillActiveLifecycle(unittest.TestCase):
     sid = "officeclaw_hitl_sess"
 
     def tearDown(self):
@@ -174,34 +132,27 @@ class TestHitlPreserveActiveSkill(unittest.TestCase):
     def _rail(self):
         return SkillActiveStateRail(session_id=self.sid)
 
-    def _activate(self, rail):
+    def _activate(self, rail, skill_name="hwocr"):
         ctx = AgentCallbackContext(agent=MagicMock())
         tool_call = MagicMock()
-        tool_call.arguments = {"skill_name": "hwocr"}
+        tool_call.arguments = {"skill_name": skill_name}
         tool_msg = MagicMock()
-        tool_msg.metadata = {"skill_name": "hwocr"}
+        tool_msg.metadata = {"skill_name": skill_name}
         ctx.inputs = ToolCallInputs(
             tool_call=tool_call,
             tool_name="skill_tool",
-            tool_args={"skill_name": "hwocr"},
+            tool_args={"skill_name": skill_name},
             tool_result=None,
             tool_msg=tool_msg,
         )
         ctx.extra = {}
         asyncio.run(rail.after_tool_call(ctx))
 
-    def _invoke_ctx(self, *, query="hello", preserve=False, source=""):
+    def _invoke_ctx(self, *, query="hello"):
         ctx = AgentCallbackContext(agent=MagicMock())
-        run_context = MagicMock()
-        run_context.extra = {
-            _PRESERVE_SKILL_ACTIVE_EXTRA_KEY: preserve,
-        }
-        if source:
-            run_context.extra[_CHAT_SEND_SOURCE_EXTRA_KEY] = source
         ctx.inputs = InvokeInputs(
             query=query,
             conversation_id=self.sid,
-            run_context=run_context,
         )
         ctx.extra = {}
         return ctx
@@ -209,33 +160,36 @@ class TestHitlPreserveActiveSkill(unittest.TestCase):
     def test_after_invoke_does_not_clear(self):
         rail = self._rail()
         self._activate(rail)
-        ctx = self._invoke_ctx(preserve=False)
-        asyncio.run(rail.after_invoke(ctx))
+        asyncio.run(rail.after_invoke(self._invoke_ctx()))
         assert get_session_active_skill(self.sid) == "hwocr"
 
     def test_permission_resume_before_invoke_keeps_active(self):
         rail = self._rail()
         self._activate(rail)
-        ctx = self._invoke_ctx(
-            query="",
-            preserve=True,
-            source="permission_interrupt",
-        )
-        asyncio.run(rail.before_invoke(ctx))
+        asyncio.run(rail.before_invoke(self._invoke_ctx(query="")))
         assert get_session_active_skill(self.sid) == "hwocr"
 
-    def test_ask_user_resume_keeps_active(self):
+    def test_new_user_task_before_invoke_keeps_active(self):
+        # 生命周期修正：新用户任务不再清空 active_skill。
         rail = self._rail()
         self._activate(rail)
-        ctx = self._invoke_ctx(preserve=True, source="ask_user_interrupt")
-        asyncio.run(rail.before_invoke(ctx))
+        asyncio.run(rail.before_invoke(self._invoke_ctx(query="下一题")))
         assert get_session_active_skill(self.sid) == "hwocr"
 
-    def test_new_user_task_before_invoke_clears(self):
+    def test_switch_to_another_skill_replaces_active(self):
+        # 切换到另一个 skill：旧 skill 清空，仅新 skill 激活。
+        rail = self._rail()
+        self._activate(rail, "hwocr")
+        assert get_session_active_skill(self.sid) == "hwocr"
+        self._activate(rail, "ppt-creation")
+        assert get_session_active_skill(self.sid) == "ppt-creation"
+
+    def test_session_teardown_clears_active(self):
+        # 会话结束：clear_session_skill_state（adapter 淘汰 / teardown）清空。
         rail = self._rail()
         self._activate(rail)
-        ctx = self._invoke_ctx(query="下一题", preserve=False)
-        asyncio.run(rail.before_invoke(ctx))
+        assert get_session_active_skill(self.sid) == "hwocr"
+        clear_session_skill_state(self.sid)
         assert get_session_active_skill(self.sid) is None
 
     def test_resume_then_inject_bash(self):
@@ -246,13 +200,9 @@ class TestHitlPreserveActiveSkill(unittest.TestCase):
         )
         self._activate(rail)
         # Simulate interrupted invoke ending without clearing.
-        asyncio.run(rail.after_invoke(self._invoke_ctx(preserve=False)))
+        asyncio.run(rail.after_invoke(self._invoke_ctx()))
         # Permission resume.
-        asyncio.run(
-            rail.before_invoke(
-                self._invoke_ctx(preserve=True, source="permission_interrupt")
-            )
-        )
+        asyncio.run(rail.before_invoke(self._invoke_ctx(query="")))
         bash_ctx = AgentCallbackContext(agent=MagicMock())
         bash_ctx.inputs = ToolCallInputs(
             tool_call=MagicMock(),
@@ -283,6 +233,149 @@ class TestHitlPreserveActiveSkill(unittest.TestCase):
         ctx.extra = {}
         asyncio.run(rail.after_tool_call(ctx))
         assert get_session_active_skill(self.sid) is None
+
+    def test_skill_complete_name_mismatch_keeps_active_and_warns(self):
+        # 激活名 ≠ 完成名：不清空当前激活态，但记录 warn 便于排查
+        rail = self._rail()
+        self._activate(rail, "hwocr")
+        ctx = AgentCallbackContext(agent=MagicMock())
+        tool_call = MagicMock()
+        tool_call.arguments = {"skill_name": "ppt-creation"}
+        tool_msg = MagicMock()
+        tool_msg.metadata = {}
+        ctx.inputs = ToolCallInputs(
+            tool_call=tool_call,
+            tool_name="skill_complete",
+            tool_args={"skill_name": "ppt-creation"},
+            tool_result=None,
+            tool_msg=tool_msg,
+        )
+        ctx.extra = {}
+        with self.assertLogs(
+            "jiuwenswarm.agents.harness.common.rails.skill_active_state",
+            level="WARNING",
+        ) as captured:
+            asyncio.run(rail.after_tool_call(ctx))
+        assert get_session_active_skill(self.sid) == "hwocr"
+        assert any("ignored" in line for line in captured.output)
+
+
+class TestStaleInvokeExpiry(unittest.TestCase):
+    """改动 3：连续 N 轮 invoke 无 skill_tool 调用 → 过期清空 active_skill。"""
+
+    sid = "officeclaw_stale_sess"
+
+    def tearDown(self):
+        clear_session_skill_state(self.sid)
+
+    def _rail(self, limit=5):
+        return SkillActiveStateRail(
+            session_id=self.sid, stale_invoke_limit=limit
+        )
+
+    def _activate(self, rail, skill_name="hwocr"):
+        ctx = AgentCallbackContext(agent=MagicMock())
+        tool_call = MagicMock()
+        tool_call.arguments = {"skill_name": skill_name}
+        tool_msg = MagicMock()
+        tool_msg.metadata = {"skill_name": skill_name}
+        ctx.inputs = ToolCallInputs(
+            tool_call=tool_call,
+            tool_name="skill_tool",
+            tool_args={"skill_name": skill_name},
+            tool_result=None,
+            tool_msg=tool_msg,
+        )
+        ctx.extra = {}
+        asyncio.run(rail.after_tool_call(ctx))
+
+    def _invoke(self, rail, query="q", source=None):
+        ctx = AgentCallbackContext(agent=MagicMock())
+        if source:
+            run_context = MagicMock()
+            run_context.extra = {"chat_send_source": source}
+            ctx.inputs = InvokeInputs(
+                query=query,
+                conversation_id=self.sid,
+                run_context=run_context,
+            )
+        else:
+            ctx.inputs = InvokeInputs(query=query, conversation_id=self.sid)
+        ctx.extra = {}
+        asyncio.run(rail.before_invoke(ctx))
+
+    def test_expires_after_limit(self):
+        rail = self._rail(limit=5)
+        self._activate(rail)
+        for i in range(5):
+            self._invoke(rail, query=f"q{i}")
+        # 连续 5 轮无 skill_tool 调用，第 5 轮结束仍存活
+        assert get_session_active_skill(self.sid) == "hwocr"
+        # 第 6 轮开始时清空
+        self._invoke(rail, query="q6")
+        assert get_session_active_skill(self.sid) is None
+
+    def test_hitl_resume_invoke_not_counted(self):
+        # CR-3a：HITL 恢复轮（同一任务的继续）不计入过期计数——
+        # 密集审批/ask_user 交互不会误清空 active_skill
+        rail = self._rail(limit=3)
+        self._activate(rail)
+        self._invoke(rail)  # count=1
+        self._invoke(rail)  # count=2
+        # 连续多轮 HITL 恢复：计数冻结
+        for i in range(5):
+            self._invoke(
+                rail, query=f"resume{i}", source="permission_interrupt"
+            )
+        assert get_session_active_skill(self.sid) == "hwocr"
+        # 恢复 normal 轮后从冻结值继续累计
+        self._invoke(rail)  # count=3
+        assert get_session_active_skill(self.sid) == "hwocr"
+        self._invoke(rail)  # count>=3 → 清空
+        assert get_session_active_skill(self.sid) is None
+
+    def test_evolution_source_still_counted(self):
+        # 非 HITL 恢复 source（如 evolution）照常计数
+        rail = self._rail(limit=2)
+        self._activate(rail)
+        self._invoke(rail, source="evolution_interrupt")  # count=1
+        self._invoke(rail, source="evolution_interrupt")  # count=2
+        self._invoke(rail)  # count>=2 → 清空
+        assert get_session_active_skill(self.sid) is None
+
+    def test_skill_tool_call_resets_counter(self):
+        rail = self._rail(limit=3)
+        self._activate(rail)
+        self._invoke(rail)
+        self._invoke(rail)
+        # 重新 skill_tool 调用 → 计数清零，重新累计
+        self._activate(rail)
+        self._invoke(rail)
+        self._invoke(rail)
+        assert get_session_active_skill(self.sid) == "hwocr"
+        self._invoke(rail)
+        assert get_session_active_skill(self.sid) == "hwocr"
+        self._invoke(rail)
+        assert get_session_active_skill(self.sid) is None
+
+    def test_switch_resets_counter(self):
+        rail = self._rail(limit=2)
+        self._activate(rail, "hwocr")
+        self._invoke(rail)
+        # 切换技能 → 新技能计数从零开始
+        self._activate(rail, "ppt-creation")
+        self._invoke(rail)
+        self._invoke(rail)
+        assert get_session_active_skill(self.sid) == "ppt-creation"
+        self._invoke(rail)
+        assert get_session_active_skill(self.sid) is None
+
+    def test_limit_nonpositive_disables_expiry(self):
+        rail = self._rail(limit=0)
+        self._activate(rail)
+        for _ in range(10):
+            self._invoke(rail)
+        assert get_session_active_skill(self.sid) == "hwocr"
 
 
 class TestCredentialInjectionUsesPreset(unittest.TestCase):
@@ -324,6 +417,89 @@ class TestCredentialInjectionUsesPreset(unittest.TestCase):
         env = bash_ctx.inputs.tool_args["env"]
         assert env["HWOCR_AK"] == "ak"
         assert env["HWOCR_SK"] == "sk"
+
+
+class TestResolveStaleInvokeLimit(unittest.TestCase):
+    """CR-3b：react.skill_stale_invoke_limit 配置解析。"""
+
+    def test_missing_returns_none(self):
+        assert resolve_stale_invoke_limit(None) is None
+        assert resolve_stale_invoke_limit({}) is None
+        assert resolve_stale_invoke_limit({"react": {}}) is None
+        assert resolve_stale_invoke_limit({"react": {"other": 1}}) is None
+        assert resolve_stale_invoke_limit("not-a-dict") is None
+
+    def test_valid_value(self):
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": 10}}
+            )
+            == 10
+        )
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": "7"}}
+            )
+            == 7
+        )
+
+    def test_zero_and_negative_passthrough(self):
+        # <=0 原样透传（显式禁用兜底）
+        assert (
+            resolve_stale_invoke_limit({"react": {"skill_stale_invoke_limit": 0}})
+            == 0
+        )
+        assert (
+            resolve_stale_invoke_limit({"react": {"skill_stale_invoke_limit": -1}})
+            == -1
+        )
+
+    def test_invalid_falls_back_to_default(self):
+        assert (
+            resolve_stale_invoke_limit(
+                {"react": {"skill_stale_invoke_limit": "abc"}}
+            )
+            is None
+        )
+
+    def test_react_section_form_accepted(self):
+        # N2：reload 路径传入的 config 本身即 react 子 dict，顶层 key 直接命中
+        assert (
+            resolve_stale_invoke_limit({"skill_stale_invoke_limit": 10}) == 10
+        )
+        assert resolve_stale_invoke_limit({"other": 1}) is None
+
+    def test_full_config_form_takes_precedence(self):
+        # 完整 agent 配置形态：react 子 dict 优先于顶层同名 key
+        assert (
+            resolve_stale_invoke_limit(
+                {
+                    "skill_stale_invoke_limit": 99,
+                    "react": {"skill_stale_invoke_limit": 7},
+                }
+            )
+            == 7
+        )
+
+    def test_rail_stale_limit_property(self):
+        # N2：公开只读属性，供装配点检测配置变化（默认 5 / 传参 / 禁用 0）
+        assert SkillActiveStateRail().stale_invoke_limit == 5
+        assert (
+            SkillActiveStateRail(stale_invoke_limit=10).stale_invoke_limit == 10
+        )
+        assert (
+            SkillActiveStateRail(stale_invoke_limit=0).stale_invoke_limit == 0
+        )
+
+    def test_rail_stale_limit_inplace_update(self):
+        # N2：reload 原位更新（不重建实例）；None 归一化为默认值
+        rail = SkillActiveStateRail(stale_invoke_limit=3)
+        rail.update_stale_invoke_limit(10)
+        assert rail.stale_invoke_limit == 10
+        rail.update_stale_invoke_limit(None)
+        assert rail.stale_invoke_limit == 5
+        rail.update_stale_invoke_limit(0)
+        assert rail.stale_invoke_limit == 0
 
 
 class TestAdoptDefaultActiveSkill(unittest.TestCase):
@@ -397,19 +573,13 @@ class TestAdoptDefaultActiveSkill(unittest.TestCase):
         assert get_session_active_skill("officeclaw_adopt_sess") == "hwocr"
         assert get_session_active_skill(_DEFAULT_SESSION_ID) is None
 
-    def test_hitl_before_invoke_adopts_unowned_orphan(self):
+    def test_before_invoke_adopts_unowned_orphan(self):
         self._activate_under_default()
         rail = SkillActiveStateRail(session_id="officeclaw_adopt_sess")
-        run_context = MagicMock()
-        run_context.extra = {
-            _PRESERVE_SKILL_ACTIVE_EXTRA_KEY: True,
-            _CHAT_SEND_SOURCE_EXTRA_KEY: "permission_interrupt",
-        }
         invoke_ctx = AgentCallbackContext(agent=MagicMock())
         invoke_ctx.inputs = InvokeInputs(
             query="",
             conversation_id="officeclaw_adopt_sess",
-            run_context=run_context,
         )
         invoke_ctx.extra = {}
         asyncio.run(rail.before_invoke(invoke_ctx))
@@ -431,45 +601,6 @@ class TestAdoptDefaultActiveSkill(unittest.TestCase):
         bash_ctx.extra = {}
         asyncio.run(inject.before_tool_call(bash_ctx))
         assert bash_ctx.inputs.tool_args["env"]["HWOCR_AK"] == "ak"
-
-
-class TestFalsePreserveFlagWithInterruptSource(unittest.TestCase):
-    sid = "officeclaw_false_preserve"
-
-    def tearDown(self):
-        clear_session_skill_state(self.sid)
-
-    def test_interrupt_source_overrides_false_preserve_flag(self):
-        rail = SkillActiveStateRail(session_id=self.sid)
-        ctx = AgentCallbackContext(agent=MagicMock())
-        tool_call = MagicMock()
-        tool_call.arguments = {"skill_name": "hwocr"}
-        tool_msg = MagicMock()
-        tool_msg.metadata = {"skill_name": "hwocr"}
-        ctx.inputs = ToolCallInputs(
-            tool_call=tool_call,
-            tool_name="skill_tool",
-            tool_args={"skill_name": "hwocr"},
-            tool_result=None,
-            tool_msg=tool_msg,
-        )
-        ctx.extra = {}
-        asyncio.run(rail.after_tool_call(ctx))
-
-        run_context = MagicMock()
-        run_context.extra = {
-            _PRESERVE_SKILL_ACTIVE_EXTRA_KEY: False,
-            _CHAT_SEND_SOURCE_EXTRA_KEY: "permission_interrupt",
-        }
-        invoke_ctx = AgentCallbackContext(agent=MagicMock())
-        invoke_ctx.inputs = InvokeInputs(
-            query="",
-            conversation_id=self.sid,
-            run_context=run_context,
-        )
-        invoke_ctx.extra = {}
-        asyncio.run(rail.before_invoke(invoke_ctx))
-        assert get_session_active_skill(self.sid) == "hwocr"
 
 
 if __name__ == "__main__":

@@ -37,6 +37,48 @@ def _stop_flush_thread():
     sh._flush_stop_event.clear()
 
 
+class TestStripSkillEnvFromHistoryItem:
+    """P1 修复配套：persist 侧 env 剥离固化（tool_call/tool_calls/arguments 三形态）。"""
+
+    def test_tool_call_dict_arguments_stripped(self):
+        item = {
+            "tool_call": {
+                "name": "bash",
+                "arguments": {"command": "echo hi", "env": {"EM_API_KEY": "k"}},
+            }
+        }
+        sh._strip_skill_env_from_history_item(item)
+        assert "env" not in item["tool_call"]["arguments"]
+        assert item["tool_call"]["arguments"]["command"] == "echo hi"
+
+    def test_tool_calls_list_stripped(self):
+        item = {
+            "tool_calls": [
+                {"name": "bash", "arguments": {"env": {"EM_API_KEY": "k"}}},
+                {
+                    "name": "bash",
+                    "arguments": json.dumps(
+                        {"command": "x", "env": {"EM_API_KEY": "k"}}
+                    ),
+                },
+            ]
+        }
+        sh._strip_skill_env_from_history_item(item)
+        assert "env" not in item["tool_calls"][0]["arguments"]
+        assert "env" not in json.loads(item["tool_calls"][1]["arguments"])
+
+    def test_item_level_arguments_stripped(self):
+        item = {"arguments": json.dumps({"env": {"EM_API_KEY": "k"}, "a": 1})}
+        sh._strip_skill_env_from_history_item(item)
+        assert "env" not in json.loads(item["arguments"])
+
+    def test_no_env_untouched(self):
+        item = {"arguments": {"command": "echo hi"}}
+        snapshot = json.dumps(item, sort_keys=True)
+        sh._strip_skill_env_from_history_item(item)
+        assert json.dumps(item, sort_keys=True) == snapshot
+
+
 @pytest.fixture(autouse=True)
 def _reset_buffer_state():
     """每个测试前后清空全局缓冲状态，避免互相污染。"""

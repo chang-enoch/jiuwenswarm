@@ -81,6 +81,9 @@ from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import 
     is_interrupt_resume_payload,
     peek_hitl_batch_members,
 )
+from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
+    _CHAT_SEND_SOURCE_EXTRA_KEY,
+)
 
 PLAN_REMINDER_ORIGINAL_QUERY_KEY = getattr(
     _plan_approval,
@@ -1828,27 +1831,17 @@ class JiuWenSwarm:
                 context,
             )
 
-        # HITL resume metadata for SkillActiveStateRail: keep active skill across
-        # permission/confirm/ask_user interrupt continuations.
+        # HITL resume source（CR-3a）：把 chat.send 的 source 透传到
+        # run_context.extra，供 SkillActiveStateRail.before_invoke 识别
+        # permission/confirm/ask_user 恢复轮——此类轮次是同一任务的继续，
+        # 不计入 active_skill 过期计数。
         try:
-            from jiuwenswarm.agents.harness.common.rails.skill_active_state import (
-                _CHAT_SEND_SOURCE_EXTRA_KEY,
-                _PRESERVE_SKILL_ACTIVE_EXTRA_KEY,
-                is_interrupt_resume_source,
-                should_preserve_skill_active_from_params,
-            )
-
             chat_send_source = (
                 params.get("source").strip()
                 if isinstance(params.get("source"), str) and params.get("source").strip()
                 else ""
             )
-            # HITL source alone must preserve; never write preserve=False for
-            # permission/confirm/ask_user (that cleared hwocr credentials).
-            preserve_skill = should_preserve_skill_active_from_params(params) or (
-                is_interrupt_resume_source(chat_send_source)
-            )
-            if preserve_skill or chat_send_source:
+            if chat_send_source:
                 run_payload = inputs.get("run")
                 if not isinstance(run_payload, dict):
                     run_payload = {}
@@ -1861,13 +1854,14 @@ class JiuWenSwarm:
                 if not isinstance(extra, dict):
                     extra = {}
                     context["extra"] = extra
-                if chat_send_source:
-                    extra[_CHAT_SEND_SOURCE_EXTRA_KEY] = chat_send_source
-                    extra["chat_send_source"] = chat_send_source
-                extra[_PRESERVE_SKILL_ACTIVE_EXTRA_KEY] = bool(preserve_skill)
+                extra[_CHAT_SEND_SOURCE_EXTRA_KEY] = chat_send_source
+                extra["chat_send_source"] = chat_send_source
         except Exception:
-            logger.debug(
-                "[_build_inputs] failed to attach skill-active preserve flags",
+            # N3：透传失败 = HITL 恢复轮回到「计入过期计数」的旧行为，
+            # 生产不可静默——warning 级留痕便于倒查。
+            logger.warning(
+                "[_build_inputs] failed to attach chat_send_source; "
+                "HITL resume invokes will count toward skill stale limit",
                 exc_info=True,
             )
 
