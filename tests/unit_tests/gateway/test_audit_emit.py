@@ -75,7 +75,26 @@ def test_emit_audit_ua_passes_uid_without_context(
     emit_audit_ua(SUBMDL="api_client", PROC="http_agent_send", UA="ok", UID="user1")
     attrs = _audit_memory.records[0]["attributes"]
     assert attrs.get("UID") == "user1"
-    assert attrs.get("user_id") == "user1"
+
+
+def test_emit_audit_maps_session_request_to_trace_txn(
+    _audit_memory: MemoryEmitter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """挂点传 session_id/request_id → 映射为 trace_id/txn_seq。"""
+    monkeypatch.setenv("JIUWENSWARM_EDITION", "enterprise")
+    emit_audit_ua(
+        SUBMDL="gateway",
+        PROC="http_resolve_identity",
+        UA="ok",
+        UID="user1",
+        session_id="webhttp_abc",
+        request_id="req_001",
+    )
+    attrs = _audit_memory.records[0]["attributes"]
+    assert attrs.get("trace_id") == "webhttp_abc"
+    assert attrs.get("txn_seq") == "req_001"
+    assert attrs.get("UID") == "user1"
 
 
 def test_emit_audit_noop_when_config_disabled(

@@ -720,6 +720,7 @@ async def test_send_request_emits_uid_from_envelope(monkeypatch):
     assert len(captured) == 1
     assert captured[0].get("PROC") == "http_agent_send"
     assert captured[0].get("UID") == "user1"
+    assert captured[0].get("session_id") == "s1"
     assert captured[0].get("method") == "session.delete"
 
 

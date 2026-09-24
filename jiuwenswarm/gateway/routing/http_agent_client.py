@@ -347,7 +347,13 @@ class HttpSseAgentServerClient(AgentServerClient):
             )
             # 信封身份：直调路径（如 session.delete）不走 open_gateway_request，
             # ContextVar 常为空；有值时显式写入，无值时仍回退审计上下文。
+            # session_id → trace_id；缺省时直调路径会落成 placeholder「-」。
             uid = str(getattr(envelope, "user_id", None) or "").strip()
+            sid = str(getattr(envelope, "session_id", None) or "").strip()
+            audit_identity = {
+                **({"UID": uid} if uid else {}),
+                **({"session_id": sid} if sid else {}),
+            }
             try:
                 response = await http.request(
                     assembled.verb,
@@ -370,7 +376,7 @@ class HttpSseAgentServerClient(AgentServerClient):
                     request_id=rid,
                     method=str(envelope.method or ""),
                     DSTIP=peer_ip,
-                    **({"UID": uid} if uid else {}),
+                    **audit_identity,
                 )
                 raise
             emit_audit_ua(
@@ -380,7 +386,7 @@ class HttpSseAgentServerClient(AgentServerClient):
                 request_id=rid,
                 method=str(envelope.method or ""),
                 DSTIP=peer_ip,
-                **({"UID": uid} if uid else {}),
+                **audit_identity,
             )
             return result
 
