@@ -608,7 +608,7 @@ function collectTeamState(records: Record<string, unknown>[], sessionId: string)
                 name: pickString(file, ['name']) || 'file',
                 size: typeof file.size === 'number' ? file.size : undefined,
                 mime_type: pickString(file, ['mime_type']) || undefined,
-                download_url: pickString(file, ['download_url']) || undefined,
+                download_url: pickString(file, ['download_url', 'url']) || undefined,
                 path: pickString(file, ['path']) || undefined,
               }))
             : [];

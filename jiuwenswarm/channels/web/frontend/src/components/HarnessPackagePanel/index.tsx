@@ -13,6 +13,7 @@ import { PackageInfo, PackagesPayload, ActivatePayload, DeactivatePayload } from
 import { HarnessExtensionTree } from '../ToolPanel/HarnessExtensionTree';
 import { resolveHarnessError } from '../../utils';
 import './HarnessPackagePanel.css';
+import { resolveApiUrl } from '../../utils/env';
 
 interface HarnessPackagePanelProps {
   sessionId: string;
@@ -297,7 +298,7 @@ export function HarnessPackagePanel({ sessionId }: HarnessPackagePanelProps) {
       if (result.download_url) {
         // New format: direct HTTP download (avoids WebSocket size limits)
         const a = document.createElement('a');
-        a.href = result.download_url;
+        a.href = resolveApiUrl(result.download_url);
         a.download = result.filename || `${selectedPackage?.extension_name || 'package'}.zip`;
         document.body.appendChild(a);
         a.click();

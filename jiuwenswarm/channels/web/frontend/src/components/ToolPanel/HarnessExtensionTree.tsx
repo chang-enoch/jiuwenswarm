@@ -13,6 +13,7 @@ import { useChatStore, useHarnessStore, CachedFileTreeEntry } from '../../stores
 import { webRequest } from '../../services/webClient';
 import { resolveHarnessError } from '../../utils';
 import { ReadOnlyFileModal } from './ReadOnlyFileModal';
+import { resolveApiUrl } from '../../utils/env';
 
 interface FileInfo {
   name: string;
@@ -240,7 +241,7 @@ export function HarnessExtensionTree(props?: HarnessExtensionTreeProps) {
       if (result.download_url) {
         // New format: direct HTTP download (avoids WebSocket size limits)
         const a = document.createElement('a');
-        a.href = result.download_url;
+        a.href = resolveApiUrl(result.download_url);
         a.download = result.filename || `${extensionName || 'package'}.zip`;
         document.body.appendChild(a);
         a.click();
