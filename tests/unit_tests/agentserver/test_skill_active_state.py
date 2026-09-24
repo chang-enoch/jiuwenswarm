@@ -462,6 +462,35 @@ class TestResolveStaleInvokeLimit(unittest.TestCase):
             is None
         )
 
+    def test_react_section_form_accepted(self):
+        # N2：reload 路径传入的 config 本身即 react 子 dict，顶层 key 直接命中
+        assert (
+            resolve_stale_invoke_limit({"skill_stale_invoke_limit": 10}) == 10
+        )
+        assert resolve_stale_invoke_limit({"other": 1}) is None
+
+    def test_full_config_form_takes_precedence(self):
+        # 完整 agent 配置形态：react 子 dict 优先于顶层同名 key
+        assert (
+            resolve_stale_invoke_limit(
+                {
+                    "skill_stale_invoke_limit": 99,
+                    "react": {"skill_stale_invoke_limit": 7},
+                }
+            )
+            == 7
+        )
+
+    def test_rail_stale_limit_property(self):
+        # N2：公开只读属性，供装配点检测配置变化（默认 5 / 传参 / 禁用 0）
+        assert SkillActiveStateRail().stale_invoke_limit == 5
+        assert (
+            SkillActiveStateRail(stale_invoke_limit=10).stale_invoke_limit == 10
+        )
+        assert (
+            SkillActiveStateRail(stale_invoke_limit=0).stale_invoke_limit == 0
+        )
+
 
 class TestAdoptDefaultActiveSkill(unittest.TestCase):
     def tearDown(self):

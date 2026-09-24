@@ -155,27 +155,34 @@ def _is_interrupt_resume_invoke(ctx: AgentCallbackContext) -> bool:
 def resolve_stale_invoke_limit(config: Any) -> Optional[int]:
     """从 agent 配置读取过期兜底轮数（CR-3b）。
 
-    读取 ``config["react"]["skill_stale_invoke_limit"]``：缺失/类型无效
-    返回 None（用 rail 默认值 5）；``<= 0`` 原样透传（显式禁用兜底）。
+    读取 ``skill_stale_invoke_limit``，兼容两种 config 形态（N2）：
+    完整 agent 配置（``config["react"][key]``）与 react 子 dict
+    （``config[key]``，reload 路径传入的形态）。缺失/类型无效返回
+    None（用 rail 默认值 5）；``<= 0`` 原样透传（显式禁用兜底）。
     装配点（interface_deep._build_skill_active_state_rail）消费。
     """
     if not isinstance(config, dict):
         return None
+    sections = [config]
     react = config.get("react")
-    if not isinstance(react, dict) or "skill_stale_invoke_limit" not in react:
-        return None
-    raw = react.get("skill_stale_invoke_limit")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "[SkillActiveStateRail] invalid skill_stale_invoke_limit=%r, "
-            "fallback to default",
-            raw,
-        )
-        return None
+    if isinstance(react, dict):
+        sections.insert(0, react)
+    for section in sections:
+        if "skill_stale_invoke_limit" not in section:
+            continue
+        raw = section.get("skill_stale_invoke_limit")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[SkillActiveStateRail] invalid skill_stale_invoke_limit=%r, "
+                "fallback to default",
+                raw,
+            )
+            return None
+    return None
 
 
 def _extract_session_id(ctx: AgentCallbackContext) -> Optional[str]:
@@ -274,6 +281,11 @@ class SkillActiveStateRail(DeepAgentRail):
         if stale_invoke_limit is None:
             stale_invoke_limit = self.DEFAULT_STALE_INVOKE_LIMIT
         self._stale_invoke_limit = int(stale_invoke_limit)
+
+    @property
+    def stale_invoke_limit(self) -> int:
+        """当前过期兜底轮数（公开只读，供装配点检测配置变化，N2）。"""
+        return self._stale_invoke_limit
 
     def _resolve_session_id(self, ctx: AgentCallbackContext) -> str:
         return resolve_skill_session_id(ctx, self._preset_session_id)

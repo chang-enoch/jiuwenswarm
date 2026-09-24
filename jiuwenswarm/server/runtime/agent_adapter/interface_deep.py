@@ -9439,7 +9439,11 @@ class JiuWenSwarmDeepAdapter:
         )
         rail_infos.insert(
             1,
-            _RailBuildInfo("_skill_active_state_rail", self._build_skill_active_state_rail),
+            _RailBuildInfo(
+                "_skill_active_state_rail",
+                self._build_skill_active_state_rail,
+                {"config": config},
+            ),
         )
 
         rail_infos.append(
@@ -9781,8 +9785,17 @@ class JiuWenSwarmDeepAdapter:
             if self._skill_credential_injection_rail is not None:
                 skill_credential_rail_newly_created = True
 
-        if self._skill_active_state_rail is None:
-            self._skill_active_state_rail = self._build_skill_active_state_rail(config)
+        # reload 路径的 config 是 react 子 dict；limit 配置变化时重建 rail，
+        # 使已存在会话的过期兜底随配置生效（N2，计数存于模块级状态，重建无副作用）
+        new_stale_limit = resolve_stale_invoke_limit(config)
+        if new_stale_limit is None:
+            new_stale_limit = SkillActiveStateRail.DEFAULT_STALE_INVOKE_LIMIT
+        if self._skill_active_state_rail is None or (
+            self._skill_active_state_rail.stale_invoke_limit != new_stale_limit
+        ):
+            self._skill_active_state_rail = self._build_skill_active_state_rail(
+                config
+            )
 
         progressive_tool_rail = None
         if "tool_lazy_load" in config:

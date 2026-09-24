@@ -87,10 +87,12 @@ _TIMEOUT_DURATION_RE = re.compile(r"^[\d.]+[smh]?$")
 
 
 def _split_subcommands(command: str) -> list[str]:
-    """按引号外的 ``&& / || / ; / | / &`` 拆子命令。
+    """按引号外的 ``&& / || / ; / | / & / 换行`` 拆子命令。
 
     引号内的分隔符不拆（``sed 's|/path/x.py|X|'`` 的 ``|`` 是 s 命令
     分隔符）；``2>&1`` 等重定向的 ``&``（前字符为 ``>``）不拆。
+    换行（含 ``\\r\\n`` 残留的 ``\\r``）与 ``;`` 同为顺序执行分隔符，
+    多行复合命令（N1）必须逐行识别，否则第二行脚本绕过执行位判定。
     """
     parts: list[str] = []
     buf: list[str] = []
@@ -115,7 +117,8 @@ def _split_subcommands(command: str) -> list[str]:
         sep_len = 0
         if command[i:i + 2] in ("&&", "||"):
             sep_len = 2
-        elif ch in (";", "|", "&"):
+        elif ch in ("\n", "\r", ";", "|", "&"):
+            # 换行与 ; 同为顺序执行分隔符（多行复合命令，N1）；
             # 2>&1 等重定向的 & 不拆（前一个字符是 > ）
             if ch == "&" and i > 0 and command[i - 1] == ">":
                 sep_len = 0

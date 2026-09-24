@@ -303,6 +303,20 @@ class TestMatchSkillInCommand(unittest.TestCase):
         cmd = "python3 /opt/skills/hwocr/scripts/run.py 查询 --no-save 2>&1"
         assert match_skill_in_command(cmd, self.KNOWN) == "hwocr"
 
+    def test_multiline_compound_commands_matched(self):
+        # N1：换行与 ; 同为顺序执行分隔符，多行复合命令必须逐行识别
+        assert match_skills_in_command(
+            "python3 /a/hwocr/x.py\nnode /b/ppt-creation/y.js", self.KNOWN
+        ) == ["hwocr", "ppt-creation"]
+        # cd 行无执行位，第二行脚本正常命中
+        assert match_skills_in_command(
+            "cd /a/hwocr\nnode /b/ppt-creation/y.js", self.KNOWN
+        ) == ["ppt-creation"]
+        # \r\n 残留形态同样逐行识别
+        assert match_skills_in_command(
+            "python3 /a/hwocr/x.py\r\nnode /b/ppt-creation/y.js", self.KNOWN
+        ) == ["hwocr", "ppt-creation"]
+
 
 class TestSkillGateAndFallback(unittest.TestCase):
     def _make_rail(self):
@@ -481,6 +495,25 @@ class TestSkillGateAndFallback(unittest.TestCase):
         ctx = self._make_ctx(
             tool_args={
                 "command": "python3 /a/hwocr/x.py && node /b/ppt-creation/y.js"
+            }
+        )
+        asyncio.run(rail.before_tool_call(ctx))
+        assert ctx.extra.get("_skip_tool") is True
+        message = str(ctx.inputs.tool_result)
+        assert "hwocr" in message and "ppt-creation" in message
+        assert "拆分" in message
+        assert "env" not in ctx.inputs.tool_args
+
+    @patch(
+        "jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail.get_session_active_skill"
+    )
+    def test_multiline_multi_skill_blocked_with_split_guidance(self, mock_get_skill):
+        # N1：多行复合命令逐行识别——多技能执行位全部命中，拆分指引拦截
+        mock_get_skill.return_value = None
+        rail = self._make_rail()
+        ctx = self._make_ctx(
+            tool_args={
+                "command": "python3 /a/hwocr/x.py\nnode /b/ppt-creation/y.js"
             }
         )
         asyncio.run(rail.before_tool_call(ctx))
