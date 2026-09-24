@@ -14,9 +14,6 @@ if [ "${ROLE}" != "gateway" ] && [ "${ROLE}" != "agentserver" ]; then
     exit 1
 fi
 
-# 初始化 workspace（先建目录/稀疏配置；企业配置由下一步 update_conf.py 覆盖）
-echo "[start.sh] initializing workspace"
-jiuwenswarm-init
 
 # 生成企业版配置（app 身份执行 → 覆盖上一步稀疏版；失败即退出，不 startup）
 echo "[start.sh] generating config via update_conf.py"
