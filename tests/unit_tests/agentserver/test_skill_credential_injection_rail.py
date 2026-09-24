@@ -258,6 +258,51 @@ class TestMatchSkillInCommand(unittest.TestCase):
         )
         assert match_skills_in_command(cmd, self.KNOWN) == ["hwocr", "ppt-creation"]
 
+    def test_readonly_commands_not_matched(self):
+        # CR-2：只读命令引用技能脚本（参数位）不命中——cat/echo/grep/
+        # head/tail/diff/ls 读脚本调试是技能开发的日常形态
+        for cmd in (
+            "cat /opt/skills/hwocr/run.py",
+            "echo see /opt/skills/hwocr/run.py",
+            "grep -n 'def main' /opt/skills/hwocr/run.py",
+            "head -5 /opt/skills/hwocr/run.py",
+            "tail -5 /opt/skills/hwocr/run.py",
+            "diff /opt/skills/hwocr/run.py /opt/skills/hwocr/run.py.bak",
+            "ls /opt/skills/hwocr/scripts",
+        ):
+            assert match_skill_in_command(cmd, self.KNOWN) is None, cmd
+
+    def test_sed_quoted_pattern_not_matched(self):
+        # CR-2：sed 替换串中的技能路径（穿单引号形态）不命中
+        cmd = "sed 's|/opt/skills/hwocr/run.py|X|' cfg"
+        assert match_skill_in_command(cmd, self.KNOWN) is None
+
+    def test_argument_position_reference_not_matched(self):
+        # CR-1 场景2：主跑 active 技能、参数位引用另一技能脚本——
+        # 执行位只有 hwocr，ppt-creation 不进 matched
+        cmd = (
+            "python3 /opt/skills/hwocr/scripts/run.py "
+            "--ref /opt/skills/ppt-creation/sample.py"
+        )
+        assert match_skills_in_command(cmd, self.KNOWN) == ["hwocr"]
+
+    def test_wrapper_prefix_and_direct_execution_matched(self):
+        # wrapper 前缀（VAR=x / sudo / nohup / timeout N）后仍能识别执行位；
+        # 首 token 即脚本的直执行形态同样命中
+        for cmd in (
+            "EM_KEY=x python3 /opt/skills/hwocr/scripts/run.py",
+            "sudo python3 /opt/skills/hwocr/scripts/run.py",
+            "nohup python3 /opt/skills/hwocr/scripts/run.py &",
+            "timeout 30 python3 /opt/skills/hwocr/scripts/run.py",
+            "./skills/hwocr/run.py --x 1",
+        ):
+            assert match_skill_in_command(cmd, self.KNOWN) == "hwocr", cmd
+
+    def test_redirect_suffix_not_split(self):
+        # 2>&1 重定向的 & 不得被子命令拆分误伤（拆坏会导致执行位丢失）
+        cmd = "python3 /opt/skills/hwocr/scripts/run.py 查询 --no-save 2>&1"
+        assert match_skill_in_command(cmd, self.KNOWN) == "hwocr"
+
 
 class TestSkillGateAndFallback(unittest.TestCase):
     def _make_rail(self):
@@ -424,6 +469,45 @@ class TestSkillGateAndFallback(unittest.TestCase):
         message = str(ctx.inputs.tool_result)
         assert "skill_tool" in message
         assert "credential" in message.lower()
+
+    @patch(
+        "jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail.get_session_active_skill"
+    )
+    def test_compound_multi_skill_blocked_with_split_guidance(self, mock_get_skill):
+        # CR-1 场景1：复合命令执行多个有凭据技能脚本——单激活语义下
+        # 「激活后重跑」会乒乓循环，指引必须改为拆分命令
+        mock_get_skill.return_value = None
+        rail = self._make_rail()
+        ctx = self._make_ctx(
+            tool_args={
+                "command": "python3 /a/hwocr/x.py && node /b/ppt-creation/y.js"
+            }
+        )
+        asyncio.run(rail.before_tool_call(ctx))
+        assert ctx.extra.get("_skip_tool") is True
+        message = str(ctx.inputs.tool_result)
+        assert "hwocr" in message and "ppt-creation" in message
+        assert "拆分" in message
+        assert "env" not in ctx.inputs.tool_args
+
+    @patch(
+        "jiuwenswarm.agents.harness.common.rails.skill_credential_injection_rail.get_session_active_skill"
+    )
+    def test_active_with_argument_reference_injects(self, mock_get_skill):
+        # CR-1 场景2：主跑 active 技能、参数位引用另一技能脚本 → 正常注入
+        mock_get_skill.return_value = "hwocr"
+        rail = self._make_rail()
+        ctx = self._make_ctx(
+            tool_args={
+                "command": (
+                    "python3 /opt/skills/hwocr/scripts/run.py "
+                    "--ref /opt/skills/ppt-creation/sample.py"
+                )
+            }
+        )
+        asyncio.run(rail.before_tool_call(ctx))
+        assert not ctx.extra.get("_skip_tool")
+        assert ctx.inputs.tool_args["env"]["HWOCR_AK"] == "ak"
 
 
 if __name__ == "__main__":

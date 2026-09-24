@@ -42,50 +42,200 @@ _DEFAULT_SHELL_TYPES = frozenset({"auto", "cmd", "bash", "sh"})
 
 SKILL_GATE_PREFIX = "[SKILL_GATE]"
 
+# 单技能直跑指引：激活是单技能覆盖语义，激活后重跑即可满足（条件表述：
+# 被拦的都是执行位脚本，但缺 key 与否取决于脚本是否实际读取凭据）。
 GATE_MESSAGE_CN = (
     f"{SKILL_GATE_PREFIX} 检测到直接运行技能「{{skill}}」的脚本，但当前激活的技能不是它，"
-    "其凭据环境变量不会被注入，脚本将因缺少 key 而失败。"
+    "其凭据环境变量不会被注入，脚本可能因缺少 key 而失败。"
     '请先调用 skill_tool(skill_name="{skill}")，然后重新执行原命令。'
 )
 GATE_MESSAGE_EN = (
     f"{SKILL_GATE_PREFIX} The command directly runs a script of skill \"{{skill}}\", "
     "which is not the active skill: its credential env vars will NOT be injected "
-    'and the script would fail on a missing key. Call '
+    'and the script may fail on a missing key. Call '
     'skill_tool(skill_name="{skill}") first, then rerun the original command.'
 )
 
-# 「技能路径 + 脚本」形态：含路径分隔符且以 .py/.js/.mjs 结尾的 token
-# （归一化 \ → / 后匹配）。不要求解释器前缀——真实命令的解释器常为带
-# 引号的绝对路径（"C:\...\python3.exe" "D:\...\skill\scripts\x.py"）。
-# token 允许成对引号包裹（含空格路径）；pip3 -r .../requirements.txt、
-# cat .../SKILL.md 等非 .py/.js/.mjs 结尾的引用天然不命中。
-_SCRIPT_TOKEN_RE = re.compile(
-    r"""(?:"[^"]*/[^"]*\.(?:py|js|mjs)\b"|'[^']*/[^']*\.(?:py|js|mjs)\b'|[^"'\s]*/[^"'\s]*\.(?:py|js|mjs)\b)""",
-    re.IGNORECASE,
+# 多技能复合命令指引（CR-1）：单激活语义下「激活 X 后重跑」会乒乓循环
+# （激活 B 后 A 变 other 再被拦），该场景唯一可满足的指引是拆分命令。
+GATE_MULTI_MESSAGE_CN = (
+    f"{SKILL_GATE_PREFIX} 本条命令会同时执行多个技能（{{skills}}）的脚本，"
+    "无法一次性注入全部凭据。请拆分为多条命令，逐个调用 "
+    "skill_tool(skill_name=...) 激活对应技能后分别执行。"
+)
+GATE_MULTI_MESSAGE_EN = (
+    f"{SKILL_GATE_PREFIX} This command executes scripts of multiple skills "
+    "({skills}) at once; their credentials cannot all be injected in a single "
+    "command. Split it into separate commands and activate each skill via "
+    "skill_tool(skill_name=...) before running its script."
 )
 
+# ── 执行位判定（CR-1/CR-2）────────────────────────────────────────────
+# 只匹配「将被执行」的脚本 token，不匹配参数位/只读引用：
+#   · cat/echo/grep/sed/head/tail/diff/ls 等命令的参数位 .py 路径不命中
+#   · --ref .../other/sample.py 等参数位引用不命中
+#   · 命令替换 $(python3 x.py)、xargs 等罕见形态会漏拦（走回退注入，
+#     安全面与旧行为持平，不产生误拦）
+_INTERPRETER_BASENAMES = frozenset({"python", "python3", "py", "node"})
+# 子命令前缀（wrapper）：跳过后继续找解释器/脚本（timeout 后可跟时长参数）
+_COMMAND_PREFIX_BASENAMES = frozenset(
+    {"nohup", "timeout", "time", "env", "nice", "stdbuf", "sudo", "ionice", "setsid"}
+)
+_SCRIPT_SUFFIXES = (".py", ".js", ".mjs")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_TIMEOUT_DURATION_RE = re.compile(r"^[\d.]+[smh]?$")
 
-def _iter_script_tokens(command: str) -> Iterable[str]:
-    for match in _SCRIPT_TOKEN_RE.finditer(command):
-        token = match.group(0).strip()
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
-            token = token[1:-1]
-        yield token
+
+def _split_subcommands(command: str) -> list[str]:
+    """按引号外的 ``&& / || / ; / | / &`` 拆子命令。
+
+    引号内的分隔符不拆（``sed 's|/path/x.py|X|'`` 的 ``|`` 是 s 命令
+    分隔符）；``2>&1`` 等重定向的 ``&``（前字符为 ``>``）不拆。
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        sep_len = 0
+        if command[i : i + 2] in ("&&", "||"):
+            sep_len = 2
+        elif ch in (";", "|", "&"):
+            if ch == "&" and i > 0 and command[i - 1] == ">":
+                sep_len = 0  # 2>&1 重定向，不拆
+            else:
+                sep_len = 1
+        if sep_len:
+            parts.append("".join(buf))
+            buf = []
+            i += sep_len
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _tokenize(command: str) -> list[str]:
+    """按空白拆 token；成对引号包裹的含空格内容保持单 token。"""
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    for ch in command:
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch.isspace():
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _strip_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+        return token[1:-1]
+    return token
+
+
+def _basename_lower(path: str) -> str:
+    """取路径 basename（兼容正斜杠与反斜杠分隔、去 .exe 后缀、小写）。"""
+    text = path.strip()
+    if not text:
+        return ""
+    name = re.split(r"[\\/]+", text)[-1]
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    return name.lower()
+
+
+def _is_interpreter_token(token: str) -> bool:
+    return _basename_lower(_strip_quotes(token)) in _INTERPRETER_BASENAMES
+
+
+def _is_script_token(token: str) -> bool:
+    return _strip_quotes(token).lower().endswith(_SCRIPT_SUFFIXES)
+
+
+def _iter_executed_scripts(subcommand: str) -> list[str]:
+    """提取子命令中「将被执行」的脚本路径（执行位判定）。
+
+    ① 首位是解释器（python/python3/py/node，含带引号绝对路径与 .exe
+       形态）→ 跳过 flag 后的第一个脚本 token 为执行位（``python -c``
+       的代码串不是路径 → 无执行位）；
+    ② 首 token 自身是脚本（``./skill/run.py`` 直执行）→ 执行位；
+    ③ 其他命令（cat/echo/grep/sed/ls…）→ 无执行位，参数位路径不扫。
+    VAR=val 赋值前缀与 nohup/sudo/timeout 等 wrapper 前缀会被跳过。
+    """
+    tokens = _tokenize(subcommand)
+    n = len(tokens)
+    i = 0
+    while i < n:
+        raw = _strip_quotes(tokens[i])
+        if _ENV_ASSIGN_RE.match(raw) and not _is_interpreter_token(raw):
+            i += 1
+            continue
+        base = _basename_lower(raw)
+        if base in _COMMAND_PREFIX_BASENAMES:
+            i += 1
+            if (
+                base == "timeout"
+                and i < n
+                and _TIMEOUT_DURATION_RE.match(_strip_quotes(tokens[i]))
+            ):
+                i += 1
+            continue
+        break
+    if i >= n:
+        return []
+    first = _strip_quotes(tokens[i])
+    if _is_interpreter_token(first):
+        j = i + 1
+        while j < n and _strip_quotes(tokens[j]).startswith("-"):
+            j += 1
+        if j < n and _is_script_token(tokens[j]):
+            return [_strip_quotes(tokens[j])]
+        return []
+    if _is_script_token(tokens[i]):
+        return [first]
+    return []
 
 
 def match_skills_in_command(command: str, known_skills: Iterable[str]) -> list[str]:
-    """Return every distinct known skill referenced by a script-path token.
+    """Return every distinct known skill whose script the command *executes*.
 
-    命令归一化（反斜杠→斜杠）后，提取所有「含路径分隔符且以
-    .py/.js/.mjs 结尾」的 token（引号包裹的含空格路径亦可），对每个
-    token 的路径**逐段**扫描，任一段精确命中已知技能名即算引用（整段
-    边界，mx-a-x 不会误匹配 mx-a；大小写不敏感）。覆盖
-    ``<skill>/scripts/x.py`` 子目录与 ``<skill>/x.py`` 根目录两种布局，
-    以及带引号绝对路径解释器的真实调用形态。按命令中出现顺序去重返回。
+    命令归一化（反斜杠→斜杠）后按 ``&& / || / ; / | / &`` 拆子命令，对每个
+    子命令做**执行位判定**（见 ``_iter_executed_scripts``），再对执行位脚本
+    路径**逐段**扫描，任一段精确命中已知技能名即算引用（整段边界，
+    mx-a-x 不会误匹配 mx-a；大小写不敏感）。覆盖 ``<skill>/scripts/x.py``
+    子目录与 ``<skill>/x.py`` 根目录布局、带引号绝对路径解释器的实录形态、
+    wrapper 前缀与直执行形态。按命令中出现顺序去重返回。
 
     注意不能用「/skill/ 后缀到脚本」的单个捕获组正则：finditer 非重叠
-    匹配会让最靠前的无关段（如 /Object/、/relay-claw/）吞掉整个匹配，
-    真正的技能段轮不到检查。
+    匹配会让最靠前的无关段（如 /Object/、/relay-claw/）吞掉整个匹配。
     """
     if not command or not known_skills:
         return []
@@ -98,12 +248,13 @@ def match_skills_in_command(command: str, known_skills: Iterable[str]) -> list[s
         return []
     matched: list[str] = []
     seen: set[str] = set()
-    for token in _iter_script_tokens(command.replace("\\", "/")):
-        for segment in re.split(r"/+", token):
-            name = canonical.get(segment.strip().lower())
-            if name is not None and name not in seen:
-                seen.add(name)
-                matched.append(name)
+    for subcommand in _split_subcommands(command.replace("\\", "/")):
+        for script in _iter_executed_scripts(subcommand):
+            for segment in re.split(r"/+", script):
+                name = canonical.get(segment.strip().lower())
+                if name is not None and name not in seen:
+                    seen.add(name)
+                    matched.append(name)
     return matched
 
 
@@ -116,6 +267,13 @@ def match_skill_in_command(command: str, known_skills: Iterable[str]) -> str | N
 def build_skill_gate_message(skill: str, language: str = "cn") -> str:
     template = GATE_MESSAGE_EN if str(language).lower() == "en" else GATE_MESSAGE_CN
     return template.format(skill=skill)
+
+
+def build_skill_gate_multi_message(skills: Iterable[str], language: str = "cn") -> str:
+    template = (
+        GATE_MULTI_MESSAGE_EN if str(language).lower() == "en" else GATE_MULTI_MESSAGE_CN
+    )
+    return template.format(skills=", ".join(skills))
 
 
 def _write_gate_tool_result(ctx: AgentCallbackContext, message: str) -> None:
@@ -187,13 +345,15 @@ def coalesce_config_skill_envs(config: Any, previous: Any) -> Any:
 class SkillCredentialInjectionRail(DeepAgentRail):
     """Inject per-skill credentials into shell tool calls.
 
-    三分支：
-    1. 命令可解析为「正在跑当前激活技能的脚本」→ 注入该技能凭据；
-    2. 命令在跑**另一个**有凭据技能的脚本 → 闸门拒绝并指引激活（逃生口：
+    三分支（执行位判定，CR-1/CR-2 修正后）：
+    1. 命令**执行**当前激活技能的脚本（执行位命中，matched == active）
+       → 注入该技能凭据；参数位/只读引用（cat/grep/--ref 等）不参与匹配；
+    2. 命令**执行**另一个有凭据技能的脚本 → 闸门拒绝并指引激活（逃生口：
        tool_args["env"] 显式携带该技能凭据 key 时放行，且不再注入 active
-       技能的凭据，避免跨技能泄漏）；
-    3. 命令静态不可解析（cd+相对路径 / 裸文件名 / 无凭据技能 / 非脚本
-       形态）→ 回退按 active 注入，与既有行为一致（零回归）。
+       技能的凭据，避免跨技能泄漏）；执行位命中**多个**技能时指引拆分为
+       多条命令分别激活（单激活语义下「激活后重跑」会乒乓循环）；
+    3. 命令无执行位脚本（只读引用/cd+相对路径/裸文件名/无凭据技能/非
+       脚本形态）→ 回退按 active 注入，与既有行为一致（零回归）。
     """
 
     priority = 5
@@ -238,6 +398,19 @@ class SkillCredentialInjectionRail(DeepAgentRail):
         other_skills = [s for s in matched_skills if s != active_skill]
 
         if other_skills:
+            if len(matched_skills) > 1:
+                # CR-1：执行位命中多个技能（单激活语义下「激活 X 后重跑」
+                # 会乒乓循环），指引拆分为多条命令分别激活执行。
+                logger.info(
+                    "[SkillCredentialInjectionRail] gate: blocked multi-skill "
+                    "command skills=%s (active=%s) session=%s tool=%s",
+                    matched_skills,
+                    active_skill,
+                    session_id,
+                    tool_name,
+                )
+                self._reject_with_split_guidance(ctx, matched_skills)
+                return
             gate_skill = other_skills[0]
             if self._has_explicit_skill_env(tool_args, gate_skill):
                 # 逃生口：模型显式传了该技能的凭据 key，按原样执行；
@@ -314,6 +487,15 @@ class SkillCredentialInjectionRail(DeepAgentRail):
         ctx.extra["_skip_tool"] = True
         _write_gate_tool_result(ctx, message)
 
+    def _reject_with_split_guidance(
+        self, ctx: AgentCallbackContext, skills: list[str]
+    ) -> None:
+        """多技能复合命令：指引拆分为多条命令分别激活执行（CR-1）。"""
+        language = resolve_language_from_context(ctx)
+        message = build_skill_gate_multi_message(skills, language)
+        ctx.extra["_skip_tool"] = True
+        _write_gate_tool_result(ctx, message)
+
     def _resolve_session_id(self, ctx: AgentCallbackContext) -> str:
         return resolve_skill_session_id(ctx, self._preset_session_id)
 
@@ -357,10 +539,13 @@ class SkillCredentialInjectionRail(DeepAgentRail):
 __all__ = [
     "GATE_MESSAGE_CN",
     "GATE_MESSAGE_EN",
+    "GATE_MULTI_MESSAGE_CN",
+    "GATE_MULTI_MESSAGE_EN",
     "SHELL_PERMISSION_TOOLS",
     "SKILL_GATE_PREFIX",
     "SkillCredentialInjectionRail",
     "build_skill_gate_message",
+    "build_skill_gate_multi_message",
     "coalesce_config_skill_envs",
     "coalesce_skill_envs",
     "match_skill_in_command",
