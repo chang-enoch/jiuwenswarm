@@ -70,7 +70,34 @@ def _propagate_stream_source_id(src_payload: Any) -> dict[str, Any]:
     return {}
 
 
-def parse_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> dict[str, Any] | None:
+def _is_absent_stream_text(
+    content: Any,
+    *,
+    preserve_whitespace: bool = False,
+) -> bool:
+    """Return True when streaming text should be skipped.
+
+    Default keeps historical strip() behavior. Team mode sets
+    ``preserve_whitespace=True`` so formatting-only chunks (``\\n``,
+    ``\\n\\n``, spaces) are kept — required for Markdown tables.
+    """
+    if content is None:
+        return True
+    if not isinstance(content, str):
+        content = str(content)
+    if content == "":
+        return True
+    if preserve_whitespace:
+        return False
+    return not content.strip()
+
+
+def parse_stream_chunk(
+    chunk: Any,
+    *,
+    _has_streamed_content: bool = False,
+    preserve_whitespace: bool = False,
+) -> dict[str, Any] | None:
     """Parse agent output chunk to frontend-consumable payload dict.
 
     统一处理所有 SDK 输出格式，包括：
@@ -82,6 +109,7 @@ def parse_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> di
     Args:
         chunk: Output chunk from agent runner
         _has_streamed_content: Whether content has been streamed (for backward compatibility)
+        preserve_whitespace: When True, keep formatting-only text chunks (team stream).
 
     Returns:
         Parsed payload dict with event_type, or None if chunk should be skipped
@@ -90,16 +118,22 @@ def parse_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> di
         return None
 
     if isinstance(chunk, dict):
-        return _parse_dict_chunk(chunk, _has_streamed_content)
+        return _parse_dict_chunk(
+            chunk, _has_streamed_content, preserve_whitespace=preserve_whitespace
+        )
 
     if hasattr(chunk, "type") and hasattr(chunk, "payload"):
-        return _parse_typed_chunk(chunk, _has_streamed_content)
+        return _parse_typed_chunk(
+            chunk, _has_streamed_content, preserve_whitespace=preserve_whitespace
+        )
 
     if hasattr(chunk, "event_type"):
         return _parse_event_typed_chunk(chunk)
 
     if hasattr(chunk, "payload") and hasattr(chunk, "request_id"):
-        return _parse_response_chunk(chunk, _has_streamed_content)
+        return _parse_response_chunk(
+            chunk, _has_streamed_content, preserve_whitespace=preserve_whitespace
+        )
 
     return {
         "event_type": "chat.delta",
@@ -107,7 +141,12 @@ def parse_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> di
     }
 
 
-def _parse_dict_chunk(chunk: dict[str, Any], _has_streamed_content: bool) -> dict[str, Any] | None:
+def _parse_dict_chunk(
+    chunk: dict[str, Any],
+    _has_streamed_content: bool,
+    *,
+    preserve_whitespace: bool = False,
+) -> dict[str, Any] | None:
     """Parse dict chunk."""
     if "event_type" in chunk:
         if chunk.get("event_type") == "chat.tracer_agent":
@@ -133,7 +172,7 @@ def _parse_dict_chunk(chunk: dict[str, Any], _has_streamed_content: bool) -> dic
 
     if "content" in chunk:
         content = chunk.get("content", "")
-        if not content or not content.strip():
+        if _is_absent_stream_text(content, preserve_whitespace=preserve_whitespace):
             return None
         return {
             "event_type": "chat.delta" if not _has_streamed_content else "chat.final",
@@ -158,7 +197,7 @@ def _parse_dict_chunk(chunk: dict[str, Any], _has_streamed_content: bool) -> dic
                 "error": output.get("output", ""),
             }
         output = chunk.get("output", "")
-        if not output or not output.strip():
+        if _is_absent_stream_text(output, preserve_whitespace=preserve_whitespace):
             return None
         return {
             "event_type": "chat.delta" if not _has_streamed_content else "chat.final",
@@ -177,7 +216,12 @@ def _serialize_chunk_recursive(obj: Any) -> Any:
     return _serialize_value(obj)
 
 
-def _parse_typed_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, Any] | None:
+def _parse_typed_chunk(
+    chunk: Any,
+    _has_streamed_content: bool,
+    *,
+    preserve_whitespace: bool = False,
+) -> dict[str, Any] | None:
     """Parse OutputSchema-like chunk with type and payload attributes."""
     chunk_type = getattr(chunk, "type", "")
     payload = getattr(chunk, "payload", {})
@@ -341,7 +385,7 @@ def _parse_typed_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, Any
             if isinstance(payload, dict)
             else str(payload)
         )
-        if not content or not content.strip():
+        if _is_absent_stream_text(content, preserve_whitespace=preserve_whitespace):
             return None
         return {
             "event_type": "chat.delta",
@@ -355,7 +399,7 @@ def _parse_typed_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, Any
             if isinstance(payload, dict)
             else str(payload)
         )
-        if not content or not content.strip():
+        if _is_absent_stream_text(content, preserve_whitespace=preserve_whitespace):
             return None
         return {
             "event_type": "chat.reasoning",
@@ -369,7 +413,7 @@ def _parse_typed_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, Any
             if isinstance(payload, dict)
             else str(payload)
         )
-        if not content or not content.strip():
+        if _is_absent_stream_text(content, preserve_whitespace=preserve_whitespace):
             return None
         return {
             "event_type": "chat.delta",
@@ -903,7 +947,12 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
-def _parse_response_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, Any] | None:
+def _parse_response_chunk(
+    chunk: Any,
+    _has_streamed_content: bool,
+    *,
+    preserve_whitespace: bool = False,
+) -> dict[str, Any] | None:
     """Parse AgentResponseChunk-like object."""
     payload = getattr(chunk, "payload", None)
 
@@ -928,15 +977,27 @@ def _parse_response_chunk(chunk: Any, _has_streamed_content: bool) -> dict[str, 
                     "event_type": "chat.error",
                     "error": output.get("output", ""),
                 }
+            content = payload.get("output", "")
+            # Default: keep historical no-filter behavior for AgentResponseChunk.
+            # Team (preserve_whitespace=True): only drop absent/empty text.
+            if preserve_whitespace and _is_absent_stream_text(
+                content, preserve_whitespace=True
+            ):
+                return None
             return {
                 "event_type": "chat.delta" if not _has_streamed_content else "chat.final",
-                "content": payload.get("output", ""),
+                "content": content,
             }
 
         if "content" in payload:
+            content = payload.get("content", "")
+            if preserve_whitespace and _is_absent_stream_text(
+                content, preserve_whitespace=True
+            ):
+                return None
             return {
                 "event_type": "chat.delta" if not _has_streamed_content else "chat.final",
-                "content": payload.get("content", ""),
+                "content": content,
             }
 
         return payload
