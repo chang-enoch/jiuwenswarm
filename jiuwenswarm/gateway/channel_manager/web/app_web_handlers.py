@@ -47,10 +47,12 @@ from jiuwenswarm.common.config import (
     get_config_raw,
     get_default_models,
     get_evolution_enabled,
+    get_ttse_enabled,
     resolve_legacy_team_model_ref,
     replace_teams_in_config,
     update_default_models_in_config,
     update_evolution_enabled_in_config,
+    update_ttse_enabled_in_config,
     update_context_engine_enabled_in_config,
     update_default_model_provider_in_config,
     update_kv_cache_affinity_enabled_in_config,
@@ -958,6 +960,7 @@ CONFIG_KEYS = tuple(_CONFIG_SET_ENV_MAP.keys())
 # 来自 config.yaml 的配置项（前端 param 名 -> config.yaml 路径）
 _CONFIG_YAML_KEYS = frozenset({
     "evolution_enabled",
+    "ttse_enabled",
     "context_engine_enabled",
     "kv_cache_release_enabled",
     "kv_cache_affinity_enabled",
@@ -2327,6 +2330,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             # skill_create: tip 优先，fallback to config.yaml
             evolution_cfg = (raw.get("react") or {}).get("evolution") or {}
             payload["evolution_enabled"] = "true" if get_evolution_enabled(raw) else "false"
+            payload["ttse_enabled"] = "true" if get_ttse_enabled(raw) else "false"
             skill_create_env = read_env_if_set("SKILL_CREATE")
             if skill_create_env is not None:
                 payload["skill_create"] = "true" if skill_create_env.lower() in ("true", "1", "yes") else "false"
@@ -2364,6 +2368,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             payload.setdefault("setup_guide_enabled", "true")
             payload.setdefault("trajectory_ui_enabled", "false")
             payload.setdefault("evolution_enabled", "true")
+            payload.setdefault("ttse_enabled", "true")
             payload.setdefault("skill_create", "false")
             payload.setdefault("memory_forbidden_enabled", "false")
             payload.setdefault("memory_forbidden_description", "")
@@ -2551,6 +2556,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             try:
                 if param_key == "evolution_enabled":
                     update_evolution_enabled_in_config(parsed)
+                elif param_key == "ttse_enabled":
+                    update_ttse_enabled_in_config(parsed)
                 elif param_key == "context_engine_enabled":
                     update_context_engine_enabled_in_config(parsed)
                 elif param_key == "kv_cache_release_enabled":

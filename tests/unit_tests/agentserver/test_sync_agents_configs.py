@@ -15,6 +15,7 @@ from jiuwenswarm.server.runtime.sync_agents_configs import (
     build_agent_spec,
     compute_content_hash,
     materialize_sync_env,
+    synthesize_config,
     validate_sync_payload,
 )
 from jiuwenswarm.server.runtime.tenant_agent_pool import TenantAgentPool
@@ -422,9 +423,100 @@ class TestSyncAgentsConfigsValidation:
             )
 
     @staticmethod
+    def test_ttse_enabled_required_like_evolution():
+        """TTSE_ENABLED is a required SYNC_ENV_SCHEMA key (same as EVOLUTION_ENABLED)."""
+        assert "TTSE_ENABLED" in SYNC_ENV_SCHEMA
+        assert "EVOLUTION_ENABLED" in SYNC_ENV_SCHEMA
+        env = _full_env()
+        del env["TTSE_ENABLED"]
+        with pytest.raises(ValueError, match="TTSE_ENABLED"):
+            validate_sync_payload(
+                {
+                    "revision": "r1",
+                    "service_id": "default",
+                    "agents": [
+                        {
+                            "agent_id": "office",
+                            "config": {},
+                            "env": env,
+                            "runtime": {},
+                        }
+                    ],
+                }
+            )
+
+    @staticmethod
     def test_materialize_omits_null_keeps_empty():
         env = materialize_sync_env({"API_KEY": "k", "MODEL_NAME": None, "API_BASE": ""})
         assert env == {"API_KEY": "k", "API_BASE": ""}
+
+
+class TestSynthesizeTtseConfig:
+    """TTSE materialization: env wins when set; omit enabled when sparse."""
+
+    @staticmethod
+    def test_env_and_config_materialize_enabled():
+        out = synthesize_config(
+            {"react": {"ttse": {"enabled": False, "evolve_enabled": True}}},
+            {"TTSE_ENABLED": "true"},
+        )
+        assert out["react"]["ttse"]["enabled"] is True
+        assert out["react"]["ttse"]["evolve_enabled"] is True
+
+    @staticmethod
+    def test_env_overlays_config_with_warning(caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="jiuwenswarm.server.runtime.sync_agents_configs"):
+            out = synthesize_config(
+                {"react": {"ttse": {"enabled": True}}},
+                {"TTSE_ENABLED": "false"},
+            )
+        assert out["react"]["ttse"]["enabled"] is False
+        assert any("TTSE_ENABLED" in r.message for r in caplog.records)
+
+    @staticmethod
+    def test_sparse_inbound_omits_enabled_key():
+        """No ttse / no TTSE_ENABLED → do not write enabled:false (inherit disk)."""
+        out = synthesize_config({"react": {"evolution": {"enabled": True}}}, None)
+        ttse = out["react"].get("ttse") or {}
+        assert "enabled" not in ttse
+
+    @staticmethod
+    def test_top_level_ttse_migrates_into_react():
+        out = synthesize_config(
+            {"ttse": {"enabled": True, "inject_enabled": False}},
+            None,
+        )
+        assert "ttse" not in out
+        assert out["react"]["ttse"]["enabled"] is True
+        assert out["react"]["ttse"]["inject_enabled"] is False
+
+    @staticmethod
+    def test_react_ttse_wins_over_top_level(caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="jiuwenswarm.server.runtime.sync_agents_configs"):
+            out = synthesize_config(
+                {
+                    "react": {"ttse": {"enabled": True}},
+                    "ttse": {"enabled": False},
+                },
+                None,
+            )
+        assert out["react"]["ttse"]["enabled"] is True
+        assert "ttse" not in out
+        assert any("top-level ttse" in r.message for r in caplog.records)
+
+    @staticmethod
+    def test_explicit_config_without_env():
+        out = synthesize_config({"react": {"ttse": {"enabled": True}}}, None)
+        assert out["react"]["ttse"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# async sync_agents_configs integration
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

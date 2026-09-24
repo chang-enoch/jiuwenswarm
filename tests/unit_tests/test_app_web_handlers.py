@@ -737,6 +737,58 @@ async def test_config_set_persists_evolution_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_config_set_persists_ttse_enabled(monkeypatch):
+    channel = FakeWebChannel()
+    persisted: list[bool] = []
+    reload_options_seen: list[dict] = []
+
+    monkeypatch.setattr(
+        app_web_handlers,
+        "get_config_raw",
+        lambda: {"react": {"ttse": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        app_web_handlers,
+        "get_config",
+        lambda: {"react": {"ttse": {"enabled": False}}},
+    )
+    monkeypatch.setattr(
+        app_web_handlers,
+        "update_ttse_enabled_in_config",
+        lambda enabled: persisted.append(enabled),
+    )
+
+    async def on_config_saved(updated_keys, *, env_updates, config_payload, reload_options):
+        del updated_keys, env_updates, config_payload
+        reload_options_seen.append(dict(reload_options))
+        return True
+
+    _register_web_handlers(
+        WebHandlersBindParams(
+            channel=channel,
+            on_config_saved=on_config_saved,
+        )
+    )
+
+    await channel.methods["config.set"](
+        object(),
+        "req-ttse-enabled",
+        {"ttse_enabled": "false"},
+        "sess-ttse-enabled",
+    )
+
+    assert persisted == [False]
+    assert reload_options_seen == [{
+        "target_channel_id": "web",
+        "reload_scopes": ["agent_runtime"],
+    }]
+    assert channel.responses[-1]["payload"] == {
+        "updated": ["ttse_enabled"],
+        "applied_without_restart": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_models_replace_all_applies_scoped_reload_before_responding(monkeypatch):
     channel = FakeWebChannel()
     reload_started = asyncio.Event()
