@@ -68,6 +68,8 @@ def test_team_helpers_wires_preserve_whitespace() -> None:
     source = Path("jiuwenswarm/server/runtime/agent_adapter/team_helpers.py").read_text(
         encoding="utf-8"
     )
-    assert "preserve_whitespace=True" in source
+    assert "preserve_whitespace" in source
     assert "_parse_team_stream_chunk" in source
     assert "parsed = _parse_team_stream_chunk(chunk)" in source
+    # Must tolerate one-arg monkeypatches used by team_helpers unit tests.
+    assert "inspect.signature(parse_stream_chunk)" in source

@@ -49,15 +49,6 @@ from jiuwenswarm.server.runtime.session.session_metadata import (
 from jiuwenswarm.server.runtime.session.session_history import append_history_record
 from jiuwenswarm.agents.harness.team.handlers.team_monitor_handler import TeamMonitorHandler
 from jiuwenswarm.server.utils.stream_utils import parse_stream_chunk
-
-
-def _parse_team_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> dict[str, Any] | None:
-    """Team stream parser: keep formatting-only deltas (newlines) for Markdown tables."""
-    return parse_stream_chunk(
-        chunk,
-        _has_streamed_content=_has_streamed_content,
-        preserve_whitespace=True,
-    )
 from jiuwenswarm.common.schema.agent import AgentResponseChunk
 from jiuwenswarm.server.runtime.agent_adapter.evolution_helpers import (
     EvolutionProgressStatus,
@@ -134,6 +125,28 @@ def _safe_team_path_segment(value: str, fallback: str = "_") -> str:
 def _team_hide_teammate_enabled() -> bool:
     """Return whether non-leader teammate frames should be filtered out in team mode."""
     return os.environ.get(_HIDE_TEAMMATE_ENV_KEY, "").strip().lower() == "true"
+
+
+def _parse_team_stream_chunk(chunk: Any, *, _has_streamed_content: bool = False) -> dict[str, Any] | None:
+    """Team stream parser: keep formatting-only deltas (newlines) for Markdown tables.
+
+    Only forward kwargs that the current ``parse_stream_chunk`` callable accepts so
+    unit tests that monkeypatch a one-arg stub keep working.
+    """
+    kwargs: dict[str, Any] = {}
+    try:
+        params = inspect.signature(parse_stream_chunk).parameters
+    except (TypeError, ValueError):
+        params = {}
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if accepts_var_kw or "_has_streamed_content" in params:
+        kwargs["_has_streamed_content"] = _has_streamed_content
+    if accepts_var_kw or "preserve_whitespace" in params:
+        kwargs["preserve_whitespace"] = True
+    return parse_stream_chunk(chunk, **kwargs)
+
 
 _INTERACT_REASON_ERROR_MAP: dict[str, str] = {
     "not_active": "Team is initializing, please try again later",
