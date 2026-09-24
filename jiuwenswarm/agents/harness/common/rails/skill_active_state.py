@@ -287,6 +287,16 @@ class SkillActiveStateRail(DeepAgentRail):
         """当前过期兜底轮数（公开只读，供装配点检测配置变化，N2）。"""
         return self._stale_invoke_limit
 
+    def update_stale_invoke_limit(self, stale_invoke_limit: Optional[int]) -> None:
+        """原位更新过期兜底轮数（reload 路径，N2）。
+
+        遵循 configure() 的原位更新约定（避免重建实例脱离 agent rail 链）：
+        None → 默认值；<= 0 → 禁用。计数存于模块级状态，更新无副作用。
+        """
+        if stale_invoke_limit is None:
+            stale_invoke_limit = self.DEFAULT_STALE_INVOKE_LIMIT
+        self._stale_invoke_limit = int(stale_invoke_limit)
+
     def _resolve_session_id(self, ctx: AgentCallbackContext) -> str:
         return resolve_skill_session_id(ctx, self._preset_session_id)
 

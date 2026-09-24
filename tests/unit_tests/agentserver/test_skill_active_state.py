@@ -491,6 +491,16 @@ class TestResolveStaleInvokeLimit(unittest.TestCase):
             SkillActiveStateRail(stale_invoke_limit=0).stale_invoke_limit == 0
         )
 
+    def test_rail_stale_limit_inplace_update(self):
+        # N2：reload 原位更新（不重建实例）；None 归一化为默认值
+        rail = SkillActiveStateRail(stale_invoke_limit=3)
+        rail.update_stale_invoke_limit(10)
+        assert rail.stale_invoke_limit == 10
+        rail.update_stale_invoke_limit(None)
+        assert rail.stale_invoke_limit == 5
+        rail.update_stale_invoke_limit(0)
+        assert rail.stale_invoke_limit == 0
+
 
 class TestAdoptDefaultActiveSkill(unittest.TestCase):
     def tearDown(self):

@@ -9785,16 +9785,15 @@ class JiuWenSwarmDeepAdapter:
             if self._skill_credential_injection_rail is not None:
                 skill_credential_rail_newly_created = True
 
-        # reload 路径的 config 是 react 子 dict；limit 配置变化时重建 rail，
-        # 使已存在会话的过期兜底随配置生效（N2，计数存于模块级状态，重建无副作用）
-        new_stale_limit = resolve_stale_invoke_limit(config)
-        if new_stale_limit is None:
-            new_stale_limit = SkillActiveStateRail.DEFAULT_STALE_INVOKE_LIMIT
-        if self._skill_active_state_rail is None or (
-            self._skill_active_state_rail.stale_invoke_limit != new_stale_limit
-        ):
+        # reload 路径遵循本函数的原位更新约定（见 docstring）：limit 变化
+        # 原位改写 rail，避免重建实例脱离 agent 注册链（N2）。
+        if self._skill_active_state_rail is None:
             self._skill_active_state_rail = self._build_skill_active_state_rail(
                 config
+            )
+        else:
+            self._skill_active_state_rail.update_stale_invoke_limit(
+                resolve_stale_invoke_limit(config)
             )
 
         progressive_tool_rail = None
