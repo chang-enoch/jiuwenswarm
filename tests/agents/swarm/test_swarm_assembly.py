@@ -208,6 +208,7 @@ _TEAM_SHARED_RAIL_NAMES: frozenset[str] = frozenset(
         registry.SKILL_RETRIEVAL_PROMPT,
         registry.SYMPHONY_ORCHESTRATION_PROMPT,
         registry.A2A_OUTBOUND_TOOLKIT,
+        registry.REQUEST_SCOPED_MCP_TOOLS,
         registry.MEMBER_SKILL_TOOLKIT,
         registry.DISABLED_TOOLS,
     }
@@ -524,7 +525,7 @@ def test_build_member_capability_specs_rail_names(
 
     assert _TEAM_SHARED_RAIL_NAMES <= rail_names
     assert extra_rails <= rail_names
-    assert len(_TEAM_SHARED_RAIL_NAMES) == 18
+    assert len(_TEAM_SHARED_RAIL_NAMES) == 19
     assert rail_names == expected
     disabled_tools = next(
         spec for spec in rails_specs if spec.type == registry.DISABLED_TOOLS
@@ -643,6 +644,59 @@ def test_member_skill_toolkit_carries_selected_skills() -> None:
 
     # Blank entries are stripped; order is preserved.
     assert toolkit.params == {"skills": ["alpha", "beta"]}
+
+
+def test_member_skill_toolkit_prefers_spec_skills_for_named_members() -> None:
+    """Named predefined members resolve skills from their own spec entry.
+
+    Predefined members are keyed by ``member_name`` in ``spec.agents``, so the
+    role-level ``config.agents.teammate`` lookup misses them and the toolkit
+    used to mount with an empty skill view (member-side ``Skill not found``).
+    """
+    config: dict[str, Any] = {}
+    base_spec = DeepAgentSpec(skills=["cg-rules", "  ", ""])
+
+    rails, _ = build_member_capability_specs(config, "team", "teammate", member_skills=["cg-rules"])
+    toolkit = next(
+        spec for spec in rails if spec.type == registry.MEMBER_SKILL_TOOLKIT
+    )
+    assert toolkit.params == {"skills": ["cg-rules"]}
+
+    # build_member_deep_agent_spec derives member_skills from base_spec.skills.
+    member_spec = build_member_deep_agent_spec(config, "team", "teammate", base_spec)
+    toolkit_rail = next(
+        rail for rail in (member_spec.rails or []) if rail.type == registry.MEMBER_SKILL_TOOLKIT
+    )
+    assert toolkit_rail.params == {"skills": ["cg-rules"]}
+
+
+def test_enrich_team_spec_for_swarm_enriches_named_predefined_members() -> None:
+    """Named predefined member specs get the full capability rails, not raw specs."""
+    spec = _make_team_spec()
+    spec.agents["product-architect"] = DeepAgentSpec(skills=["cg-rules"])
+    spec.predefined_members = [
+        TeamMemberSpec(
+            member_name="product-architect",
+            display_name="Product Architect",
+            role_type=TeamRole.TEAMMATE,
+        ),
+    ]
+
+    enrich_team_spec_for_swarm(
+        spec,
+        session_id="s",
+        mode="team",
+        channel_id="web",
+    )
+
+    member_rail_names = {rail.type for rail in (spec.agents["product-architect"].rails or [])}
+    assert registry.MEMBER_SKILL_TOOLKIT in member_rail_names
+    toolkit = next(
+        rail
+        for rail in (spec.agents["product-architect"].rails or [])
+        if rail.type == registry.MEMBER_SKILL_TOOLKIT
+    )
+    assert toolkit.params == {"skills": ["cg-rules"]}
 
 
 def test_swarm_skill_retrieval_tools_use_global_skill_manager(
@@ -1156,8 +1210,8 @@ def test_enrich_skips_absent_roles_gracefully() -> None:
     assert registry.TEAM_SKILL_EVOLUTION in leader_rail_names
 
 
-def test_enrich_mounts_stream_events_only_on_named_llm_teammates() -> None:
-    """Named predefined LLM teammates emit canonical UI tool events."""
+def test_enrich_mounts_runtime_rails_on_named_llm_teammates() -> None:
+    """Named predefined LLM teammates receive request runtime capabilities."""
     spec = TeamAgentSpec(
         agents={
             "leader": DeepAgentSpec(),
@@ -1191,10 +1245,18 @@ def test_enrich_mounts_stream_events_only_on_named_llm_teammates() -> None:
     analyst_rails = [rail.type for rail in (spec.agents["analyst"].rails or [])]
     reviewer_rails = [rail.type for rail in (spec.agents["reviewer"].rails or [])]
     human_rails = [rail.type for rail in (spec.agents["human"].rails or [])]
-    assert analyst_rails == [registry.STREAM_EVENT]
-    assert reviewer_rails == [registry.STREAM_EVENT]
+    # Named LLM teammates are fully enriched: capability rails incl. the skill
+    # toolkit, plus the request runtime mounts (stream event + scoped MCP tools).
+    assert analyst_rails.count(registry.STREAM_EVENT) == 1
+    assert registry.REQUEST_SCOPED_MCP_TOOLS in analyst_rails
+    assert registry.MEMBER_SKILL_TOOLKIT in analyst_rails
+    # Keep the pre-declared event rail without emitting duplicate UI events.
+    assert reviewer_rails.count(registry.STREAM_EVENT) == 1
+    assert registry.REQUEST_SCOPED_MCP_TOOLS in reviewer_rails
+    assert reviewer_rails.count(registry.MEMBER_SKILL_TOOLKIT) == 1
+    # Human-agent members stay untouched.
     assert human_rails == []
-    assert not spec.agents["analyst"].tools
+    assert not spec.agents["human"].tools
 
 
 def test_enriched_spec_serialization_round_trip() -> None:
@@ -1775,6 +1837,7 @@ _EXPECTED_CODE_RAIL_NAMES_LEADER: frozenset[str] = frozenset(
         registry.SKILL_RETRIEVAL_PROMPT,
         registry.SYMPHONY_ORCHESTRATION_PROMPT,
         registry.A2A_OUTBOUND_TOOLKIT,
+        registry.REQUEST_SCOPED_MCP_TOOLS,
         registry.CODE_CONFIRM_INTERRUPT,
         registry.MEMBER_SKILL_TOOLKIT,
         registry.TEAM_WORKSPACE_REPORT_PATH,

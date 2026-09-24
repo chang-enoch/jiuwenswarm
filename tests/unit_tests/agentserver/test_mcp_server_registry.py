@@ -485,7 +485,7 @@ async def test_chat_prefers_mcp_server_list(monkeypatch) -> None:
     seen: dict[str, object] = {}
 
     async def fake_registry(
-        self, request, names, office_claw_config=None, leftover_servers=None
+        self, request, names, office_claw_config=None, leftover_servers=None, *, generation
     ):
         seen["names"] = names
         seen["office_claw"] = office_claw_config
@@ -547,7 +547,9 @@ async def test_chat_empty_list_without_office_claw_skips() -> None:
         params={"mcp_server_list": []},
     )
     result = await adapter.register_request_scoped_office_claw_mcp(request)
-    assert result is None
+    assert result is not None
+    assert result.tool_ids == ()
+    await adapter.cleanup_request_scoped_office_claw_mcp(result)
 
 
 @pytest.mark.asyncio

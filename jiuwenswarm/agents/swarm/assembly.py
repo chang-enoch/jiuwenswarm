@@ -29,19 +29,46 @@ from openjiuwen.agent_teams.schema.deep_agent_spec import RailSpec
 from jiuwenswarm.agents.swarm.config_specs import build_member_deep_agent_spec
 from jiuwenswarm.agents.swarm.context import SwarmBuildContext
 from jiuwenswarm.agents.harness.team.config_loader import _normalize_prompt_language
-from jiuwenswarm.agents.swarm.registry import STREAM_EVENT, register_swarm_providers
+from jiuwenswarm.agents.swarm.registry import (
+    REQUEST_SCOPED_MCP_TOOLS,
+    STREAM_EVENT,
+    register_swarm_providers,
+)
 from jiuwenswarm.common.config import get_config
 from jiuwenswarm.common.mcp_config import build_enabled_mcp_server_configs
 from jiuwenswarm.common.utils import get_agent_skills_dir
 
 logger = logging.getLogger(__name__)
 
-# Member roles enriched in place, in deterministic order.
+# Member roles enriched in place, in deterministic order. Named predefined
+# members (spec.agents keyed by member_name) are enriched too, after the role
+# keys, so their capabilities come from the same config source — without this
+# a predefined member builds from a raw spec with no skill rails/links and
+# skill_tool reports "Skill not found" for its configured skills.
 _MEMBER_ROLES: tuple[str, ...] = ("leader", "teammate")
 
 
-def _mount_named_teammate_stream_events(spec: Any) -> list[str]:
-    """Mount canonical UI stream events on named predefined LLM teammates."""
+def _collect_named_teammate_members(spec: Any) -> list[str]:
+    """Return predefined LLM-teammate member names present in ``spec.agents``.
+
+    Human-agent / bridge members are excluded: only role_type == "teammate"
+    entries are assembled from the shared config source.
+    """
+    names: list[str] = []
+    for member in getattr(spec, "predefined_members", None) or []:
+        role_type = getattr(member, "role_type", None)
+        if getattr(role_type, "value", role_type) != "teammate":
+            continue
+        name = str(getattr(member, "member_name", "") or "").strip()
+        if not name or name in _MEMBER_ROLES or name not in spec.agents:
+            continue
+        if name not in names:
+            names.append(name)
+    return sorted(names)
+
+
+def _mount_named_teammate_runtime_rails(spec: Any) -> list[str]:
+    """Mount request runtime rails on named predefined LLM teammates."""
     mounted: list[str] = []
     for member in getattr(spec, "predefined_members", None) or []:
         role_type = getattr(member, "role_type", None)
@@ -52,9 +79,11 @@ def _mount_named_teammate_stream_events(spec: Any) -> list[str]:
             continue
         member_spec = spec.agents[member_name]
         rails = list(member_spec.rails or [])
-        if not any(rail.type == STREAM_EVENT for rail in rails):
-            rails.append(RailSpec(type=STREAM_EVENT))
-            spec.agents[member_name] = member_spec.model_copy(update={"rails": rails})
+        existing_types = {rail.type for rail in rails}
+        for rail_type in (STREAM_EVENT, REQUEST_SCOPED_MCP_TOOLS):
+            if rail_type not in existing_types:
+                rails.append(RailSpec(type=rail_type))
+        spec.agents[member_name] = member_spec.model_copy(update={"rails": rails})
         mounted.append(member_name)
     return mounted
 
@@ -149,7 +178,21 @@ def enrich_team_spec_for_swarm(
             member_spec = _with_project_cwd(member_spec, project_dir)
             spec.agents[role] = member_spec
 
-    named_teammates = _mount_named_teammate_stream_events(spec)
+    named_members = _collect_named_teammate_members(spec)
+    for member_name in named_members:
+        member_spec = build_member_deep_agent_spec(
+            config,
+            mode,
+            "teammate",
+            spec.agents[member_name],
+            member_name=member_name,
+            enable_permissions=spec.enable_permissions,
+            mcp_configs=mcp_configs,
+        )
+        member_spec = _with_project_cwd(member_spec, project_dir)
+        spec.agents[member_name] = member_spec
+
+    named_teammates = _mount_named_teammate_runtime_rails(spec)
 
     spec.build_context = base
     # Carry a serializable seed alongside the live context so members rebuilt
@@ -157,9 +200,11 @@ def enrich_team_spec_for_swarm(
     # cold recovery) can reconstruct the context via the registered factory.
     spec.build_context_seed = base.to_seed()
     logger.info(
-        "[swarm.assembly] enriched team spec '%s' (roles=%s, named_teammates=%s, session=%s, mcps=%d)",
+        "[swarm.assembly] enriched team spec '%s' (roles=%s, named_members=%s, "
+        "named_teammates=%s, session=%s, mcps=%d)",
         spec.team_name,
         [role for role in _MEMBER_ROLES if role in spec.agents],
+        named_members,
         named_teammates,
         session_id,
         len(mcp_configs),
