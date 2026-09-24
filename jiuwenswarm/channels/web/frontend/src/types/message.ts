@@ -32,9 +32,10 @@ export interface UsageSummary {
 export interface FileDownloadItem {
   name: string;
   size: number;
-  mime_type: string;
-  download_url: string;
-  download_token: string;
+  mime_type?: string;
+  download_url?: string;
+  download_token?: string;
+  url?: string;            // 新增：企业版 MinIO 下发
   /** 工作区绝对/相对路径；用于去重身份（优先于 downloadUrl 中的 exp token） */
   path?: string;
 }

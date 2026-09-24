@@ -40,6 +40,7 @@ import { ProactiveRecommendationCard } from './ProactiveRecommendationCard';
 import { fileArtifactId } from '../ArtifactsPanel';
 import { openArtifactPanel } from '../../features/teamPanelState';
 import { executeDesktopSave, type DesktopSaveApiResult } from '../../utils/desktopSave';
+import { resolveApiUrl } from '../../utils/env';
 
 export const MarkdownMessageBody = memo(function MarkdownMessageBody({
   content,
@@ -784,12 +785,15 @@ function FileDownloadList({
 }) {
   const { t } = useTranslation();
   const [expiredSet, setExpiredSet] = useState<Set<number>>(new Set());
-  const downloadProbeKey = files.map((file) => file.download_url).join('\0');
+  const fileDownloadUrl = (file: FileDownloadItem): string | undefined => file.download_url || file.url;
+  const downloadProbeKey = files.map((file) => fileDownloadUrl(file) ?? '').join('\0');
 
   useEffect(() => {
     let cancelled = false;
     files.forEach((file, index) => {
-      fetch(file.download_url, { method: 'HEAD' })
+      const rawUrl = fileDownloadUrl(file);
+      if (!rawUrl) return;
+      fetch(resolveApiUrl(rawUrl), { method: 'HEAD' })
         .then((res) => {
           if (!cancelled && !res.ok) {
             setExpiredSet((prev) => new Set(prev).add(index));
@@ -814,7 +818,7 @@ function FileDownloadList({
     if (pywebviewApi?.download_file) {
       // 桌面端：通过 webview API 下载
       const outcome = await executeDesktopSave(() =>
-        pywebviewApi.download_file!(file.download_url, file.name || 'download')
+        pywebviewApi.download_file!(resolveApiUrl(fileDownloadUrl(file) ?? ''), file.name || 'download')
       );
       if (outcome === 'failed') {
         window.alert(t('artifacts.downloadFailed', { name: file.name }));
@@ -823,7 +827,7 @@ function FileDownloadList({
     }
     // 浏览器模式：使用标准 <a> 标签下载
     const link = document.createElement('a');
-    link.href = file.download_url;
+    link.href = resolveApiUrl(fileDownloadUrl(file) ?? '');
     link.download = file.name || '';
     document.body.appendChild(link);
     link.click();
