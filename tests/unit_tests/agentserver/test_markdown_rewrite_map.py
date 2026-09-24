@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from jiuwenswarm.agents.harness.common.tools.deepresearch_plugin import (
     markdown_rewrite_map as rewrite_map_module,
@@ -545,7 +546,6 @@ def test_crlf_inline_breaks_keep_exact_source_ranges(markdown, break_source):
     "markdown",
     [
         "unterminated **strong",
-        "[label](<bad destination)",
         "<https://example.com>",
     ],
 )
@@ -558,17 +558,77 @@ def test_ambiguous_inline_topology_fails_closed(markdown):
     ]
 
 
+def test_broken_link_destination_stays_supported_as_literal_text():
+    # A malformed angle-bracket destination emits no link tokens, so the whole
+    # span is literal text; `<` alone is not an unmatched construct. The
+    # relay-claw frontend accepts this paragraph, so the sidecar must too.
+    markdown = "[label](<bad destination)"
+
+    unit = rewrite_map_module.build_rewrite_map(markdown).units[0]
+
+    assert [slot.text for slot in unit.slots] == [markdown]
+    assert unit.protected == ()
+
+
+def test_named_entity_stays_supported_as_one_visible_character():
+    # `&le;` renders as one visible char spanning several raw bytes; the slot
+    # carries the decoded text while its byte range covers the entity source.
+    markdown = "浓度&le;0.5的溶液"
+
+    unit = rewrite_map_module.build_rewrite_map(markdown).units[0]
+
+    assert [slot.text for slot in unit.slots] == ["浓度≤0.5的溶液"]
+    assert unit.protected == ()
+
+
+def test_multi_codepoint_named_entity_fails_closed():
+    # HTML5 named entities can decode to several code points (`&fjlig;` ->
+    # "fj"). Aligning only the first code point would misattribute the rest
+    # to the source following the entity, so the unit fails closed instead.
+    markdown = "荷兰语连字&fjlig;示例"
+
+    rewrite_map = rewrite_map_module.build_rewrite_map(markdown)
+
+    assert rewrite_map.units == ()
+    assert [region.kind for region in rewrite_map.unsupported_regions] == [
+        "unsupported_inline"
+    ]
+
+
+def test_cjk_friendly_rules_do_not_leak_into_stock_parsers():
+    # The CJK-friendly flanking is registered per parser instance: a stock
+    # markdown-it keeps CommonMark semantics (the `**` stays literal next to
+    # CJK punctuation) while the rewrite parser pairs it like the frontend.
+    markdown = "**要点。**的"
+
+    stock = MarkdownIt("commonmark", {"html": True}).enable(
+        ["table", "strikethrough"]
+    )
+    inline = next(token for token in stock.parse(markdown) if token.type == "inline")
+    rewrite_slots = [
+        slot.text
+        for slot in rewrite_map_module.build_rewrite_map(markdown).units[0].slots
+    ]
+
+    assert [token.type for token in inline.children] == ["text"]
+    assert rewrite_slots == ["要点。", "的"]
+
+
 @pytest.mark.parametrize(
     ("markdown", "expects_literal_stars"),
     [
-        # CommonMark flanking rules decline to treat a paired `**` as emphasis
-        # when the opener is followed by punctuation (here the math symbol `<=`),
-        # so markdown-it emits the `**` as literal text. The engine must consume
-        # those literal markers as text instead of demoting the whole paragraph.
-        ("每周**≤2次**。", True),
+        # With the frontend's CJK-friendly flanking rules, a CJK character
+        # before the opener lets `**` pair even when the follower is a
+        # non-CJK punctuation mark (the math symbol `<=`), so the markers are
+        # stripped as strong syntax — matching the relay-claw frontend.
+        ("每周**≤2次**。", False),
+        # A Latin word before the opener still cannot open next to
+        # punctuation, so markdown-it emits the `**` as literal text. The
+        # engine must consume those literal markers as text instead of
+        # demoting the whole paragraph.
         ("x**≤**y", True),
-        # When flanking succeeds the `**` parses as emphasis and the markers are
-        # stripped from the slot text; the paragraph is still supported.
+        # Intraword flanking succeeds and the markers are stripped from the
+        # slot text; the paragraph is still supported.
         ("a**b≤c**d", False),
     ],
 )

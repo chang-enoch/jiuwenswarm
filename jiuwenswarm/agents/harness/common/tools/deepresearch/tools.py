@@ -2742,6 +2742,9 @@ def _exclusive_write_at(
             os.fsync(stream.fileno())
         return metadata.st_dev, metadata.st_ino
     except BaseException:
+        # Close before unlinking: on Windows an open handle blocks unlink.
+        with suppress(OSError):
+            os.close(descriptor)
         if identity is not None:
             try:
                 current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
@@ -2756,7 +2759,8 @@ def _exclusive_write_at(
                         os.unlink(name, dir_fd=root_fd)
         raise
     finally:
-        os.close(descriptor)
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 def _publish_asset_directory_at(
@@ -3076,6 +3080,9 @@ def _exclusive_write(path: Path, payload: bytes) -> tuple[int, int]:
             os.fsync(stream.fileno())
         return metadata.st_dev, metadata.st_ino
     except BaseException:
+        # Close before unlinking: on Windows an open handle blocks unlink.
+        with suppress(OSError):
+            os.close(descriptor)
         if identity is not None:
             try:
                 current = path.lstat()
@@ -3091,7 +3098,8 @@ def _exclusive_write(path: Path, payload: bytes) -> tuple[int, int]:
                         path.unlink()
         raise
     finally:
-        os.close(descriptor)
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 async def _generate_report_html(
