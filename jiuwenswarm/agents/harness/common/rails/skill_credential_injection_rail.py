@@ -113,7 +113,7 @@ def _split_subcommands(command: str) -> list[str]:
         # 二字符分隔符 && / || 必须先于单字符 ; / | / & 判定，
         # 否则 || 会被当成单个 | 拆开，产生空子命令； && 同理
         sep_len = 0
-        if command[i : i + 2] in ("&&", "||"):
+        if command[i:i + 2] in ("&&", "||"):
             sep_len = 2
         elif ch in (";", "|", "&"):
             # 2>&1 等重定向的 & 不拆（前一个字符是 > ）
