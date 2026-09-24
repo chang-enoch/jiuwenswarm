@@ -142,7 +142,16 @@ __all__ = [
 
 
 def _fire_and_forget_aclose_exit_stack(stack: Any) -> None:
-    """后台 best-effort ``aclose`` 旧 AsyncExitStack，避免泄漏；不阻塞调用方。"""
+    """宿主 task 结束后再 best-effort ``aclose`` 旧 AsyncExitStack。
+
+    stack 里的 anyio cancel scope 是在当前 task 上 enter 的。立刻丢到另一个
+    task 里 ``aclose()`` 会取消这些 scope，宿主 task 收到
+    ``Cancelled via cancel scope ... by Task-N``，整次聊天被当成用户取消
+    （0 chunk、无 ``chat.error``），Relay 空等看门狗后变成 OA.05000090。
+
+    因此不在宿主还活着时 aclose。等它结束后再清理：此时 cancel 已是空操作，
+    连接泄漏只覆盖这一次请求。无 running loop 时放弃 aclose。
+    """
     if not isinstance(stack, AsyncExitStack):
         return
 
@@ -150,7 +159,7 @@ def _fire_and_forget_aclose_exit_stack(stack: Any) -> None:
         try:
             await stack.aclose()
         except BaseException as exc:
-            # 含 CancelledError：后台清理失败不得污染当前调用方
+            # 含 CancelledError / 跨 task 退出 scope：清理失败不得再抛
             logger.debug(
                 "[mcp-timeout] background aclose of old AsyncExitStack failed: %r",
                 exc,
@@ -164,15 +173,28 @@ def _fire_and_forget_aclose_exit_stack(stack: Any) -> None:
         )
         return
 
-    task = loop.create_task(_aclose())
-
     def _drain_task_result(done: asyncio.Task) -> None:
         try:
             done.result()
         except BaseException:
             pass
 
-    task.add_done_callback(_drain_task_result)
+    def _schedule_aclose(_done: asyncio.Task | None = None) -> None:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "[mcp-timeout] loop already closed; skip background aclose of old AsyncExitStack"
+            )
+            return
+        cleanup = running.create_task(_aclose())
+        cleanup.add_done_callback(_drain_task_result)
+
+    host = asyncio.current_task(loop)
+    if host is None or host.done():
+        _schedule_aclose()
+        return
+    host.add_done_callback(_schedule_aclose)
 
 
 def force_invalidate_mcp_client(client: Any) -> None:
@@ -182,10 +204,9 @@ def force_invalidate_mcp_client(client: Any) -> None:
     且成功 aclose 后旧 stack 也不能再 enter。超时 / Session terminated 路径必须
     无条件调用本函数。
 
-    替换 ``_exit_stack`` 前会取出旧 stack，用 running loop 的
-    ``create_task`` fire-and-forget 去 ``aclose()``（后台 best-effort；异常仅
-    debug 记录。无 running loop 时 debug 后放弃 aclose）。本函数保持同步，
-    不改成 async。
+    替换 ``_exit_stack`` 前会取出旧 stack。aclose 推迟到当前 task 结束之后
+    （scope 是在这个 task 上 enter 的，活着时跨 task aclose 会取消整次聊天）。
+    无 running loop 时放弃 aclose。本函数保持同步，不改成 async。
 
     同时打上 ``_jws_needs_reconnect``：即便残留对象仍像「已连接」，下次调用也强制
     重连。聊天会话 A/B 共用同一客户端，否则新建会话也会继承半死连接。
@@ -270,7 +291,7 @@ async def _abandon_session(client: Any, *, context: str) -> None:
     导致下一轮重连后的成功结果在 AbilityManager 外层退出时仍被盖掉
     （TC_MCP_CALL_014 第 3 轮）。
 
-    ``force_invalidate_mcp_client`` 会把旧 stack 丢到后台 task best-effort
+    ``force_invalidate_mcp_client`` 会把旧 stack 留到宿主 task 结束后再
     ``aclose()``，本协程本身不 await 清理。
     """
     force_invalidate_mcp_client(client)
