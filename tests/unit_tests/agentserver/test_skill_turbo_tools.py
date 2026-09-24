@@ -279,7 +279,7 @@ async def test_hitl_abort_does_not_clear_or_post_run_turbo_session(
         ),
     ):
         from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
-            _SKILL_TURBO_HITL_PLACEHOLDER,
+            _SKILL_TURBO_HITL_RESULT_KEY,
             set_skill_turbo_hitl_tic,
         )
 
@@ -289,7 +289,9 @@ async def test_hitl_abort_does_not_clear_or_post_run_turbo_session(
         finally:
             set_skill_turbo_hitl_tic(None)
 
-    assert result == _SKILL_TURBO_HITL_PLACEHOLDER
+    assert isinstance(result, dict)
+    assert result.get(_SKILL_TURBO_HITL_RESULT_KEY) is True
+    assert isinstance(result.get("request"), dict)
     clear_ctx.assert_not_awaited()
     turbo_session.post_run.assert_not_awaited()
     turbo_session.close_stream.assert_not_awaited()

@@ -11,6 +11,8 @@ import pytest
 
 from openjiuwen.core.foundation.llm import AssistantMessage, ToolMessage, UserMessage
 from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
+from openjiuwen.core.single_agent.interrupt.response import ToolCallInterruptRequest
 from openjiuwen.core.single_agent.interrupt.state import RESUME_USER_INPUT_KEY
 from openjiuwen.core.single_agent.rail.base import ToolCallInputs
 from jiuwenswarm.agents.harness.common.rails.stream_event_rail import (
@@ -883,12 +885,63 @@ async def test_skill_turbo_hitl_after_tool_call_writes_placeholder_tool_msg():
     finally:
         set_skill_turbo_hitl_tic(None)
 
+    assert isinstance(ctx.inputs.tool_result, ToolInterruptException)
     assert isinstance(ctx.inputs.tool_msg, ToolMessage)
-    assert ctx.inputs.tool_msg.content == rail._tool_interrupted_message(
-        "skill_acceleration_exec"
-    )
+    assert ctx.inputs.tool_msg.content == _SKILL_TURBO_HITL_PLACEHOLDER
     assert ctx.inputs.tool_msg.tool_call_id == "call_982c"
     assert ctx.inputs.tool_msg is not leaked
+
+
+@pytest.mark.asyncio
+async def test_skill_turbo_hitl_after_tool_call_rewrites_from_result_marker():
+    from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+        build_skill_turbo_hitl_result,
+    )
+
+    rail = JiuSwarmStreamEventRail()
+    rail.set_skill_turbo_adapter(object())
+    session = _StreamSession()
+    tool_call = SimpleNamespace(
+        id="call_982d",
+        name="skill_acceleration_exec",
+        arguments={"query": "生成PPT"},
+    )
+    ctx = SimpleNamespace(
+        session=session,
+        inputs=ToolCallInputs(
+            tool_call=tool_call,
+            tool_name="skill_acceleration_exec",
+            tool_args={"query": "生成PPT"},
+            tool_result=build_skill_turbo_hitl_result(
+                ToolInterruptException(
+                    request=ToolCallInterruptRequest(
+                        message="风格",
+                        auto_confirm_key="ask_user:style",
+                    ),
+                    tool_call=SimpleNamespace(
+                        id="skill_turbo-tc-ask_user-2",
+                        name="ask_user",
+                        arguments={},
+                    ),
+                )
+            ),
+            tool_msg=None,
+        ),
+        extra={},
+        exception=None,
+        request_force_finish=lambda *_args, **_kwargs: None,
+    )
+    set_skill_turbo_hitl_tic(None)
+    await rail.after_tool_call(ctx)
+
+    assert isinstance(ctx.inputs.tool_result, ToolInterruptException)
+    rebuilt_request = ctx.inputs.tool_result.request
+    assert getattr(rebuilt_request, "message", "") == "风格"
+    assert getattr(rebuilt_request, "auto_confirm_key", "") == "ask_user:style"
+    assert ctx.inputs.tool_result.tool_call is tool_call
+    assert isinstance(ctx.inputs.tool_msg, ToolMessage)
+    assert ctx.inputs.tool_msg.content == _SKILL_TURBO_HITL_PLACEHOLDER
+    assert ctx.inputs.tool_msg.tool_call_id == "call_982d"
 
 
 class _ModelContext:
